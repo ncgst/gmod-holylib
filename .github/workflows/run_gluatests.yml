@@ -1,0 +1,297 @@
+---
+name: HolyLib GLuaTest Runner
+
+# Vendored from RaphaelIT7/GLuaTest@holylib_v2 so action runtimes can be
+# maintained with the HolyLib workflow stack.
+
+
+on:
+  workflow_call:
+    inputs:
+      server-cfg:
+        type: string
+        required: false
+        description: "A path (relative to project directory) with extra server config options"
+        default: "gluatest_custom.cfg"
+
+      requirements:
+        type: string
+        required: false
+        description: "A path (relative to project directory) with a list of all requirements to test this project"
+        default: "gluatest_requirements.txt"
+
+      gamemode:
+        type: string
+        required: false
+        description: "The name of the gamemode for the test server to run. (Be sure to list it as a requirement or include it in the test collection, if necessary)"
+        default: "sandbox"
+
+      map:
+        type: string
+        required: false
+        description: "The name of the map for the test server to run. (Be sure to list it as a requirement or include it in the test collection, if necessary)"
+        default: "gm_construct"
+
+      collection:
+        type: string
+        required: false
+        description: "The workshop ID of the collection for the test server to use"
+
+      extra-startup-args:
+        type: string
+        required: false
+        description: "Extra arguments to pass to the test server on startup"
+        default: ""
+
+      ssh-private-key:
+        type: string
+        required: false
+        description: "The Private SSH key to use when cloning the dependencies"
+
+      github-token:
+        type: string
+        required: false
+        description: "A GitHub Personal Access Token"
+
+      timeout:
+        type: string
+        required: false
+        description: "How many minutes to let the job run before killing the server (small projects shouldn't need more than 2 minutes)"
+        default: "2"
+
+      branch:
+        type: string
+        required: false
+        description: "Which GMod branch to run your tests on. Must be: `public`, `x86-64`, `prerelease`, or `dev`"
+        default: "public"
+
+      gluatest-repo:
+        type: string
+        required: false
+        description: "The GLuaTest repository to use. This is usually the same as the one this action is in"
+        default: "https://github.com/RaphaelIT7/GLuaTest"
+
+      gluatest-ref:
+        type: string
+        required: false
+        description: "Which tag/branch of GLuaTest to run"
+        default: "holylib_v2"
+
+      custom-overrides:
+        type: string
+        required: false
+        description: "An absolute path with custom files to copy to the server directly. Structure should match the contents of `garrysmod/`"
+
+      download-artifact:
+        type: string
+        required: false
+        description: "If specified it will download and setup the given artifact (can also be given a url to a file). It has to be a tar file that will be unpacked in the root directory."
+        default: ""
+
+      additional-setup:
+        type: string
+        required: false
+        description: "If specified it execute the given string as a command after everything was set up allowing you to execute additional commands/scripts"
+        default: ""
+
+      dockerbuild:
+        type: boolean
+        required: false
+        description: "If enabled it will build the docker image from scratch (You should only use this if you are testing a change to the GLuaTest docker image itself)"
+        default: false
+
+      no-checkout: # If this is given, all files are probably inside the given artifact.
+        type: boolean
+        required: false
+        description: "If enabled it will skip the override directory step"
+        default: false
+
+      logs-as-artifact:
+        type: boolean
+        required: false
+        description: "If enabled, it will upload the server logs as an artifact"
+        default: false
+
+    secrets:
+      secret-startup-args:
+        required: false
+      secret-additional-setup:
+        required: false
+
+jobs:
+  test:
+    name: "Run tests"
+    runs-on: 'ubuntu-latest' #${{ github.repository_owner == 'RaphaelIT7' && 'self-hosted' || 'ubuntu-latest' }}
+
+    steps:
+      - name: "Check out the repo"
+        if: ${{ !inputs.no-checkout }}
+        uses: actions/checkout@v7
+        with:
+          path: project
+
+      - name: Set up output files
+        run: |
+          cd $GITHUB_WORKSPACE
+          mkdir -p project # In case there was no checkout
+          mkdir -p garrysmod_override # Same here
+          touch $GITHUB_WORKSPACE/project/${{ inputs.requirements }}
+          echo "gluatest_github_output 1" >> $GITHUB_WORKSPACE/project/${{ inputs.server-cfg }}
+
+      - name: Get latest GLuaTest version
+        id: latest-tag-getter
+        run: |
+          cd $GITHUB_WORKSPACE
+
+          # RaphaelIT7: I use self-hosted runners where the files may remain across runs, so we gotta clean
+          # rm -rf gluatest
+          git clone --single-branch --depth 1 ${{ inputs.gluatest-repo }}.git gluatest
+
+          cd gluatest
+          git fetch --quiet origin ${{ inputs.gluatest-ref }}
+          git checkout FETCH_HEAD
+          git fetch --quiet --tags
+
+          latest=$(git describe --tags $(git rev-list --tags --max-count=1) 2>/dev/null || echo "0.00")
+          echo "Latest Tag: $latest"
+          echo "LATEST_TAG=$latest" >> $GITHUB_OUTPUT
+
+          cd ../
+          cd $GITHUB_WORKSPACE
+          mkdir -p ${{ github.workspace }}/gluatest/docker/_gluatest_artifacts/ # Silently also setup the artifacts dir
+
+      - name: Prepare the override directory
+        if: ${{ !inputs.no-checkout }}
+        run: |
+          cd $GITHUB_WORKSPACE/project
+
+          get_gamemode_name () {
+            gamemode_file=$(grep --recursive --word-regexp --files-with-matches '"base"')
+            gamemode_name=$(head --quiet --lines 1 "$gamemode_file" | tr --delete '"')
+
+            echo "$gamemode_name"
+          }
+
+          source="$GITHUB_WORKSPACE/project"
+          dest="$GITHUB_WORKSPACE/garrysmod_override/"
+
+          if [ -d "garrysmod" ]; then
+            # The repo contains a full server
+            source="$GITHUB_WORKSPACE/project/garrysmod"
+          elif [ -d "gamemodes" ]; then
+            # The repo is the contents of a garrysmod/ dir - we can copy its contents directly
+            :
+          elif [ -d "gamemode" ]; then
+            # The repo is the contents of a gamemode
+            gamemode_name=$(get_gamemode_name)
+            dest="$GITHUB_WORKSPACE/garrysmod_override/gamemodes/$gamemode_name/"
+          elif [ -d "lua" ]; then
+            # The repo is likely an addon
+            dest="$GITHUB_WORKSPACE/garrysmod_override/addons/project/"
+          else
+            echo "::error title=Unknown project structure!::Please report this: ${{ inputs.gluatest-repo }}/issues"
+            exit 1
+          fi
+
+          mkdir --verbose --parents "$dest"
+          cp --recursive --verbose $source/* "$dest/"
+
+      - name: Sync custom overrides
+        if: ${{ inputs.custom-overrides }}
+        run: |
+          rsync --verbose --archive ${{ inputs.custom-overrides }} $GITHUB_WORKSPACE/garrysmod_override/
+
+      - name: Download artifact (Github)
+        if: inputs.download-artifact != '' && !(startsWith(inputs.download-artifact, 'https://') || startsWith(inputs.download-artifact, 'http://'))
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ github.workspace }}/gluatest/docker/_gluatest_artifacts/
+          name: "${{ inputs.download-artifact }}"
+
+      - name: Download artifact (Http)
+        if: inputs.download-artifact != '' && (startsWith(inputs.download-artifact, 'https://') || startsWith(inputs.download-artifact, 'http://'))
+        run: |
+          cd ${{ github.workspace }}/gluatest/docker/_gluatest_artifacts/
+          wget -O artifact.tar.gz ${{ inputs.download-artifact }} # No matter what, we expect it as a .tar.gz
+
+      - name: Run Additional Setup
+        run: |
+          cd ${{ github.workspace }}
+          ${{ inputs.additional-setup }}
+          ${{ secrets.secret-additional-setup }}
+
+      - name: Pull GLuaTest Runner
+        if: ${{ !inputs.dockerbuild }}
+        env:
+          GMOD_BRANCH: "${{ inputs.branch }}"
+        run: |
+          cd $GITHUB_WORKSPACE/gluatest/docker
+
+          docker compose pull
+
+      - name: Build GLuaTest
+        if: ${{ inputs.dockerbuild }}
+        env:
+          REQUIREMENTS: "${{ github.workspace }}/project/${{ inputs.requirements }}"
+          CUSTOM_SERVER_CONFIG: "${{ github.workspace }}/project/${{ inputs.server-cfg }}"
+          PROJECT_DIR: "${{ github.workspace }}/garrysmod_override"
+          GMOD_ARTIFACT_DIR: "${{ github.workspace }}/gluatest/docker/_gluatest_artifacts"
+        run: |
+          cd $GITHUB_WORKSPACE/gluatest/docker
+          docker build \
+            --build-arg="GMOD_BRANCH=${{ inputs.branch }}" \
+            --build-arg="GLUATEST_REPO=${{ inputs.gluatest-repo }}.git" \
+            --build-arg="GLUATEST_REF=${{ inputs.gluatest-ref }}" \
+            --tag ghcr.io/cfc-servers/gluatest:latest .
+
+      - name: Run GLuaTest
+        env:
+          REQUIREMENTS: "${{ github.workspace }}/project/${{ inputs.requirements }}"
+          CUSTOM_SERVER_CONFIG: "${{ github.workspace }}/project/${{ inputs.server-cfg }}"
+          PROJECT_DIR: "${{ github.workspace }}/garrysmod_override"
+          EXTRA_STARTUP_ARGS: "${{ inputs.extra-startup-args }} ${{ secrets.secret-startup-args }}"
+          GAMEMODE: "${{ inputs.gamemode }}"
+          MAP: "${{ inputs.map }}"
+          COLLECTION_ID: "${{ inputs.collection }}"
+          SSH_PRIVATE_KEY: "${{ inputs.ssh-private-key }}"
+          GITHUB_TOKEN: "${{ inputs.github-token }}"
+          TIMEOUT: "${{ inputs.timeout }}"
+          GMOD_BRANCH: "${{ inputs.branch }}"
+        run: |
+          cd $GITHUB_WORKSPACE/gluatest/docker
+
+          # RaphaelIT7: Setting up the core pattern here as inside the docker image it's a read-only filesystem
+          # ${{ github.repository_owner == 'RaphaelIT7' && '#' || '' }}
+          echo "core" | sudo tee /proc/sys/kernel/core_pattern
+
+          docker compose up --pull never --no-log-prefix --exit-code-from runner
+          exitstatus=$?
+
+          if [ $exitstatus -ne 0 ]; then
+            exit $exitstatus
+          fi
+
+      - name: Capture Docker Logs
+        if: ${{ always() && inputs.logs-as-artifact }}
+        run: |
+          # ${{ github.repository_owner == 'RaphaelIT7' && '#' || '' }}
+          sudo apt-get install -y colorized-logs
+
+          cd $GITHUB_WORKSPACE/gluatest/docker
+
+          filename="$GITHUB_WORKSPACE/gluatest-log-${{ inputs.branch }}.log"
+          docker compose logs --no-color --no-log-prefix runner >& "$filename.pre"
+
+          # Remove all the ANSI color codes
+          cat "$filename.pre" | ansi2txt > "$filename"
+
+          # Remove secrets
+          sed -i '/${{ secrets.secret-startup-args }}/d' "$filename"
+
+      - name: Upload Test Log Artifact
+        if: ${{ always() && inputs.logs-as-artifact }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: gluatest-log-${{ inputs.branch }}
+          path: ${{ github.workspace }}/gluatest-log-${{ inputs.branch }}.log
+          retention-days: 3

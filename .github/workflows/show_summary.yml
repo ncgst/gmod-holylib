@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     container: raphaelit7/gmod-builder:latest_64x
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         name: "Checkout build tool files"
         with:
           sparse-checkout: source/_prebuildtools
