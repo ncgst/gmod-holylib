@@ -12,7 +12,7 @@ on:
 jobs:
   build_ghostinj:
     name: "Build GhostInj"
-    uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@agent/node24-actions
+    uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
       PROJECT_PATH: "ghostinj-dll/"
       PROJECT_NAME: "ghostinj"
