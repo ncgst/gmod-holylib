@@ -14,7 +14,7 @@ jobs:
   build-windows-64:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         name: Checkout
 
       - uses: ilammy/msvc-dev-cmd@v1
@@ -25,32 +25,24 @@ jobs:
           ren lua51.lib lua51_64.lib
           ren luajit.lib luajit_64.lib
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         name: Upload lua51.lib
         with:
           name: lua51_64.lib
           path: luajit/src/lua51_64.lib
           retention-days: 1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         name: Upload luajit executable (64x)
         with:
           name: luajit.exe (64x)
           path: luajit/src/luajit.exe
           retention-days: 1
 
-      - uses: actions/upload-artifact@v4
-        if: false
-        name: Upload luajit.lib
-        with:
-          name: luajit_64.lib
-          path: luajit/src/luajit_64.lib
-          retention-days: 1
-
   build-windows-32:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         name: Checkout
 
       - uses: ilammy/msvc-dev-cmd@v1
@@ -64,26 +56,18 @@ jobs:
           ren lua51.lib lua51_32.lib
           ren luajit.lib luajit_32.lib
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         name: Upload lua51.lib
         with:
           name: lua51_32.lib
           path: luajit/src/lua51_32.lib
           retention-days: 1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         name: Upload luajit executable (32x)
         with:
           name: luajit.exe
           path: luajit/src/luajit.exe
-          retention-days: 1
-
-      - uses: actions/upload-artifact@v4
-        if: false
-        name: Upload luajit.lib
-        with:
-          name: luajit_32.lib (32x)
-          path: luajit/src/luajit_32.lib
           retention-days: 1
 
   build-linux-64:
@@ -95,24 +79,23 @@ jobs:
           apt update
           apt install -y build-essential
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         name: Checkout
 
-      - uses: ilammy/msvc-dev-cmd@v1
       - name: Generate libs
         run: |
           cd luajit/src/
           make CC='$(DEFAULT_CC) -fPIC'
           mv libluajit.a libluajit_64.a
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         name: Upload libluajit.a (64x)
         with:
           name: libluajit_64.a
           path: luajit/src/libluajit_64.a
           retention-days: 1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         name: Upload luajit executable (64x)
         with:
           name: luajit (64x)
@@ -129,24 +112,23 @@ jobs:
           apt update
           apt install -y build-essential gcc-multilib g++-multilib
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         name: Checkout
 
-      - uses: ilammy/msvc-dev-cmd@v1
       - name: Generate libs
         run: |
           cd luajit/src/
           make DEFAULT_CC='gcc -m32'
           mv libluajit.a libluajit_32.a
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         name: Upload libluajit.a (32x)
         with:
           name: libluajit_32.a
           path: luajit/src/libluajit_32.a
           retention-days: 1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         name: Upload luajit executable (32x)
         with:
           name: luajit (32x)

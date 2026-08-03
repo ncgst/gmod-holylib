@@ -18,7 +18,7 @@ env:
 jobs:
   build_plugin_windows:
     name: "Build Plugin"
-    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
+    uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
       PROJECT_NAME: "holylib"
       BUILD_64x: "true"
@@ -37,7 +37,7 @@ jobs:
 
   build_plugin_windows_dedicated:
     name: "Build Plugin (Dedicated)"
-    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
+    uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
       PROJECT_NAME: "holylib"
       BUILD_64x: "true"
@@ -57,7 +57,7 @@ jobs:
 
   build_plugin_windows_64x_main:
     name: "Build Plugin (64x - Main Branch)"
-    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
+    uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
       PROJECT_NAME: "holylib"
       BUILD_64x: "true"
@@ -77,7 +77,7 @@ jobs:
 
   build_plugin_linux:
     name: "Build Plugin"
-    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
+    uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
       PROJECT_NAME: "holylib"
       BUILD_64x: "true"
@@ -95,7 +95,7 @@ jobs:
   build_testingarea:
     name: "Build 32x (Testing Area - Dev)"
     if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
-    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
+    uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     secrets:
       PTERODACTYL_KEY: ${{ secrets.PTERODACTYL_KEY }}
       PTERODACTYL_SERVER: ${{ secrets.PTERODACTYL_SERVER }}
@@ -120,7 +120,7 @@ jobs:
   build_testingarea_dev2: # Could make this use the already created artifact but I'm too lazy rn
     name: "Build 32x (Testing Area - Public)"
     if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
-    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
+    uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     secrets:
       PTERODACTYL_KEY: ${{ secrets.PTERODACTYL_KEY }}
       PTERODACTYL_SERVER: ${{ secrets.PTERODACTYL_SERVER_PUBLIC }}
@@ -145,7 +145,7 @@ jobs:
   build_testingarea_64x:
     name: "Build 64x (Testing Area - 64x)"
     if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
-    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
+    uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     secrets:
       PTERODACTYL_KEY: ${{ secrets.PTERODACTYL_KEY }}
       PTERODACTYL_SERVER: ${{ secrets.PTERODACTYL_SERVER_X64 }}
@@ -170,7 +170,7 @@ jobs:
 
   build_ghostinj:
     name: "Build GhostInj"
-    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
+    uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
       PROJECT_PATH: "ghostinj-dll/"
       PROJECT_NAME: "ghostinj"
@@ -194,7 +194,7 @@ jobs:
     # Doing this paralle to the main builds gives us at minimim 1min time with ~34 runners available to run parallel
     # needs: build_plugin_linux
     name: "Build Stripped modules"
-    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
+    uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     strategy:
       fail-fast: false
       matrix:
@@ -266,19 +266,19 @@ jobs:
             ghostinj_artifact: ghostinj.dll (64x)
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         name: "Checkout required files"
         with:
           sparse-checkout: |
             ${{ matrix.vdf }}
             gluatests
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         name: "Download plugin"
         with:
           name: "${{ matrix.plugin_artifact }}"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         name: "Download ghostinj"
         with:
           name: "${{ matrix.ghostinj_artifact }}"
@@ -296,7 +296,7 @@ jobs:
           tar -czf gluatest.tar.gz ${{ matrix.ghostinj }} garrysmod/
           tar -czf gluatest_no_ghostinj.tar.gz garrysmod/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         name: "Upload tar"
         with:
           name: gluatest_${{ matrix.arch }}
@@ -304,7 +304,7 @@ jobs:
           compression-level: 9
           retention-days: 1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         name: "Upload tar"
         with:
           name: gluatest_no_ghostinj_${{ matrix.arch }}
@@ -315,7 +315,7 @@ jobs:
   test_32bit:
     name: "Test 32x branches"
     needs: setup_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     strategy:
       matrix:
         branch:
@@ -325,7 +325,7 @@ jobs:
     with:
       extra-startup-args: "-usegh"
       download-artifact: "gluatest_32x"
-      no-checkout: "true"
+      no-checkout: true
       branch: ${{ matrix.branch }}
       timeout: "10"
     secrets:
@@ -334,7 +334,7 @@ jobs:
   test_32bit_noghostinj:
     name: "Test 32x branches (No GhostInj)"
     needs: setup_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     strategy:
       matrix:
         branch:
@@ -343,7 +343,7 @@ jobs:
           - prerelease
     with:
       download-artifact: "gluatest_no_ghostinj_32x"
-      no-checkout: "true"
+      no-checkout: true
       branch: ${{ matrix.branch }}
       timeout: "10"
     secrets:
@@ -352,12 +352,12 @@ jobs:
   test_64bit:
     name: "Test x86-64 branch"
     needs: setup_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     with:
       branch: x86-64
       extra-startup-args: "-usegh"
       download-artifact: "gluatest_64x"
-      no-checkout: "true"
+      no-checkout: true
       timeout: "10"
     secrets:
       secret-additional-setup: "mkdir -p garrysmod/ && mkdir -p garrysmod/_workflow/ && echo https://loki-public.raphaelit7.com > garrysmod/_workflow/loki_public_host.txt && echo ${{ github.repository }} > garrysmod/_workflow/github_repo.txt && echo ${{ secrets.LOKI_HOST }} > garrysmod/_workflow/loki_host.txt && echo ${{ secrets.LOKI_APIKEY }} > garrysmod/_workflow/loki_api.txt && tar -czf gluatest/docker/_gluatest_artifacts/gm_secrets.tar.gz -C . garrysmod && rm -rf garrysmod"
@@ -365,11 +365,11 @@ jobs:
   test_64bit_noghostinj:
     name: "Test x86-64 branch (No GhostInj)"
     needs: setup_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     with:
       branch: x86-64
       download-artifact: "gluatest_no_ghostinj_64x"
-      no-checkout: "true"
+      no-checkout: true
       timeout: "10"
     secrets:
       secret-additional-setup: "mkdir -p garrysmod/ && mkdir -p garrysmod/_workflow/ && echo https://loki-public.raphaelit7.com > garrysmod/_workflow/loki_public_host.txt && echo ${{ github.repository }} > garrysmod/_workflow/github_repo.txt && echo ${{ secrets.LOKI_HOST }} > garrysmod/_workflow/loki_host.txt && echo ${{ secrets.LOKI_APIKEY }} > garrysmod/_workflow/loki_api.txt && tar -czf gluatest/docker/_gluatest_artifacts/gm_secrets.tar.gz -C . garrysmod && rm -rf garrysmod"
@@ -377,7 +377,7 @@ jobs:
   test_32x_holylua:
     name: "Test 32x branches (HolyLua)"
     needs: setup_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     strategy:
       matrix:
         branch:
@@ -387,7 +387,7 @@ jobs:
     with:
       extra-startup-args: "-usegh -holylib_lua +holylib_module_debug 0"
       download-artifact: "gluatest_32x"
-      no-checkout: "true"
+      no-checkout: true
       branch: ${{ matrix.branch }}
       timeout: "10"
     secrets:
@@ -396,7 +396,7 @@ jobs:
   test_32x_holylua_noghostinj:
     name: "Test 32x branches (HolyLua, No GhostInj)"
     needs: setup_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     strategy:
       matrix:
         branch:
@@ -406,7 +406,7 @@ jobs:
     with:
       extra-startup-args: "-holylib_lua +holylib_module_debug 0"
       download-artifact: "gluatest_no_ghostinj_32x"
-      no-checkout: "true"
+      no-checkout: true
       branch: ${{ matrix.branch }}
       timeout: "10"
     secrets:
@@ -415,12 +415,12 @@ jobs:
   test_64bit_holylua:
     name: "Test x86-64 branch (HolyLua)"
     needs: setup_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     with:
       branch: x86-64
       extra-startup-args: "-usegh -holylib_lua +holylib_module_debug 0"
       download-artifact: "gluatest_64x"
-      no-checkout: "true"
+      no-checkout: true
       timeout: "10"
     secrets:
       secret-additional-setup: "mkdir -p garrysmod/ && mkdir -p garrysmod/_workflow/ && echo https://loki-public.raphaelit7.com > garrysmod/_workflow/loki_public_host.txt && echo ${{ github.repository }} > garrysmod/_workflow/github_repo.txt && echo ${{ secrets.LOKI_HOST }} > garrysmod/_workflow/loki_host.txt && echo ${{ secrets.LOKI_APIKEY }} > garrysmod/_workflow/loki_api.txt && tar -czf gluatest/docker/_gluatest_artifacts/gm_secrets.tar.gz -C . garrysmod && rm -rf garrysmod"
@@ -428,12 +428,12 @@ jobs:
   test_64bit_holylua_noghostinj:
     name: "Test x86-64 branch (HolyLua, No GhostInj)"
     needs: setup_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     with:
       branch: x86-64
       extra-startup-args: "-holylib_lua +holylib_module_debug 0"
       download-artifact: "gluatest_no_ghostinj_64x"
-      no-checkout: "true"
+      no-checkout: true
       timeout: "10"
     secrets:
       secret-additional-setup: "mkdir -p garrysmod/ && mkdir -p garrysmod/_workflow/ && echo https://loki-public.raphaelit7.com > garrysmod/_workflow/loki_public_host.txt && echo ${{ github.repository }} > garrysmod/_workflow/github_repo.txt && echo ${{ secrets.LOKI_HOST }} > garrysmod/_workflow/loki_host.txt && echo ${{ secrets.LOKI_APIKEY }} > garrysmod/_workflow/loki_api.txt && tar -czf gluatest/docker/_gluatest_artifacts/gm_secrets.tar.gz -C . garrysmod && rm -rf garrysmod"
@@ -441,7 +441,7 @@ jobs:
   test_32x_luajit:
     name: "Test 32x branches (LuaJIT)"
     needs: setup_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     strategy:
       matrix:
         branch:
@@ -451,7 +451,7 @@ jobs:
     with:
       extra-startup-args: "-usegh -holylib_enable_luajit 1 +holylib_module_debug 0"
       download-artifact: "gluatest_32x"
-      no-checkout: "true"
+      no-checkout: true
       branch: ${{ matrix.branch }}
       timeout: "10"
     secrets:
@@ -460,12 +460,12 @@ jobs:
   test_64bit_luajit:
     name: "Test x86-64 branch (LuaJIT)"
     needs: setup_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     with:
       branch: x86-64
       extra-startup-args: "-usegh -holylib_enable_luajit 1 +holylib_module_debug 0"
       download-artifact: "gluatest_64x"
-      no-checkout: "true"
+      no-checkout: true
       timeout: "10"
     secrets:
       secret-additional-setup: "mkdir -p garrysmod/ && mkdir -p garrysmod/_workflow/ && echo https://loki-public.raphaelit7.com > garrysmod/_workflow/loki_public_host.txt && echo ${{ github.repository }} > garrysmod/_workflow/github_repo.txt && echo ${{ secrets.LOKI_HOST }} > garrysmod/_workflow/loki_host.txt && echo ${{ secrets.LOKI_APIKEY }} > garrysmod/_workflow/loki_api.txt && tar -czf gluatest/docker/_gluatest_artifacts/gm_secrets.tar.gz -C . garrysmod && rm -rf garrysmod"
@@ -480,7 +480,7 @@ jobs:
     runs-on: ubuntu-latest
     container: raphaelit7/gmod-builder:latest_64x
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         name: "Checkout build tool files"
         with:
           sparse-checkout: source/_prebuildtools
@@ -508,14 +508,14 @@ jobs:
       matrix:
         arch: [32x, 64x]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         name: "Checkout gmod_tests repo"
         with:
           sparse-checkout: lua
           repository: 'RaphaelIT7/gmod_tests'
           path: 'gmod_tests'
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         name: "Download ${{ matrix.arch }} artifact"
         with:
           name: "gluatest_${{ matrix.arch }}"
@@ -535,7 +535,7 @@ jobs:
           tar -czf gmod_tests.tar.gz ghostinj.dll garrysmod/
           tar -czf gmod_tests_no_ghostinj.tar.gz garrysmod/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         name: "Upload tar"
         with:
           name: gmod_tests_${{ matrix.arch }}
@@ -543,7 +543,7 @@ jobs:
           compression-level: 9
           retention-days: 1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         name: "Upload tar"
         with:
           name: gmod_tests_no_ghostinj_${{ matrix.arch }}
@@ -554,7 +554,7 @@ jobs:
   test_gmod_tests_32bit:
     name: "Test 32x branches (gmod_tests)"
     needs: setup_gmod_tests_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     strategy:
       matrix:
         branch:
@@ -570,14 +570,14 @@ jobs:
       branch: ${{ matrix.branch }}
       extra-startup-args: "${{ matrix.artifact.args }} -maxplayers 64"
       download-artifact: ${{ matrix.artifact.name }}
-      no-checkout: "true"
+      no-checkout: true
       additional-setup: "curl -L -o gluatest/docker/_gluatest_artifacts/linux.tar.gz https://github.com/RaphaelIT7/gmod-holytest/releases/latest/download/linux.tar.gz"
       map: gm_glua_tests
 
   test_gmod_tests_64bit:
     name: "Test x86-64 branch (gmod_tests)"
     needs: setup_gmod_tests_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     strategy:
       matrix:
         artifact:
@@ -589,7 +589,7 @@ jobs:
       branch: x86-64
       extra-startup-args: "${{ matrix.artifact.args }} -maxplayers 64"
       download-artifact: ${{ matrix.artifact.name }}
-      no-checkout: "true"
+      no-checkout: true
       additional-setup: "curl -L -o gluatest/docker/_gluatest_artifacts/linux.tar.gz https://github.com/RaphaelIT7/gmod-holytest/releases/latest/download/linux.tar.gz"
       map: gm_glua_tests
 
@@ -597,7 +597,7 @@ jobs:
     if: false
     name: "Test 32x branches (gmod_tests & VPhysics replacement)"
     needs: setup_gmod_tests_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     strategy:
       matrix:
         branch:
@@ -613,7 +613,7 @@ jobs:
       branch: ${{ matrix.branch }}
       extra-startup-args: "${{ matrix.artifact.args }} -maxplayers 64 -holylib_replaceivp"
       download-artifact: ${{ matrix.artifact.name }}
-      no-checkout: "true"
+      no-checkout: true
       additional-setup: "curl -L -o gluatest/docker/_gluatest_artifacts/linux.tar.gz https://github.com/RaphaelIT7/gmod-holytest/releases/latest/download/linux.tar.gz"
       map: gm_glua_tests
 
@@ -621,7 +621,7 @@ jobs:
     if: false
     name: "Test x86-64 branch (gmod_tests & VPhysics replacement)"
     needs: setup_gmod_tests_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     strategy:
       matrix:
         artifact:
@@ -633,7 +633,7 @@ jobs:
       branch: x86-64
       extra-startup-args: "${{ matrix.artifact.args }} -maxplayers 64 -holylib_replaceivp"
       download-artifact: ${{ matrix.artifact.name }}
-      no-checkout: "true"
+      no-checkout: true
       additional-setup: "curl -L -o gluatest/docker/_gluatest_artifacts/linux.tar.gz https://github.com/RaphaelIT7/gmod-holytest/releases/latest/download/linux.tar.gz"
       map: gm_glua_tests
 
@@ -641,7 +641,7 @@ jobs:
     if: false
     name: "Test 32x branches (gmod_tests & VPhysics replacement)"
     needs: setup_gmod_tests_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     strategy:
       matrix:
         branch:
@@ -657,7 +657,7 @@ jobs:
       branch: ${{ matrix.branch }}
       extra-startup-args: "${{ matrix.artifact.args }} -maxplayers 64 -holylib_enable_luajit 1"
       download-artifact: ${{ matrix.artifact.name }}
-      no-checkout: "true"
+      no-checkout: true
       additional-setup: "curl -L -o gluatest/docker/_gluatest_artifacts/linux.tar.gz https://github.com/RaphaelIT7/gmod-holytest/releases/latest/download/linux.tar.gz"
       map: gm_glua_tests
 
@@ -665,7 +665,7 @@ jobs:
     if: false
     name: "Test x86-64 branch (gmod_tests & LuaJIT replacement)"
     needs: setup_gmod_tests_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     strategy:
       matrix:
         artifact:
@@ -677,7 +677,7 @@ jobs:
       branch: x86-64
       extra-startup-args: "${{ matrix.artifact.args }} -maxplayers 64 -holylib_enable_luajit 1"
       download-artifact: ${{ matrix.artifact.name }}
-      no-checkout: "true"
+      no-checkout: true
       additional-setup: "curl -L -o gluatest/docker/_gluatest_artifacts/linux.tar.gz https://github.com/RaphaelIT7/gmod-holytest/releases/latest/download/linux.tar.gz"
       map: gm_glua_tests
 
@@ -685,7 +685,7 @@ jobs:
     if: false # always() Enable it if a unknown crash is happening. We'll test every single module.
     name: "Find the crash cause"
     needs: setup_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     strategy:
       fail-fast: false
       matrix:
@@ -722,7 +722,7 @@ jobs:
       branch: dev
       extra-startup-args: "-usegh -holylib_startdisabled -holylib_enable_${{ matrix.module }} 1"
       download-artifact: "gluatest_32x"
-      no-checkout: "true"
+      no-checkout: true
 
   # -------
   # HolyLib Example DLL jobs
@@ -730,7 +730,7 @@ jobs:
 
   build_exampledll_linux:
     name: "Build ExampleDLL"
-    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
+    uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
       PROJECT_PATH: "example-module-dll/"
       PROJECT_NAME: "exampledll"
@@ -758,12 +758,12 @@ jobs:
             dll_artifact: gmsv_exampledll_linux64.dll (64x)
             config_path: x64
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         name: "Download ${{ matrix.arch }} artifact"
         with:
           name: "gluatest_${{ matrix.arch }}"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         name: "Download module"
         with:
           name: "${{ matrix.dll_artifact }}"
@@ -790,7 +790,7 @@ jobs:
           tar -czf gluatest_exampledll.tar.gz ghostinj.dll garrysmod/
           tar -czf gluatest_exampledll_no_ghostinj.tar.gz garrysmod/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         name: "Upload tar"
         with:
           name: gluatest_exampledll_${{ matrix.arch }}
@@ -798,7 +798,7 @@ jobs:
           compression-level: 9
           retention-days: 1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         name: "Upload tar"
         with:
           name: gluatest_exampledll_no_ghostinj_${{ matrix.arch }}
@@ -809,7 +809,7 @@ jobs:
   test_exampledll_32bit:
     name: "Test ExampleDLL 32x branches (No GhostInj)"
     needs: setup_exampledll_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     strategy:
       matrix:
         branch:
@@ -825,13 +825,13 @@ jobs:
       branch: ${{ matrix.branch }}
       extra-startup-args: "${{ matrix.artifact.args }} -maxplayers 64"
       download-artifact: ${{ matrix.artifact.name }}
-      no-checkout: "true"
+      no-checkout: true
       timeout: "10"
 
   test_exampledll_64bit:
     name: "Test ExampleDLL x86-64 branch"
     needs: setup_exampledll_artifacts
-    uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
+    uses: ./.github/workflows/run_gluatests.yml
     strategy:
       matrix:
         artifact:
@@ -843,5 +843,5 @@ jobs:
       branch: x86-64
       extra-startup-args: "${{ matrix.artifact.args }} -maxplayers 64"
       download-artifact: ${{ matrix.artifact.name }}
-      no-checkout: "true"
+      no-checkout: true
       timeout: "10"

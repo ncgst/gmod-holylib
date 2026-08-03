@@ -39,11 +39,11 @@ jobs:
           COMMAND="$COMMAND | xargs rm -f -- && cd ../../"
 
           echo "Generated Command: $COMMAND"
-          echo "::set-output name=COMMAND::$COMMAND"
+          echo "COMMAND=$COMMAND" >> "$GITHUB_OUTPUT"
 
   build_holylib:
     needs: build_custom_version
-    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
+    uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
       PROJECT_NAME: "holylib"
       BUILD_64x: "true"
@@ -61,7 +61,7 @@ jobs:
       ADDITIONAL_LINUX_64_SETUP: ${{ needs.build_custom_version.outputs.COMMAND }}
 
   build_ghostinj:
-    uses: RaphaelIT7/gmod-common-module-base/.github/workflows/compile.yml@workflow
+    uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
       PROJECT_PATH: "ghostinj-dll/"
       PROJECT_NAME: "ghostinj"
