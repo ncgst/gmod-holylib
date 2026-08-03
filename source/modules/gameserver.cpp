@@ -34,6 +34,40 @@ static ConVar gameserver_connectionlesspackethook("holylib_gameserver_connection
 ConVar sv_filter_nobanresponse("sv_filter_nobanresponse", "0", 0, "If enabled, a blocked ip won't be informed that its even blocked.");
 static ConVar gameserver_rawclients("holylib_gameserver_rawclients", "0", 0, "Experimental - Exposes the CBaseClient's even when their empty/have no clients connected");
 
+// NotifyClientDisconnect can reach the module after IsConnected() has already
+// flipped to false, while the CBaseClient object is still alive on the native
+// callback stack. Permit Lua to read that one client only for the duration of
+// HolyLib:OnClientDisconnect so queue cleanup can obtain its identity/state.
+// Outside that narrow scope the existing fail-closed validity rule remains.
+static thread_local CBaseClient* g_pLuaDisconnectingClient = nullptr;
+
+static bool IsCBaseClientAccessibleFromLua(CBaseClient* pClient)
+{
+	return pClient && (
+		gameserver_rawclients.GetBool() ||
+		pClient == g_pLuaDisconnectingClient ||
+		pClient->IsConnected()
+	);
+}
+
+class ScopedLuaDisconnectingClientAccess
+{
+public:
+	explicit ScopedLuaDisconnectingClientAccess(CBaseClient* pClient) :
+		m_pPrevious(g_pLuaDisconnectingClient)
+	{
+		g_pLuaDisconnectingClient = pClient;
+	}
+
+	~ScopedLuaDisconnectingClientAccess()
+	{
+		g_pLuaDisconnectingClient = m_pPrevious;
+	}
+
+private:
+	CBaseClient* m_pPrevious;
+};
+
 static CGameServerModule g_pGameServerModule;
 IModule* pGameServerModule = &g_pGameServerModule;
 
@@ -127,7 +161,7 @@ public:
 };
 
 PushReferenced_LuaClass(CBaseClient)
-SpecialGet_LuaClass(CBaseClient, CHLTVClient, "CBaseClient", (gameserver_rawclients.GetBool() || pVar->IsConnected()))
+SpecialGet_LuaClass(CBaseClient, CHLTVClient, "CBaseClient", IsCBaseClientAccessibleFromLua(pVar))
 
 Default__index(CBaseClient);
 Default__newindex(CBaseClient);
@@ -4430,13 +4464,16 @@ void CGameServerModule::OnClientDisconnect(CBaseClient* pClient)
 
 	if (g_Lua)
 	{
-		if (Lua::PushHook("HolyLib:OnClientDisconnect"))
 		{
-			Push_CBaseClient(g_Lua, pClient);
-			LuaUserData* pData = Get_CBaseClient_Data(g_Lua, -1, false);
-			g_Lua->CallFunctionProtected(2, 0, true);
-			if (pData)
-				pData->ClearLuaTable(g_Lua);
+			ScopedLuaDisconnectingClientAccess access(pClient);
+			if (Lua::PushHook("HolyLib:OnClientDisconnect"))
+			{
+				Push_CBaseClient(g_Lua, pClient);
+				LuaUserData* pData = Get_CBaseClient_Data(g_Lua, -1, false);
+				g_Lua->CallFunctionProtected(2, 0, true);
+				if (pData)
+					pData->ClearLuaTable(g_Lua);
+			}
 		}
 
 		// Our IsValid function checks for IsConnected, so technically we don't need to delete the userdata at all
