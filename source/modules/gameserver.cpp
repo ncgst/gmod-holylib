@@ -4206,6 +4206,12 @@ static QueuePromotionResult CommitQueuePromotion(CGameClient* origin, CGameClien
 	// Phase B starts here. target is a verified empty real slot; invoking the
 	// game-DLL-facing Inactivate path on it is unnecessary and unsafe.
 	target->Clear();
+
+	// Connect synchronously fires player_connect/player_connect_client. Seed the
+	// authenticated identity before that callback boundary so networkid cannot
+	// expose the previous occupant of this reusable real-slot object. Connect may
+	// alter client fields, so the complete transfer below still reapplies it.
+	target->m_SteamID = state.steamID;
 	target->Connect(state.name, state.userID, state.channel, state.fakePlayer, state.clientChallenge);
 
 	// Connect synchronously fires game events/Lua. The channel destructor hook
