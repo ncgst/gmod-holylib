@@ -700,13 +700,21 @@ struct SavedCrash
 {
 	int signal;
 	siginfo_t info;
-	ucontext_t context;
+	gregset_t gregs;
 
 	void Store(int signalCode, siginfo_t* signalInfo, void* ucontext)
 	{
 		this->signal = signalCode;
 		memcpy(&this->info, signalInfo, sizeof(siginfo_t));
-		memcpy(&this->context, (ucontext_t*)ucontext, sizeof(ucontext_t));
+
+		ucontext_t* context = static_cast<ucontext_t*>(ucontext);
+		memcpy(this->gregs, context->uc_mcontext.gregs, sizeof(this->gregs));
+	}
+
+	void RestoreGeneralRegisters(void* ucontext) const
+	{
+		ucontext_t* context = static_cast<ucontext_t*>(ucontext);
+		memcpy(context->uc_mcontext.gregs, this->gregs, sizeof(this->gregs));
 	}
 };
 
@@ -769,7 +777,10 @@ static void RestoreDefaultHandler()
 
 /*
 	Restores the original handler and returns to the code that threw the signal.
-	This is to allow the server to properly crash and to create the default debug.log file
+	This is to allow the server to properly crash and to create the default debug.log file.
+
+	Do not call sigreturn/setcontext manually here. Returning from CrashHandler lets
+	the normal Linux signal trampoline restore the live kernel-created signal frame.
 */
 static void ReturnSignal()
 {
@@ -777,8 +788,6 @@ static void ReturnSignal()
 
 	if (g_bInducedCrash.load())
 		abort();
-	else
-		sigreturn(nullptr);
 }
 
 static void GenerateCrashFileName(char* buffer, int bufferSize)
@@ -799,23 +808,28 @@ static void GenerateCrashFileName(char* buffer, int bufferSize)
 
 static void DumpRegister(int fd, gregset_t& registers, const char* name, int idx)
 {
-	int32_t sval = (int32_t)registers[idx];
-	uint32_t uval = (uint32_t)registers[idx];
+	intptr_t sval = static_cast<intptr_t>(registers[idx]);
+	uintptr_t uval = static_cast<uintptr_t>(registers[idx]);
 
 	dprintf(fd,
-		"  %-8s 0x%08x  %d\n",
-		name, uval, sval
+		"  %-8s 0x%0*" PRIxPTR "  %" PRIdPTR "\n",
+		name,
+		static_cast<int>(sizeof(uintptr_t) * 2),
+		uval,
+		sval
 	);
 };
 
 static bool AttemptLuaCallback(bool bMainThreadCrash);
 static void CrashHandler(int signal, siginfo_t* signalInfo, void* ucontext)
 {
-	// ToDo: Fix this in the future
-	// If we hit this, we- the handler crashed in backtrace, so we restore the original signal for the core dump / gdb to be right.
+	// If the handler itself crashed while generating the backtrace, restore the
+	// original crash's general registers into THIS kernel-created signal frame.
+	// Do not call setcontext() on a copied signal ucontext: its FP/XSTATE storage
+	// is not safely relocatable and can make setcontext() crash while restoring MXCSR.
 	if (g_bAttemptedBacktrace.load())
 	{
-		setcontext(&g_pSavedCrash.context);
+		g_pSavedCrash.RestoreGeneralRegisters(ucontext);
 		ReturnSignal();
 		return;
 	} else
@@ -830,11 +844,10 @@ static void CrashHandler(int signal, siginfo_t* signalInfo, void* ucontext)
 		if (signalData)
 		{
 			dprintf(signalData->fileDescriptor, "CrashHandler crashed while attempting Lua callback!\n");
-			// iirc it is not expected that this function returns since it jumps straight to execution anyways
-			// We DID crash, BUT we want GDB to not be messed up by us having tried to call Lua
-			// So we attempt to restore the previous crash
-			RestoreDefaultHandler();
-			setcontext(&signalData->savedCrash.context);
+
+			// Restore only the original general registers into the current, valid
+			// kernel signal frame. Keep this frame's FP/XSTATE state intact.
+			signalData->savedCrash.RestoreGeneralRegisters(ucontext);
 		}
 
 		ReturnSignal();
