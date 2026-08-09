@@ -1292,19 +1292,26 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 
 	std::string fileName = clientFiles->GetString(fileID);
 	GarrysMod::Lua::LuaFile* luaFile = Lua::GetShared()->GetCache(fileName);
+	const HolyLib::LuaPack::DeliveryDecision delivery = HolyLib::LuaPack::DecideDeliveryForClient(
+		clientIdx, fileName, luaFile ? luaFile->contents.length() : 0);
+	if (delivery.action == HolyLib::LuaPack::DeliveryAction::Stub && delivery.compressed)
+	{
+		// A stub is a normal, reliably delivered LuaFileDownload. It preserves the engine's
+		// per-file barrier contract while the multi-megabyte payload stays exclusively on FastDL.
+		SendCompressedLuaFile(clientIdx, fileID, *delivery.compressed);
+		return;
+	}
+	if (delivery.action == HolyLib::LuaPack::DeliveryAction::Reject)
+	{
+		HolyLib::LuaPack::DisconnectRequiredClient(clientIdx, delivery.failure);
+		return;
+	}
+
 	if (!luaFile)
 	{
 		DevWarning(PROJECT_NAME " - gmoddatapack: Client requested file but doesn't exist! \"%s\"\n", fileName.c_str());
 		if (HolyLib::LuaPack::IsEnabled())
 			SendOriginalLuaFile(pDataPack, clientIdx, fileID);
-		return;
-	}
-
-	if (const Bootil::AutoBuffer* stub = HolyLib::LuaPack::StubForClient(clientIdx, fileName, luaFile->contents.length()))
-	{
-		// A stub is a normal, reliably delivered LuaFileDownload. It preserves the engine's
-		// per-file barrier contract while the multi-megabyte payload stays exclusively on FastDL.
-		SendCompressedLuaFile(clientIdx, fileID, *stub);
 		return;
 	}
 

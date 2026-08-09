@@ -33,10 +33,30 @@ namespace HolyLib::LuaPack
 		double generationRetentionSeconds = 300.0;
 		double objectRetentionSeconds = 604800.0;
 		double readyDeadlineSeconds = 30.0;
+		bool requiredStubbing = false;
+		bool allowOptOut = true;
 		bool optimisticStubbing = false;
 		unsigned int optimisticPrefixFiles = 256;
 		unsigned long long optimisticPrefixBytes = 262144;
 		double unreadyTtlSeconds = 900.0;
+	};
+
+	enum class DeliveryAction
+	{
+		Native,
+		Stub,
+		Reject,
+	};
+
+	struct DeliveryDecision
+	{
+		DeliveryDecision(DeliveryAction deliveryAction = DeliveryAction::Native,
+			const Bootil::AutoBuffer* payload = nullptr, const char* rejectionFailure = nullptr)
+			: action(deliveryAction), compressed(payload), failure(rejectionFailure) {}
+
+		DeliveryAction action;
+		const Bootil::AutoBuffer* compressed;
+		const char* failure;
 	};
 
 	const Config& GetConfig();
@@ -52,7 +72,8 @@ namespace HolyLib::LuaPack
 	void CaptureFile(const GarrysMod::Lua::LuaFile* file);
 	std::string PrepareVanillaFile(const std::string& virtualPath, const std::string& contents);
 	bool ConsumeBootstrapRefresh();
-	const Bootil::AutoBuffer* StubForClient(int slot, const std::string& virtualPath, size_t nativeSourceBytes);
+	DeliveryDecision DecideDeliveryForClient(int slot, const std::string& virtualPath, size_t nativeSourceBytes);
+	void DisconnectRequiredClient(int slot, const char* failure);
 	void ClientConnect(int slot);
 	void ClientActive(int slot);
 	void ClientDisconnect(int slot);

@@ -14,6 +14,8 @@ Evidence that was available:
 - A publicly committed recovered incumbent bootstrap at `eoan-ermine/urfim_ww2`, commit `2bb21fc383301c125753ef95640078bdf158f7ef`, path `addons/urf_plib/lua/includes/init.lua`. It is used only as behavioral evidence. HolyLib's bootstrap was written independently.
 - `danielga/sourcesdk-minimal` public interfaces for signon states, cvar flags, string tables, and GMod client messages.
 
+Later follow-up also inspected an archived Linux x86-64 incumbent plugin (SHA-256 `7ba78ad490d9d554ac1b19d4e88a825889f1acfc8ef1375a24be213d4cf11395`, 5,829,800 bytes). Its pre-Lua opt-out path asks the engine for the client's `tv_nochat` user setting, compares it with the exact value `no_gluapack`, and stores a per-slot boolean. HolyLib independently implements only that observable protocol through `CBaseClient::GetUserSetting`; no incumbent code or payload is reused.
+
 Offsets below are ELF virtual addresses in the two target `server.so` files, not stable signatures.
 
 ## Findings 1–12
@@ -48,7 +50,7 @@ The public bootstrap's resolver is named `gluapack`; it hashes `debug.getinfo(2,
 
 The prior reconstruction is corrected in one respect: the recovered incumbent bootstrap does **not** override `include` or `RunString`.
 
-Implementation decision: use a generation-explicit, independently named stub `return __holypack("<generation>")()` and cover `CompileFile`, `include`, and identifier-based `RunString`, always falling back to the originals when a key is absent.
+Implementation decision: use independently named, generation-explicit stubs: `return __holypack("<generation>", false)()` for the fail-open lane and the same payload with `true` for required joins. Cover `CompileFile`, `include`, and identifier-based `RunString`, always falling back to the originals when a key is absent.
 
 ### 5. Pack layout, compression, crypto, and MD5 — CONFIRMED client-side; server producer remains OPEN
 
@@ -99,7 +101,7 @@ Implementation decision: compose through HolyLib's existing `AddOrUpdateFile` ow
 
 The recovered `failed(message, disconnect, openHelp)` installs a no-op resolver when `disconnect` is truthy. Missing-pack and MD5-mismatch sites pass a disconnect reason. At label `::failed::`, however, `RunConsoleCommand("disconnect")` executes only when `cl_downloadfilter ~= "none"`; the code then requires three base modules and returns. Thus the exact downloads-disabled branch does not disconnect and cannot install the real packed Lua state: it is a genuine limbo path.
 
-Implementation decision: HolyLib never acknowledges a missing, undecodable, undecompressible, unparsable, or MD5-mismatched generation. It prints actionable download-filter guidance and continues the ordinary init body. Because the server has not received READY, every requested file is delivered normally. No client waits silently and no forced disconnect is required for recovery.
+Implementation decision: HolyLib retains that behavior in its default fail-open lane. Its separately configured required join lane marks placeholders explicitly, reports an unresolvable required stub to the server without scheduling an automatic retry, and disconnects with the documented `+tv_nochat no_gluapack` opt-out. The server also rejects a required join before sending placeholders when its pinned object is not in the engine download queue. After a first successful READY, ordinary live-autorefresh gaps keep their existing native handoff so a source edit does not mass-kick active players.
 
 ### 12. Sigscan validity — CONFIRMED for HolyLib symbols; incumbent comparison OPEN
 
@@ -120,7 +122,8 @@ What would settle it: provide both stripped plugin architectures plus the exact 
 | No encryption or secret | Finding 5; clean-room/no-DRM requirement |
 | Atomic retained-generation manifest | Findings 8 and 9 |
 | Init-file bootstrap excluded from stubbing | Finding 10 |
-| Missing/corrupt pack means no READY, not limbo | Finding 11 |
+| Missing/corrupt pack means native recovery by default, or a kick in required mode | Finding 11 |
+| `tv_nochat=no_gluapack` selects a per-slot native lane before Lua | Follow-up native artifact |
 | Only HTTP carries the pack body | Findings 1, 7, and 9 |
 
 ## Remaining runtime checks

@@ -9,7 +9,9 @@ The feature is experimental and defaults off. The `gmoddatapack` module itself m
 - A connecting slot is pinned to the current immutable generation.
 - The client mounts and validates downloaded packs before sending `READY(generation, md5)`.
 - A delayed READY for a superseded pin is accepted, then the active client is immediately handed the latest generation. The handoff retries until acknowledged, so back-to-back hotfixes converge instead of leaving a client ready on an intermediate pack.
-- Only a ready slot receives tiny per-file stubs. The full init file first follows HolyLib's existing path so it can carry the bootstrap; after that, a non-ready, expired, corrupt, downloads-disabled, or otherwise uncertain slot is handed directly to the native `GModDataPack::SendFileToClient` implementation.
+- With `required=0`, only a ready slot receives tiny per-file stubs. The full init file first follows HolyLib's existing path so it can carry the bootstrap; after that, an uncertain slot is handed directly to native `GModDataPack::SendFileToClient` unless the separate optimistic mode is enabled.
+- With `required=1`, the init file is still real, but every other connecting request is answered immediately with a required-generation stub without waiting for READY. A missing generation, an object unavailable during the engine download phase, a requested path absent from the generation, a client mount/validation failure, or an expired initial READY deadline disconnects that client. Required joins never silently rotate to native delivery.
+- A client can explicitly choose native delivery for its whole connection by presenting the exact userinfo value `tv_nochat=no_gluapack`, when `allow_optout=1`. The lane is read and latched on the first Lua request, before client Lua exists.
 - Every stub is an ordinary reliable `LuaFileDownload` for the requested file ID, so the Requesting Lua barrier advances.
 - Publishing creates the immutable object before replacing the one replicated manifest snapshot. At most `downloadable_limit` LuaPack objects are appended to Source's non-removable, level-lifetime `downloadables` table; later hotfix generations use the same validated HTTP handoff as connected-client autorefresh once a new join has spawned.
 - Old generations remain addressable until pins drain and their manifest-retention TTL passes. A separate object TTL prunes only files that are no longer retained **and** no longer present in the active `downloadables` table, so hotfix rebuilds cannot strand current-session joins. New joins are never offered an unbounded history of hotfix packs.
@@ -25,10 +27,12 @@ The feature is experimental and defaults off. The `gmoddatapack` module itself m
 | `holylib_gmoddatapack_luapack_downloadurl_policy` | `respect` | `respect`, `require`, or `lock` as described below. |
 | `holylib_gmoddatapack_luapack_ingest_url` | empty | Optional HTTP endpoint receiving the compressed object body. |
 | `holylib_gmoddatapack_luapack_ingest_method` | `PUT` | Method used by the optional ingest request. |
-| `holylib_gmoddatapack_luapack_downloadable_limit` | `1` | Maximum LuaPack objects appended to Source's level-lifetime `downloadables` table. `0` makes every generation post-spawn HTTP-only. Once exhausted, publication and autorefresh continue; new joins use native Lua during signon, then fetch and acknowledge their pinned generation after activation. The default bounds a hotfixed JIP to one engine-queued object plus at most one current-generation HTTP handoff. |
+| `holylib_gmoddatapack_luapack_downloadable_limit` | `1` | Maximum LuaPack objects appended to Source's level-lifetime `downloadables` table. `0` makes every generation post-spawn HTTP-only. Once exhausted, publication and autorefresh continue. Fail-open joins use native Lua during signon and fetch after activation; required joins are rejected until the current generation is engine-downloadable (normally after a level lifecycle boundary, or when the budget is sized to include it). |
 | `holylib_gmoddatapack_luapack_retention_ttl` | `300` | Seconds an unpinned superseded manifest entry remains retained. |
 | `holylib_gmoddatapack_luapack_object_retention_ttl` | `604800` | Minimum age in seconds before an unreferenced local object may be removed. `0` disables housekeeping. The effective value is never lower than `retention_ttl`; active `downloadables` and retained generations are always protected. Compatible ingest endpoints receive the same value in `X-HolyLib-LuaPack-Retention-Seconds`. |
-| `holylib_gmoddatapack_luapack_ready_deadline` | `180` | Seconds a silent **spawned** slot keeps its generation pinned in memory. The clock starts at client activation, not at connect: a fresh client can spend many minutes in map load and the Requesting-Lua burst before its Lua state exists, and the pin must survive all of it. A matching late acknowledgement is still accepted afterwards while the generation remains retained. |
+| `holylib_gmoddatapack_luapack_ready_deadline` | `180` | Seconds a silent **spawned** slot may remain unacknowledged. The clock starts at client activation, not at connect. Fail-open clients release the pin and use native delivery after expiry; required clients are kicked until their first successful READY. |
+| `holylib_gmoddatapack_luapack_required` | `0` | GluaPack-style fail-closed join mode. Non-opt-out clients receive required stubs during Requesting Lua without waiting for READY; pack or publication failures kick instead of using native Lua. |
+| `holylib_gmoddatapack_luapack_allow_optout` | `1` | Honor the exact pre-Lua userinfo value `tv_nochat=no_gluapack` as a per-connection native-delivery opt-out. |
 | `holylib_gmoddatapack_luapack_optimistic` | `0` | Speculatively stub large joins before the READY acknowledgement. See below. |
 | `holylib_gmoddatapack_luapack_optimistic_prefix_files` | `256` | Files delivered natively at the start of a join before speculation may begin. |
 | `holylib_gmoddatapack_luapack_optimistic_prefix_bytes` | `262144` | Native Lua source bytes delivered at the start of a join before speculation may begin. |
@@ -46,6 +50,22 @@ While luapack is enabled, `holylib_gmoddatapack_removeserverif` and `holylib_gmo
 - `lock` remembers its value while luapack is active and restores accidental changes. It does not invent a URL.
 
 The ingest worker is asynchronous and non-fatal. Requests carry the object path, MD5, and the configured object-retention TTL; a compatible endpoint may use that TTL to prune its own immutable-object store after preserving the newly uploaded object. This repository's `cpp-httplib` build is not linked to OpenSSL, so built-in ingestion accepts `http://` only and refuses to downgrade `https://`. Operators needing HTTPS can handle the pluggable server hook `HolyLib:OnLuaPackBuilt(generation, resourcePath, md5, compressedSize)` in their existing trusted uploader. Do not place credentials in archived cvars or commit them to configuration.
+
+## Required join mode and native opt-out
+
+`holylib_gmoddatapack_luapack_required 1` makes LuaPack canonical for new connections. The server still sends the real `includes/init.lua` so the resolver exists, then responds to each remaining requested file ID with a tiny reliable placeholder equivalent to `return __holypack("<generation>", true)()`. The second argument marks the payload fail-closed: if the immutable object is absent, corrupt, unparsable, MD5-invalid, or missing that file, the bootstrap reports failure without scheduling `retry`; the server kicks with opt-out instructions.
+
+The lane is fixed on the first Lua request. A player who needs native Lua must set this Garry's Mod launch option and restart before joining:
+
+```text
++tv_nochat no_gluapack
+```
+
+Source exposes `tv_nochat` as userinfo, so the server can read it before client Lua starts. Only the exact value `no_gluapack` opts out, and `holylib_gmoddatapack_luapack_allow_optout 0` disables the exception. Opt-out clients use native Lua for their entire connection and cannot switch back by sending a late READY.
+
+Required mode takes precedence over optimistic mode. It also requires the pinned generation to be present in Source's engine download queue during an initial join; the post-spawn HTTP handoff is too late for Requesting Lua. Because `downloadables` entries cannot safely be removed during a level, exhausting `downloadable_limit` or publishing a newer HTTP-only generation deliberately causes required new joins to be kicked instead of falling back. Plan hotfixes around a level change or size the per-level budget for the expected number of generations.
+
+Required mode is deliberately an admission policy, not a reason to kick already-playing users during every live Lua edit. After a connection has successfully acknowledged one generation, the existing autorefresh bridge remains fail-open while the replacement pack is built and fetched: changed paths are delivered natively during that handoff, then required-marked stubs resume after the new READY. An actual required stub that later becomes unresolvable still reports failure and is kicked.
 
 ## Optimistic join stubbing
 
@@ -93,6 +113,8 @@ holylib_gmoddatapack_luapack_kill
 
 The command sets the master switch to `0`. Stub decisions stop immediately; the next frame clears the replicated manifest. Existing and new file requests use normal Lua networking without a restart.
 
+Setting `holylib_gmoddatapack_luapack_required 0` changes the lane selected by future connections; a connection that already selected required or opt-out delivery remains on that lane. Use the master kill switch for an immediate all-client emergency return to native delivery.
+
 Optimistic join stubbing has its own independent switch: setting `holylib_gmoddatapack_luapack_optimistic 0` stops speculation on the next file request while leaving acknowledged-stub delivery and the rest of the feature untouched.
 
 ## FastDL layout
@@ -106,7 +128,7 @@ downloadables entry: data/<packdir>/abc....bsp
 client cache: download/data/<packdir>/abc....bsp
 ```
 
-Source string-table entries cannot be removed safely during a level, which is why `downloadable_limit` exists. Once the budget is exhausted, additional generations are not appended and JIP clients receive the current object through a retried post-spawn HTTP handoff. Mirror `garrysmod/data/<packdir>/` into the same relative `data/<packdir>/` path below the configured FastDL origin. CDN replication, overseas routing, cache invalidation, and `.bz2` generation are operator responsibilities. Do not configure a pipeline that removes a generation while it can still appear in the retained manifest. Local housekeeping runs after a successful publish and also preserves every object still registered in the current level's `downloadables` table; superseded hotfix objects therefore become removable only after both the TTL and a level lifecycle boundary make them safe.
+Source string-table entries cannot be removed safely during a level, which is why `downloadable_limit` exists. Once the budget is exhausted, additional generations are not appended: fail-open JIP clients receive the current object through a retried post-spawn HTTP handoff, while required JIP clients are rejected because that handoff occurs after Requesting Lua. Mirror `garrysmod/data/<packdir>/` into the same relative `data/<packdir>/` path below the configured FastDL origin. CDN replication, overseas routing, cache invalidation, and `.bz2` generation are operator responsibilities. Do not configure a pipeline that removes a generation while it can still appear in the retained manifest. Local housekeeping runs after a successful publish and also preserves every object still registered in the current level's `downloadables` table; superseded hotfix objects therefore become removable only after both the TTL and a level lifecycle boundary make them safe.
 
 ## Rollout and verification
 
@@ -116,10 +138,13 @@ Source string-table entries cannot be removed safely during a level, which is wh
 4. Off-peak, set `holylib_gmoddatapack_luapack_enable 1`. Confirm the log reports one immutable generation, the object exists on FastDL, and the manifest is non-empty.
 5. Join with downloads enabled. Confirm one `.bsp` HTTP object, a READY log for the pinned generation, and successful completion of Requesting Lua.
 6. Start a throttled join on generation G1, modify a registered Lua file to publish G2, and confirm that join still acknowledges/uses G1 while new joins use G2.
-7. Join with `cl_downloadfilter none`. Confirm the client prints guidance, sends no READY, receives native per-file Lua after the full bootstrap/init file, and reaches the game rather than remaining in limbo.
-8. Corrupt or remove the FastDL object and repeat. Confirm MD5/decompression/missing failures take the same native fallback.
-9. Exercise the kill switch during a join and confirm subsequent requests are real files, not stubs.
-10. Watch netchannel and HTTP byte counts at production population before expanding rollout.
+7. While `required=0`, join with `cl_downloadfilter none` and corrupt/remove the FastDL object. Confirm both cases still take the legacy native recovery path.
+8. Confirm the current generation is marked engine-downloadable, then set `holylib_gmoddatapack_luapack_required 1` with `allow_optout 1`. On a normal clean-cache join, confirm the summary reports the `required` lane and required stubs during Requesting Lua, followed by READY.
+9. In required mode, repeat with downloads disabled, a missing object, a corrupt object, and an MD5 mismatch. Each case must kick with the `+tv_nochat no_gluapack` instruction and must not schedule an automatic retry or rotate to native Lua.
+10. Restart a test client with launch option `+tv_nochat no_gluapack`. Confirm the summary reports `optout-native`, the join completes using native per-file Lua, and a forged/late READY cannot move that connection onto stubs.
+11. Exhaust `downloadable_limit` with a test hotfix and confirm a new required join is rejected rather than native-fallback. Perform the planned level lifecycle boundary and confirm the current generation becomes joinable again.
+12. Exercise the master kill switch during a join and confirm subsequent requests are real files, not stubs.
+13. Watch netchannel and HTTP byte counts at production population before expanding rollout.
 
 ## Risks and non-goals
 

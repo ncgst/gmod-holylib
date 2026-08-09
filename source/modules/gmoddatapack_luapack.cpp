@@ -62,6 +62,7 @@ namespace HolyLib::LuaPack
 		double retireAfter = 0.0;
 		bool engineDownloadable = false;
 		std::shared_ptr<Bootil::AutoBuffer> compressedStub;
+		std::shared_ptr<Bootil::AutoBuffer> compressedRequiredStub;
 		std::unordered_map<std::string, bool> files;
 		unsigned int pins = 0;
 	};
@@ -72,16 +73,22 @@ namespace HolyLib::LuaPack
 		double deadline = 0.0;
 		double nextHandoffAt = 0.0;
 		bool ready = false;
+		bool everReady = false;
 		bool active = false;
 		bool fallback = true;
 		bool holdsPin = false;
+		bool deliveryLaneResolved = false;
+		bool requiredLane = false;
+		bool optOut = false;
+		bool disconnectIssued = false;
 
-		// Optimistic join stubbing. All of this is per-connection state; ReleasePin resets it.
+		// Join delivery accounting. All of this is per-connection state; ReleasePin resets it.
 		std::string networkID;
 		bool nativeLatched = false;
 		bool joinSummaryLogged = false;
 		unsigned int joinNativeFiles = 0;
 		unsigned int joinOptimisticStubs = 0;
+		unsigned int joinRequiredStubs = 0;
 		unsigned int joinReadyStubs = 0;
 		unsigned long long joinNativeBytes = 0;
 	};
@@ -156,6 +163,18 @@ namespace HolyLib::LuaPack
 -- wrapper) and net.Receive do NOT exist yet.
 do
 	local getConVar = GetConVar_Internal or GetConVar
+	local mirrorFlags = (FCVAR_REPLICATED or 0) + (FCVAR_PROTECTED or 0) +
+		(FCVAR_DONTRECORD or 0) + (FCVAR_UNLOGGED or 0) + (FCVAR_UNREGISTERED or 0)
+	local function mirroredConVar(name, default)
+		local ok, convar = pcall(CreateConVar, name, default, mirrorFlags)
+		return (ok and convar) or (getConVar and getConVar(name))
+	end
+	local requiredConVar = mirroredConVar("holylib_gmoddatapack_luapack_required", "0")
+	local allowOptOutConVar = mirroredConVar("holylib_gmoddatapack_luapack_allow_optout", "1")
+	local sourceTvConVar = getConVar and getConVar("tv_nochat")
+	local clientOptedOut = allowOptOutConVar and allowOptOutConVar:GetBool() and sourceTvConVar and
+		sourceTvConVar:GetString() == "no_gluapack"
+	local requiredMode = requiredConVar and requiredConVar:GetBool() and not clientOptedOut
 	local installReceiver -- assigned by bootstrap(); installed later once net.Receive exists
 
 	local function warn(message)
@@ -179,8 +198,10 @@ do
 	-- on the wire before the reconnect tears the channel down, hence the timer; the server
 	-- also latches on its own when a speculated connection dies unacknowledged, so a lost
 	-- unready command still converges.
+	-- Required stubs pass a second true argument and never enter the retry/native-latch path.
 	local recoveryTaint = false
 	local recoverySignaled = false
+	local requiredFailureSignaled = false
 	local recoveryScheduled = false
 	local recoveryRetried = false
 	local function issueRetry()
@@ -195,8 +216,20 @@ do
 			timer.Simple(1, issueRetry)
 		end
 	end
-	local function stubRecovery(generation)
+	local function stubRecovery(generation, required)
+		-- A cached pre-required stub has no second argument. Fall back to replicated lane
+		-- policy so enabling required mode cannot resurrect the old automatic retry loop.
+		if required == nil then required = requiredMode end
 		recoveryTaint = true
+		if required then
+			if not requiredFailureSignaled then
+				requiredFailureSignaled = true
+				warn("required pack " .. tostring(generation) ..
+					" could not resolve this Lua file; waiting for the server to disconnect (opt out with +tv_nochat no_gluapack)")
+				RunConsoleCommand("holylib_luapack_failed", tostring(generation or ""))
+			end
+			return function() end
+		end
 		if not recoverySignaled then
 			recoverySignaled = true
 			warn("cannot resolve stubbed Lua for generation " .. tostring(generation) ..
@@ -217,16 +250,13 @@ do
 	-- Stubs must never hit a nil global, even when the full bootstrap below cannot run
 	-- (empty or unparsable manifest snapshot). installOverrides() replaces this guard.
 	if not _G.__holypack then
-		_G.__holypack = function(generation) return stubRecovery(generation) end
+		_G.__holypack = function(generation, required) return stubRecovery(generation, required) end
 	end
 
 	local function bootstrap()
 		if _G.__holypack_bootstrapped then return end
 
-		local flags = (FCVAR_REPLICATED or 0) + (FCVAR_PROTECTED or 0) +
-			(FCVAR_DONTRECORD or 0) + (FCVAR_UNLOGGED or 0) + (FCVAR_UNREGISTERED or 0)
-		local ok, manifestConVar = pcall(CreateConVar, "holylib_gmoddatapack_luapack_manifest", "", flags)
-		manifestConVar = ok and manifestConVar or getConVar("holylib_gmoddatapack_luapack_manifest")
+		local manifestConVar = mirroredConVar("holylib_gmoddatapack_luapack_manifest", "")
 		local snapshot = manifestConVar and manifestConVar:GetString() or ""
 		if snapshot == "" then return end
 
@@ -262,7 +292,7 @@ do
 
 		local currentGeneration, manifests = parseSnapshot(snapshot)
 		if not currentGeneration then
-			warn("ignored an invalid manifest snapshot; vanilla Lua delivery remains active")
+			warn("ignored an invalid manifest snapshot; no Lua pack generation can be acknowledged")
 			return
 		end
 
@@ -355,7 +385,7 @@ do
 
 			local originalCompileFile, originalInclude = CompileFile, include
 
-			function _G.__holypack(generation)
+			function _G.__holypack(generation, required)
 				local pack = packs[generation]
 				if not pack and not recoveryTaint and not lazyMountAttempted[generation] then
 					-- A speculative stub can arrive while the pack's FastDL download is still
@@ -369,7 +399,7 @@ do
 						RunConsoleCommand("holylib_luapack_ready", generation, manifest.md5)
 					end
 				end
-				if not pack then return stubRecovery(generation) end
+				if not pack then return stubRecovery(generation, required) end
 				selectedGeneration = generation
 				local info = debug.getinfo(2, "S")
 				local sourcePath = info and info.source or ""
@@ -379,7 +409,7 @@ do
 					-- file cannot be produced in place either way, so recover like an
 					-- unmounted generation instead of erroring the boot.
 					warn("pack " .. tostring(generation) .. " has no usable entry for " .. tostring(sourcePath))
-					return stubRecovery(generation)
+					return stubRecovery(generation, required)
 				end
 				return compiled
 			end
@@ -413,7 +443,7 @@ do
 
 				local manifest = manifestFromSnapshot(refreshSnapshot, generation)
 				if not manifest or downloadUrl == "" then
-					warn("autorefresh generation " .. tostring(generation) .. " has no usable FastDL manifest; future files will use vanilla delivery")
+					warn("autorefresh generation " .. tostring(generation) .. " has no usable FastDL manifest and cannot be acknowledged")
 					return
 				end
 				if packs[generation] then
@@ -428,13 +458,13 @@ do
 				http.Fetch(url, function(compressed)
 					local contents = util.Decompress(compressed or "")
 					if not contents or string.lower(util.MD5(contents)) ~= manifest.md5 then
-						warn("autorefresh generation " .. generation .. " failed decompression or MD5 validation; future files will use vanilla delivery")
+						warn("autorefresh generation " .. generation .. " failed decompression or MD5 validation and cannot be acknowledged")
 						return
 					end
 
 					local pack, parseError = parsePack(contents, manifest)
 					if not pack then
-						warn("autorefresh generation " .. generation .. " is invalid (" .. tostring(parseError) .. "); future files will use vanilla delivery")
+						warn("autorefresh generation " .. generation .. " is invalid (" .. tostring(parseError) .. ") and cannot be acknowledged")
 						return
 					end
 
@@ -447,7 +477,7 @@ do
 						RunConsoleCommand("holylib_luapack_ready", generation, manifest.md5)
 					end
 				end, function(message)
-					warn("autorefresh FastDL fetch failed for generation " .. generation .. ": " .. tostring(message) .. "; future files will use vanilla delivery")
+					warn("autorefresh FastDL fetch failed for generation " .. generation .. ": " .. tostring(message) .. "; the generation cannot be acknowledged")
 				end)
 			end)
 		end
@@ -479,9 +509,9 @@ do
 			end
 			if not mountedNow and generation == currentGeneration then
 				if downloadsDisabled then
-					warn("pack " .. generation .. " is missing and downloads are disabled; set cl_downloadfilter to mapsonly or all. This join will use vanilla Lua delivery")
+					warn("pack " .. generation .. " is missing and downloads are disabled; set cl_downloadfilter to mapsonly or all. Required delivery will disconnect; fail-open delivery can use native Lua")
 				else
-					warn("pack " .. generation .. " " .. failure .. "; staying on vanilla Lua delivery while the FastDL download finishes in the background")
+					warn("pack " .. generation .. " " .. failure .. "; waiting for the background FastDL download before it can be acknowledged")
 				end
 			end
 		end
@@ -518,7 +548,7 @@ do
 					timer.Remove("HolyLibLuaPackMount")
 				elseif attempts >= 60 then
 					if pendingManifests[currentGeneration] then
-						warn("pack " .. currentGeneration .. " could not be mounted after five minutes (last failure: " .. tostring(lastFailure[currentGeneration]) .. "); this session stays on vanilla Lua delivery")
+						warn("pack " .. currentGeneration .. " could not be mounted after five minutes (last failure: " .. tostring(lastFailure[currentGeneration]) .. ") and remains unacknowledged")
 					end
 				end
 			end)
@@ -526,7 +556,7 @@ do
 	end
 
 	local ok, message = xpcall(bootstrap, debug.traceback)
-	if not ok then Msg("[HolyLib luapack] bootstrap failed; vanilla Lua delivery remains active: " .. tostring(message) .. "\n") end
+	if not ok then Msg("[HolyLib luapack] bootstrap failed; no Lua pack generation can be acknowledged: " .. tostring(message) .. "\n") end
 end
 )HOLYLUAPACK";
 
@@ -746,9 +776,10 @@ end)
 		task->complete.store(true);
 	}
 
-	static std::shared_ptr<Bootil::AutoBuffer> BuildCompressedStub(const std::string& generation)
+	static std::shared_ptr<Bootil::AutoBuffer> BuildCompressedStub(const std::string& generation, bool required)
 	{
-		const std::string source = "return __holypack(\"" + generation + "\")()";
+		const std::string source = "return __holypack(\"" + generation + "\"" +
+			(required ? ",true)()" : ",false)()");
 		std::vector<unsigned char> hash(32);
 		picosha2::hash256_one_by_one hasher;
 		hasher.process(source.c_str(), source.c_str() + source.length() + 1);
@@ -795,6 +826,55 @@ end)
 	static bool IsValidSlot(int slot)
 	{
 		return slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT;
+	}
+
+	static void RecordNativeJoin(ClientPin& client, size_t nativeSourceBytes)
+	{
+		if (client.active)
+			return;
+
+		++client.joinNativeFiles;
+		client.joinNativeBytes += nativeSourceBytes;
+	}
+
+	static void ResolveDeliveryLane(int slot, ClientPin& client)
+	{
+		if (client.deliveryLaneResolved)
+			return;
+
+		const Config& currentConfig = GetConfig();
+		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		const char* optOutValue = baseClient ? baseClient->GetUserSetting("tv_nochat") : nullptr;
+		client.optOut = currentConfig.allowOptOut && optOutValue && strcmp(optOutValue, "no_gluapack") == 0;
+		client.requiredLane = currentConfig.requiredStubbing && !client.optOut;
+		client.deliveryLaneResolved = true;
+
+		if (client.optOut)
+		{
+			MarkFallback(client);
+			Msg(PROJECT_NAME " - luapack: client slot %i selected native delivery with tv_nochat=no_gluapack\n", slot);
+			return;
+		}
+
+		// The old optimistic-recovery latch only belongs to the fail-open lane. Required
+		// connections must either resolve their pack or be kicked, regardless of prior history.
+		if (!client.requiredLane && !client.networkID.empty())
+		{
+			auto latch = state.nativeLatches.find(client.networkID);
+			if (latch != state.nativeLatches.end())
+			{
+				if (ServerTime() <= latch->second)
+				{
+					client.nativeLatched = true;
+					Msg(PROJECT_NAME " - luapack: client slot %i (%s) selected fail-open delivery with a native latch from a failed speculative join\n",
+						slot, client.networkID.c_str());
+				}
+				else
+				{
+					state.nativeLatches.erase(latch);
+				}
+			}
+		}
 	}
 
 	static std::string DataDirectory(const std::string& packDirectory)
@@ -1098,7 +1178,7 @@ end)
 		const unsigned int registered = RegisteredPackObjectCount(downloadables, packDirectory);
 		if (registered >= limit)
 		{
-			Msg(PROJECT_NAME " - luapack: downloadables budget exhausted (%u/%u); generation '%s' will use the post-spawn HTTP handoff for new joins\n",
+			Msg(PROJECT_NAME " - luapack: downloadables budget exhausted (%u/%u); generation '%s' is HTTP-only (fail-open joins hand off after spawn; required joins are rejected)\n",
 				registered, limit, resourcePath.c_str());
 			return DownloadableRegistration::BudgetExhausted;
 		}
@@ -1224,7 +1304,7 @@ end)
 
 	static ConVar luapack_enable(
 		"holylib_gmoddatapack_luapack_enable", "0", FCVAR_ARCHIVE,
-		"Bundle clientside Lua for FastDL delivery. Disabled by default; vanilla Lua delivery remains the fallback");
+		"Bundle clientside Lua for FastDL delivery. Disabled by default; required versus fail-open delivery is configured separately");
 	static ConVar luapack_packdir(
 		"holylib_gmoddatapack_luapack_packdir", "holylib/luapack", FCVAR_ARCHIVE,
 		"Directory below garrysmod/data used for immutable Lua pack objects");
@@ -1253,9 +1333,15 @@ end)
 		"holylib_gmoddatapack_luapack_ready_deadline", "180", FCVAR_ARCHIVE,
 		"Seconds a silent spawned client keeps its generation pinned (the clock starts at activation, not connect); a matching late acknowledgement is still accepted afterwards",
 		true, 1.0f, true, 3600.0f);
+	static ConVar luapack_required(
+		"holylib_gmoddatapack_luapack_required", "0", FCVAR_ARCHIVE | FCVAR_REPLICATED,
+		"Require connecting clients to use the pinned engine-downloaded Lua pack; failures disconnect instead of falling back to native Lua");
+	static ConVar luapack_allow_optout(
+		"holylib_gmoddatapack_luapack_allow_optout", "1", FCVAR_ARCHIVE | FCVAR_REPLICATED,
+		"Allow a client whose tv_nochat userinfo is exactly no_gluapack to use native Lua for its entire connection");
 	static ConVar luapack_optimistic(
 		"holylib_gmoddatapack_luapack_optimistic", "0", FCVAR_ARCHIVE,
-		"Speculatively deliver generation stubs to large joins before the client acknowledges its pack. Off by default; the native join prefix and every fail-open path stay unchanged");
+		"Speculatively deliver generation stubs to fail-open joins before the client acknowledges its pack. Ignored by connections on the required lane");
 	static ConVar luapack_optimistic_prefix_files(
 		"holylib_gmoddatapack_luapack_optimistic_prefix_files", "256", FCVAR_ARCHIVE,
 		"Files delivered natively at the start of a join before speculative stubbing may begin",
@@ -1492,6 +1578,8 @@ end)
 		if (config.objectRetentionSeconds > 0.0)
 			config.objectRetentionSeconds = std::max(config.objectRetentionSeconds, config.generationRetentionSeconds);
 		config.readyDeadlineSeconds = luapack_ready_deadline.GetFloat();
+		config.requiredStubbing = luapack_required.GetBool();
+		config.allowOptOut = luapack_allow_optout.GetBool();
 		config.optimisticStubbing = luapack_optimistic.GetBool();
 		config.optimisticPrefixFiles = static_cast<unsigned int>(luapack_optimistic_prefix_files.GetInt());
 		config.optimisticPrefixBytes = static_cast<unsigned long long>(luapack_optimistic_prefix_bytes.GetInt());
@@ -1520,7 +1608,7 @@ end)
 		}
 
 		if (!state.stringTables)
-			Warning(PROJECT_NAME " - luapack: INetworkStringTableContainer is unavailable; FastDL publishing will stay fail-open\n");
+			Warning(PROJECT_NAME " - luapack: INetworkStringTableContainer is unavailable; FastDL publishing cannot start\n");
 		RefreshConfig();
 		state.featureEnabledLastFrame = IsEnabled();
 	}
@@ -1622,7 +1710,7 @@ end)
 				{
 					Warning(PROJECT_NAME " - luapack: Failed to atomically write pack %s\n", task->md5.c_str());
 				} else if (!CoordinateDownloadUrl(true)) {
-					Warning(PROJECT_NAME " - luapack: Pack %s exists but was not published; clients remain on vanilla delivery\n", task->md5.c_str());
+					Warning(PROJECT_NAME " - luapack: Pack %s exists but was not published; fail-open joins remain native and required joins are rejected\n", task->md5.c_str());
 					state.nextBuildAllowed = ServerTime() + 15.0;
 					std::lock_guard<std::mutex> lock(state.registryMutex);
 					state.buildRequested = true;
@@ -1632,7 +1720,7 @@ end)
 						currentConfig.packDirectory, currentConfig.downloadableLimit);
 					if (registration == DownloadableRegistration::Failed)
 					{
-						Warning(PROJECT_NAME " - luapack: Pack %s exists but was not published; clients remain on vanilla delivery\n", task->md5.c_str());
+						Warning(PROJECT_NAME " - luapack: Pack %s exists but was not published; fail-open joins remain native and required joins are rejected\n", task->md5.c_str());
 						state.nextBuildAllowed = ServerTime() + 15.0;
 						std::lock_guard<std::mutex> lock(state.registryMutex);
 						state.buildRequested = true;
@@ -1648,10 +1736,11 @@ end)
 					generation.engineDownloadable = registration == DownloadableRegistration::Registered;
 					generation.sourceRevision = task->sourceRevision;
 					generation.publishedAt = ServerTime();
-					generation.compressedStub = BuildCompressedStub(generation.id);
+					generation.compressedStub = BuildCompressedStub(generation.id, false);
+					generation.compressedRequiredStub = BuildCompressedStub(generation.id, true);
 					for (const FileRecord& file : task->files)
 						generation.files[NormalizePath(file.virtualPath)] = true;
-					if (!generation.compressedStub)
+					if (!generation.compressedStub || !generation.compressedRequiredStub)
 					{
 						Warning(PROJECT_NAME " - luapack: Failed to build generation stub; pack remains unpublished\n");
 						delete task;
@@ -1675,8 +1764,9 @@ end)
 					NotifyAutorefresh(previousGeneration, task);
 					NotifyPackBuilt(task, generation);
 					HousekeepObjects();
-					Msg(PROJECT_NAME " - luapack: Built immutable generation %s (%u compressed bytes, %u files)\n",
-						generation.id.c_str(), task->compressed.GetWritten(), static_cast<unsigned int>(task->files.size()));
+					Msg(PROJECT_NAME " - luapack: Built immutable generation %s (%u compressed bytes, %u files, engine-downloadable=%s)\n",
+						generation.id.c_str(), task->compressed.GetWritten(), static_cast<unsigned int>(task->files.size()),
+						generation.engineDownloadable ? "yes" : "no");
 				}
 			}
 
@@ -1722,6 +1812,11 @@ end)
 			if (!client.generation.empty() && !client.ready && !client.fallback && client.active &&
 				now > client.deadline)
 			{
+				if (client.requiredLane && !client.everReady)
+				{
+					DisconnectRequiredClient(slot, "the client did not acknowledge its required generation before the READY deadline");
+					continue;
+				}
 				MarkFallback(client);
 			}
 		}
@@ -1825,35 +1920,89 @@ end)
 		return refresh;
 	}
 
-	const Bootil::AutoBuffer* StubForClient(int slot, const std::string& virtualPath, size_t nativeSourceBytes)
+	DeliveryDecision DecideDeliveryForClient(int slot, const std::string& virtualPath, size_t nativeSourceBytes)
 	{
+		DeliveryDecision decision;
 		if (!IsEnabled() || !IsValidSlot(slot))
-			return nullptr;
+			return decision;
 
 		ClientPin& client = state.clients[slot];
-		if (client.fallback || client.generation.empty())
-			return nullptr;
-		auto generation = state.generations.find(client.generation);
-		if (generation == state.generations.end() || !generation->second.compressedStub)
-			return nullptr;
+		ResolveDeliveryLane(slot, client);
+		if (client.optOut)
+		{
+			RecordNativeJoin(client, nativeSourceBytes);
+			return decision;
+		}
 
 		const std::string path = NormalizePath(virtualPath);
+		if (client.requiredLane)
+		{
+			// Required mode governs admission. After this connection has mounted at least one
+			// generation, preserve the established hot-refresh behavior: changed paths remain
+			// native while a replacement HTTP generation is in flight, then stubs resume on READY.
+			if (client.active && client.everReady)
+			{
+				auto activeGeneration = state.generations.find(client.generation);
+				const bool stubbable = activeGeneration != state.generations.end() &&
+					activeGeneration->second.compressedRequiredStub && !IsInitFile(path) &&
+					activeGeneration->second.files.find(path) != activeGeneration->second.files.end();
+				if (client.ready && stubbable)
+					return {DeliveryAction::Stub, activeGeneration->second.compressedRequiredStub.get(), nullptr};
+				return decision;
+			}
+
+			if (client.generation.empty())
+				return {DeliveryAction::Reject, nullptr, "no generation was pinned before Lua transfer"};
+
+			auto generation = state.generations.find(client.generation);
+			if (generation == state.generations.end() || !generation->second.compressedRequiredStub)
+				return {DeliveryAction::Reject, nullptr, "the pinned generation is no longer available"};
+
+			// A connecting client can only mount an object already present in Source's resource
+			// phase. Spawned clients may receive later generations through the HTTP handoff.
+			if (!client.active && !generation->second.engineDownloadable)
+				return {DeliveryAction::Reject, nullptr, "the pinned generation is not in the engine download queue"};
+
+			// includes/init.lua must remain real because it installs __holypack. Every other
+			// request has to exist in the immutable generation; required mode never substitutes
+			// a native body when publication is stale or incomplete.
+			if (IsInitFile(path))
+			{
+				RecordNativeJoin(client, nativeSourceBytes);
+				return decision;
+			}
+			if (generation->second.files.find(path) == generation->second.files.end())
+				return {DeliveryAction::Reject, nullptr, "the requested path is absent from the pinned generation"};
+
+			++client.joinRequiredStubs;
+			if (client.joinRequiredStubs == 1)
+				Msg(PROJECT_NAME " - luapack: client slot %i is using required generation %s; stubbing the join without waiting for READY\n",
+					slot, client.generation.c_str());
+			return {DeliveryAction::Stub, generation->second.compressedRequiredStub.get(), nullptr};
+		}
+
+		if (client.fallback || client.generation.empty())
+			return decision;
+		auto generation = state.generations.find(client.generation);
+		if (generation == state.generations.end() || !generation->second.compressedStub)
+			return decision;
+
 		const bool stubbable = !IsInitFile(path) &&
 			generation->second.files.find(path) != generation->second.files.end();
 
 		if (client.ready)
 		{
 			if (!stubbable)
-				return nullptr;
+				return decision;
 			if (!client.active)
 				++client.joinReadyStubs;
-			return generation->second.compressedStub.get();
+			return {DeliveryAction::Stub, generation->second.compressedStub.get(), nullptr};
 		}
 
 		// Everything below is the pre-acknowledgement join burst. Requests from a spawned
 		// client that never acknowledged stay native: it may hold no mountable pack at all.
 		if (client.active)
-			return nullptr;
+			return decision;
 
 		const Config& currentConfig = GetConfig();
 		const bool prefixDelivered = client.joinNativeFiles >= currentConfig.optimisticPrefixFiles &&
@@ -1863,16 +2012,35 @@ end)
 		{
 			// Counted even while speculation is off or latched: the join summary is the
 			// measurement that sizes the prefix thresholds in the first place.
-			++client.joinNativeFiles;
-			client.joinNativeBytes += nativeSourceBytes;
-			return nullptr;
+			RecordNativeJoin(client, nativeSourceBytes);
+			return decision;
 		}
 
 		++client.joinOptimisticStubs;
 		if (client.joinOptimisticStubs == 1)
 			Msg(PROJECT_NAME " - luapack: client slot %i crossed the native prefix (%u files, %llu source bytes) before acknowledging generation %s; speculatively stubbing the rest of the join\n",
 				slot, client.joinNativeFiles, client.joinNativeBytes, client.generation.c_str());
-		return generation->second.compressedStub.get();
+		return {DeliveryAction::Stub, generation->second.compressedStub.get(), nullptr};
+	}
+
+	void DisconnectRequiredClient(int slot, const char* failure)
+	{
+		if (!IsValidSlot(slot))
+			return;
+
+		ClientPin& client = state.clients[slot];
+		if (client.disconnectIssued)
+			return;
+		client.disconnectIssued = true;
+
+		Warning(PROJECT_NAME " - luapack: disconnecting required-pack client slot %i: %s\n",
+			slot, failure ? failure : "unspecified required-pack failure");
+		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		if (baseClient)
+		{
+			baseClient->Disconnect("%s",
+				"Required LuaPack failed. Opt out: set launch option +tv_nochat no_gluapack, restart Garry's Mod, then reconnect.");
+		}
 	}
 
 	void ClientConnect(int slot)
@@ -1885,32 +2053,13 @@ end)
 		if (!IsEnabled())
 			return;
 
-		// The native latch is keyed by account, not slot: a client that reported (or silently
-		// died on) unresolvable stubs must get native files on its next attempt, whichever
-		// slot it reconnects into.
+		// Capture the account now; once the first Lua request selects a lane, fail-open
+		// delivery consults any optimistic-recovery latch by account rather than by slot.
 		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
 		const char* networkID = baseClient ? baseClient->GetNetworkIDString() : nullptr;
 		if (networkID && networkID[0] != '\0' &&
 			V_stricmp(networkID, "BOT") != 0 && V_stricmp(networkID, "UNKNOWN") != 0)
 			client.networkID = networkID;
-
-		if (!client.networkID.empty())
-		{
-			auto latch = state.nativeLatches.find(client.networkID);
-			if (latch != state.nativeLatches.end())
-			{
-				if (ServerTime() <= latch->second)
-				{
-					client.nativeLatched = true;
-					Msg(PROJECT_NAME " - luapack: client slot %i (%s) joins with native delivery latched after a failed speculative join\n",
-						slot, client.networkID.c_str());
-				}
-				else
-				{
-					state.nativeLatches.erase(latch);
-				}
-			}
-		}
 
 		if (state.currentGeneration.empty())
 			return;
@@ -1941,16 +2090,18 @@ end)
 			client.deadline = ServerTime() + GetConfig().readyDeadlineSeconds;
 
 		if (IsEnabled() && !client.joinSummaryLogged &&
-			(client.joinNativeFiles > 0 || client.joinOptimisticStubs > 0 || client.joinReadyStubs > 0))
+			(client.joinNativeFiles > 0 || client.joinOptimisticStubs > 0 ||
+				client.joinRequiredStubs > 0 || client.joinReadyStubs > 0))
 		{
 			client.joinSummaryLogged = true;
 			// The acknowledgement usually arrives after the client spawned (queued client
 			// commands only flush post-signon), so ready=no here is normal for stub joins.
-			Msg(PROJECT_NAME " - luapack: join summary slot %i (%s): %u native files (%llu source bytes), %u speculative stubs, %u acknowledged stubs, generation=%s ready=%s latched=%s fallback=%s\n",
+			Msg(PROJECT_NAME " - luapack: join summary slot %i (%s): %u native files (%llu source bytes), %u required stubs, %u speculative stubs, %u acknowledged stubs, lane=%s generation=%s ready=%s latched=%s fallback=%s\n",
 				slot,
 				client.networkID.empty() ? "?" : client.networkID.c_str(),
 				client.joinNativeFiles, client.joinNativeBytes,
-				client.joinOptimisticStubs, client.joinReadyStubs,
+				client.joinRequiredStubs, client.joinOptimisticStubs, client.joinReadyStubs,
+				client.optOut ? "optout-native" : (client.requiredLane ? "required" : "fail-open"),
 				client.generation.empty() ? "-" : client.generation.c_str(),
 				client.ready ? "yes" : "no",
 				client.nativeLatched ? "yes" : "no",
@@ -1988,6 +2139,15 @@ end)
 		if (!args || args->ArgC() < 1)
 			return MODULE_RESULT::CONTINUE;
 
+		if (V_stricmp(args->Arg(0), "holylib_luapack_failed") == 0)
+		{
+			// Required stubs use this fail-closed signal instead of the optimistic retry/latch
+			// path. Forging the private command can only disconnect the sending client.
+			if (IsEnabled() && IsValidSlot(slot) && state.clients[slot].requiredLane)
+				DisconnectRequiredClient(slot, "the client reported that its required generation could not resolve a stub");
+			return MODULE_RESULT::STOP;
+		}
+
 		if (V_stricmp(args->Arg(0), "holylib_luapack_unready") == 0)
 		{
 			// Always consume our private recovery command. A client sends it right before it
@@ -1997,6 +2157,11 @@ end)
 				return MODULE_RESULT::STOP;
 
 			ClientPin& client = state.clients[slot];
+			if (client.requiredLane)
+			{
+				DisconnectRequiredClient(slot, "the client reported an unresolvable required stub through the legacy recovery command");
+				return MODULE_RESULT::STOP;
+			}
 			MarkFallback(client); // whatever remains of this connection goes native immediately
 			client.nativeLatched = true;
 			if (!client.networkID.empty())
@@ -2017,6 +2182,8 @@ end)
 			return MODULE_RESULT::STOP;
 
 		ClientPin& client = state.clients[slot];
+		if (client.optOut)
+			return MODULE_RESULT::STOP;
 		const std::string generationId = args->Arg(1);
 		const std::string md5 = args->Arg(2);
 		auto generation = state.generations.find(client.generation);
@@ -2028,6 +2195,7 @@ end)
 			generationId == client.generation && md5 == generation->second.md5)
 		{
 			client.ready = true;
+			client.everReady = true;
 			client.fallback = false;
 			// Proof of a mounted pack also heals the account's native latch.
 			client.nativeLatched = false;
