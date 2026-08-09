@@ -735,6 +735,7 @@ struct SignalData
 	const char* crashOrigin;
 	int fileDescriptor;
 	LuaAlloc luaAlloc;
+	bool luaSnapshotDumped;
 #if SYSTEM_LINUX
 	SavedCrash savedCrash;
 #endif
@@ -743,27 +744,72 @@ struct SignalData
 static std::atomic<SignalData*> g_pSignalData;
 static std::atomic<bool> g_bInducedCrash = false;
 
-static void DumpLuaState(int fileDescriptor)
+static bool DumpLuaState(int fileDescriptor)
 {
-	// Unsafe but we want to dump the main state!
+	if (!g_Lua)
+	{
+		dprintf(fileDescriptor, "Lua state unavailable: g_Lua is null\n");
+		return false;
+	}
+
+	lua_State* pState = g_Lua->GetState();
+	if (!pState)
+	{
+		dprintf(fileDescriptor, "Lua state unavailable: current state is null\n");
+		return false;
+	}
+
+	lua_State* pMainState = Lua::MainState(pState);
+	bool isCoroutine = pMainState && pMainState != pState;
+
+	if (!pMainState)
+		dprintf(fileDescriptor, "Invalid Main state!\n");
+	else
+		dprintf(fileDescriptor, "Inside Coroutine?: %s\n", isCoroutine ? "true" : "false");
+
+	dprintf(fileDescriptor, "Inside Trace?: %s\n", (Lua::GlobalJITBase(pState) ? "true" : "false"));
+
 	GarrysMod::Lua::ILuaShared* pLuaShared = Lua::GetShared();
 	if (pLuaShared)
 	{
 		dprintf(fileDescriptor, "Lua Stack trace:\n");
-		dprintf(fileDescriptor, pLuaShared->GetStackTraces());
+		const char* stackTraces = pLuaShared->GetStackTraces();
+		if (stackTraces)
+			dprintf(fileDescriptor, "%s", stackTraces);
+		else
+			dprintf(fileDescriptor, "  <unavailable>\n");
+	} else {
+		dprintf(fileDescriptor, "Lua Stack trace: <ILuaShared unavailable>\n");
 	}
 
-	dprintf(fileDescriptor, "Lua Stack values:\n");
-
-	lua_State* pState = g_Lua->GetState();
-	TValue* pBase = Lua::LuaBase(pState);
-	int nTop = (int)(Lua::LuaTop(pState) - pBase);
-	dprintf(fileDescriptor, "  Stack size: %i\n", nTop);
-	for (int i=0; i<nTop; ++i)
+	for (int flip = 0; flip < (pMainState && pMainState != pState ? 2 : 1); ++flip)
 	{
-		dprintf(fileDescriptor, "  %i: %s\n", i, Lua::TValueToString(pBase));
-		pBase++;
+		lua_State* pCurrentState = flip == 0 ? pState : pMainState;
+		if (!pCurrentState)
+			break;
+
+		dprintf(fileDescriptor, "Lua Stack values (%s):\n", (isCoroutine && pState == pCurrentState) ? "Current Coroutine state" : "Main State");
+
+		Lua::pExecutingInterface = g_Lua; // TValueToString uses GetGCStrData
+		TValue* pBase = Lua::LuaBase(pCurrentState);
+		int nTop = (int)(Lua::LuaTop(pCurrentState) - pBase);
+		dprintf(fileDescriptor, "  Stack size: %i\n", nTop);
+
+		// A corrupted Lua state can otherwise turn crash reporting into a huge loop.
+		if (nTop < 0 || nTop > 16384)
+		{
+			dprintf(fileDescriptor, "  Invalid Stack! No Dump!\n");
+			continue;
+		}
+
+		for (int i = 0; i < nTop; ++i)
+		{
+			dprintf(fileDescriptor, "  %i: %s\n", i, Lua::TValueToString(pBase));
+			pBase++;
+		}
 	}
+
+	return true;
 }
 
 #if SYSTEM_LINUX
@@ -808,46 +854,54 @@ static void GenerateCrashFileName(char* buffer, int bufferSize)
 
 static void DumpRegister(int fd, gregset_t& registers, const char* name, int idx)
 {
-	intptr_t sval = static_cast<intptr_t>(registers[idx]);
-	uintptr_t uval = static_cast<uintptr_t>(registers[idx]);
+#if defined(__x86_64__)
+	// greg_t is 64-bit on x86-64. Keep the full value in crash logs.
+	long long sval = static_cast<long long>(registers[idx]);
+	unsigned long long uval = static_cast<unsigned long long>(registers[idx]);
 
 	dprintf(fd,
-		"  %-8s 0x%0*" PRIxPTR "  %" PRIdPTR "\n",
-		name,
-		static_cast<int>(sizeof(uintptr_t) * 2),
-		uval,
-		sval
+		"  %-8s 0x%016llx  %lld\n",
+		name, uval, sval
 	);
+#elif defined(__i386__)
+	// Preserve the original 32-bit formatting/type path for x86 builds.
+	int sval = static_cast<int>(registers[idx]);
+	unsigned int uval = static_cast<unsigned int>(registers[idx]);
+
+	dprintf(fd,
+		"  %-8s 0x%08x  %d\n",
+		name, uval, sval
+	);
+#else
+#error "Unsupported architecture"
+#endif
 };
 
 static bool AttemptLuaCallback(bool bMainThreadCrash);
 static void CrashHandler(int signal, siginfo_t* signalInfo, void* ucontext)
 {
-	// If the handler itself crashed while generating the backtrace, restore the
-	// original crash's general registers into THIS kernel-created signal frame.
-	// Do not call setcontext() on a copied signal ucontext: its FP/XSTATE storage
-	// is not safely relocatable and can make setcontext() crash while restoring MXCSR.
-	if (g_bAttemptedBacktrace.load())
-	{
-		g_pSavedCrash.RestoreGeneralRegisters(ucontext);
-		ReturnSignal();
-		return;
-	} else
-		g_pSavedCrash.Store(signal, signalInfo, ucontext);
-
 	static thread_local bool g_bIsInSignalHandler = false;
 
-	// If this happens, we crashed in our handler, so let's skip that and let gdb catch the original crash
+	/*
+		If the crash handler itself faults, preserve the ORIGINAL crash.
+
+		Only copy the original GPRs into the current kernel-created signal frame.
+		Do not setcontext() a copied signal ucontext because FP/XSTATE state is not
+		safely relocatable and can cause a secondary SIGSEGV while restoring MXCSR.
+	*/
 	if (g_bIsInSignalHandler)
 	{
 		SignalData* signalData = g_pSignalData.load();
 		if (signalData)
 		{
-			dprintf(signalData->fileDescriptor, "CrashHandler crashed while attempting Lua callback!\n");
+			if (g_bAttemptedBacktrace.load())
+				dprintf(signalData->fileDescriptor, "CrashHandler crashed while generating native backtrace!\n");
+			else
+				dprintf(signalData->fileDescriptor, "CrashHandler crashed while dumping Lua/callback state!\n");
 
-			// Restore only the original general registers into the current, valid
-			// kernel signal frame. Keep this frame's FP/XSTATE state intact.
 			signalData->savedCrash.RestoreGeneralRegisters(ucontext);
+		} else {
+			g_pSavedCrash.RestoreGeneralRegisters(ucontext);
 		}
 
 		ReturnSignal();
@@ -855,6 +909,7 @@ static void CrashHandler(int signal, siginfo_t* signalInfo, void* ucontext)
 	}
 
 	g_bIsInSignalHandler = true;
+	g_pSavedCrash.Store(signal, signalInfo, ucontext);
 
 	ModuleInfo pModuleInfo;
 
@@ -910,6 +965,18 @@ static void CrashHandler(int signal, siginfo_t* signalInfo, void* ucontext)
 	const ModuleEntry* mod = pModuleInfo.FindModule((uintptr_t)ip);
 	const char* moduleName = mod ? mod->path : "unknown";
 	dprintf(fileDescriptor, "Crashed in module: %s\n", moduleName);
+
+	/*
+		Publish the original crash context before any optional/risky diagnostics.
+		If Lua dumping or native unwinding faults, the nested handler can restore
+		the original GPRs and let the OS/core dump report the real crash site.
+	*/
+	SignalData signalData;
+	memset(&signalData, 0, sizeof(SignalData));
+	signalData.crashOrigin = moduleName;
+	signalData.fileDescriptor = fileDescriptor;
+	signalData.savedCrash.Store(signal, signalInfo, ucontext);
+	g_pSignalData.store(&signalData);
 
 	dprintf(fileDescriptor, "HolyLib: %s\n", HolyLib_GetPluginDescription());
 	dprintf(fileDescriptor, "Triggered by watcher?: %s\n", g_bInducedCrash.load() ? "true" : "false");
@@ -985,43 +1052,66 @@ static void CrashHandler(int signal, siginfo_t* signalInfo, void* ucontext)
 	dprintf(fileDescriptor, "  GG\n");
 #endif
 
-	// If we re-entered it's 99% that we crashed when calling backtrace!
+	/*
+		Preserve Lua-side context BEFORE native unwinding.
+
+		backtrace() is not async-signal-safe and can itself fault on a damaged
+		native stack. If it does, the Lua call stack below has already reached disk.
+
+		Do not inspect the main Lua VM directly from a worker crash thread.
+	*/
+	if (ThreadInMainThread())
+	{
+		dprintf(fileDescriptor, "Lua snapshot (before native backtrace):\n");
+		signalData.luaSnapshotDumped = DumpLuaState(fileDescriptor);
+	} else {
+		dprintf(fileDescriptor, "Lua snapshot deferred: crash occurred outside the main thread.\n");
+	}
+
 	if (g_bInducedCrash.load())
 	{
-		DumpLuaState(fileDescriptor);
-
 		dprintf(fileDescriptor, "Backtrace generation skipped due to unsafe conditions!\n");
 	} else {
-		// ToDo: backtrace is not really signal safe! It could deadlock!
+		/*
+			backtrace() is not signal safe.
+			g_bAttemptedBacktrace allows a nested SIGSEGV to identify this stage,
+			restore the original crash registers and terminate on the original site.
+		*/
 		void* buffer[bufferSize];
 		g_bAttemptedBacktrace.store(true);
 		int nptrs = backtrace(buffer, bufferSize);
 		g_bAttemptedBacktrace.store(false);
+
 		dprintf(fileDescriptor, "Backtrace (%d frames):\n", nptrs);
 		for (int i = 0; i < nptrs; ++i)
 		{
 			uintptr_t addr = (uintptr_t)buffer[i];
 			const ModuleEntry* fmod = pModuleInfo.FindModule(addr);
+
 			FunctionResult funcResult;
 			funcResult.pEntry = fmod;
 			funcResult.nAddress = addr;
 			pModuleInfo.FindFunctionInfo(funcResult);
 
-			dprintf(fileDescriptor, "  %-10p: %s + 0x%" PRIxPTR " [%s - %p]\n", (void*)addr, funcResult.funcName, funcResult.funcOffset, fmod ? fmod->path : "UNKNOWN", (void*)funcResult.fileOffset);
+			dprintf(
+				fileDescriptor,
+				"  %-10p: %s + 0x%" PRIxPTR " [%s - %p]\n",
+				(void*)addr,
+				funcResult.funcName,
+				funcResult.funcOffset,
+				fmod ? fmod->path : "UNKNOWN",
+				(void*)funcResult.fileOffset
+			);
 		}
 	}
 
-	SignalData signalData;
-	memset(&signalData, 0, sizeof(SignalData));
-	signalData.crashOrigin = moduleName;
-	signalData.fileDescriptor = fileDescriptor;
-	signalData.savedCrash.Store(signal, signalInfo, ucontext);
-
-	// Safe since we know 100% that the stack remains.
-	g_pSignalData.store(&signalData);
-
-	if (!AttemptLuaCallback(true) && !g_bInducedCrash.load())
-		DumpLuaState(fileDescriptor);
+	/*
+		The crash hook remains after the passive diagnostic capture.
+		If this is a non-main-thread crash and the early snapshot was deferred,
+		the old fallback behaviour is retained.
+	*/
+	if (!AttemptLuaCallback(true) && !g_bInducedCrash.load() && !signalData.luaSnapshotDumped)
+		signalData.luaSnapshotDumped = DumpLuaState(fileDescriptor);
 
 	ReturnSignal();
 
@@ -1074,49 +1164,16 @@ static void DoLuaCallback(bool bMainThreadCrash)
 	if (!pState)
 		return;
 	
-	bool isCoroutine = false;
 	lua_State* pMainState = Lua::MainState(pState);
 	if (!pMainState)
 		dprintf(signalData->fileDescriptor, "Invalid Main state!\n");
-	else {
-		isCoroutine = pMainState != pState;
-		dprintf(signalData->fileDescriptor, "Inside Coroutine?: %s\n", isCoroutine ? "true" : "false");
-	}
 
-	if (bMainThreadCrash && !g_bInducedCrash.load())
-	{
-		dprintf(signalData->fileDescriptor, "Inside Trace?: %s\n", (Lua::GlobalJITBase(pState) ? "true" : "false"));
-
-		GarrysMod::Lua::ILuaShared* pLuaShared = Lua::GetShared();
-		if (pLuaShared)
-		{
-			dprintf(signalData->fileDescriptor, "Lua Stack trace:\n");
-			dprintf(signalData->fileDescriptor, pLuaShared->GetStackTraces());
-		}
-
-		for (int flip=0; flip<(pMainState != pState ? 2 : 1); ++flip)
-		{
-			lua_State* pCurrentState = flip == 0 ? pState : pMainState;
-			if (!pCurrentState)
-				break;
-
-			dprintf(signalData->fileDescriptor, "Lua Stack values (%s):\n", (isCoroutine && pState == pCurrentState) ? "Current Coroutine state" : "Main State");
-
-			Lua::pExecutingInterface = g_Lua; // Set since TValueToString uses GetGCStrData
-			TValue* pBase = Lua::LuaBase(pCurrentState);
-			int nTop = (int)(Lua::LuaTop(pCurrentState) - pBase);
-			dprintf(signalData->fileDescriptor, "  Stack size: %i\n", nTop);
-			if (nTop < 0)
-				dprintf(signalData->fileDescriptor, "  Invalid Stack! No Dump!\n");
-			else {
-				for (int i=0; i<nTop; ++i)
-				{
-					dprintf(signalData->fileDescriptor, "  %i: %s\n", i, Lua::TValueToString(pBase));
-					pBase++;
-				}
-			}
-		}
-	}
+	/*
+		Normally the main-thread Lua snapshot was already persisted before native
+		backtrace(). Keep this as a fallback for paths where it was deferred.
+	*/
+	if (bMainThreadCrash && !g_bInducedCrash.load() && !signalData->luaSnapshotDumped)
+		signalData->luaSnapshotDumped = DumpLuaState(signalData->fileDescriptor);
 
 	// We stop the GC in case a crash is related to an memory allocator or some bs
 	Util::func_lua_gc(pState, LUA_GCSTOP, 0);
@@ -1147,7 +1204,9 @@ static bool AttemptLuaCallback(bool bMainThreadCrash)
 	} else {
 		// We crashed on another thread - so Lua should be good to use
 		g_bThreadAwaitingLua.store(true);
-		// We wait at best 100ms before just continuing, BUT as fallback behavior, we will then dump the main lua state into the dump too
+
+		// We wait at best 100ms before just continuing,
+		// BUT as fallback behavior, we will then dump the main lua state into the dump too
 		for (int i=0; i<10; ++i)
 		{
 			ThreadSleep(10);
@@ -1163,8 +1222,10 @@ static ThreadId_t g_nMainThreadID = -1;
 #if 0
 // Unlike our crash handler, we here will be in a more "safe" context.
 // ToDo / WIP:
-// We want to attach ourselves to the thread and attempt to get a backtrace, BUT we need to figure out a way to get the stack frames safely for unwinding :/
-// I would maybe use libunwind, BUT that is not installed in containers, so we must find our own way as I don't think GMod compiles with frame pointers...
+// We want to attach ourselves to the thread and attempt to get a backtrace,
+// BUT we need to figure out a way to get the stack frames safely for unwinding :/
+// I would maybe use libunwind, BUT that is not installed in containers,
+// so we must find our own way as I don't think GMod compiles with frame pointers...
 static void DumpMainThread()
 {
 #if SYSTEM_LINUX
@@ -1230,13 +1291,17 @@ static std::mutex g_pConsoleMutex;
 static std::deque<const char*> g_pConsoleBuffer;
 static std::atomic<void*> g_pConsole = nullptr;
 static Detouring::Hook detour_CTextConsoleUnix_GetLine;
+
 #if ARCHITECTURE_X86_64
 static std::atomic<int> g_nConsoleThreadState = ThreadState::STATE_NOTRUNNING;
+
 // This thread effectively only exists on 64x since it uses an older or newer? implementation of CTextConsoleUnix
 static SIMPLETHREAD_RETURNVALUE ConsoleThread(void* data)
 {
 	// Got no valid detour!
-	Symbols::CTextConsoleUnix_GetLine func_CTextConsoleUnix_GetLine = detour_CTextConsoleUnix_GetLine.GetTrampoline<Symbols::CTextConsoleUnix_GetLine>();
+	Symbols::CTextConsoleUnix_GetLine func_CTextConsoleUnix_GetLine =
+		detour_CTextConsoleUnix_GetLine.GetTrampoline<Symbols::CTextConsoleUnix_GetLine>();
+
 	if (!func_CTextConsoleUnix_GetLine)
 	{
 		Warning(PROJECT_NAME " - crashhandler: ConsoleThread stopped due to missing CTextConsoleUnix::GetLine\n");
@@ -1249,6 +1314,7 @@ static SIMPLETHREAD_RETURNVALUE ConsoleThread(void* data)
 		std::vector<const char*> pCommandBuffer;
 		char szBuf[511];
 		void* pConsole = g_pConsole.load();
+
 		if (pConsole)
 		{
 			char* cmd = func_CTextConsoleUnix_GetLine(pConsole);
@@ -1285,8 +1351,10 @@ static SIMPLETHREAD_RETURNVALUE ConsoleThread(void* data)
 
 #if ARCHITECTURE_X86
 // add_command is threaded in the engine already! See editline_threadproc in dedicated/console/TextConsoleUnix.cpp
-// NOTE: add_command blocks the thread it's running in until the main thread handles the command, so for our case we just put them into the buffer.
+// NOTE: add_command blocks the thread it's running in until the main thread handles the command,
+// so for our case we just put them into the buffer.
 static Detouring::Hook detour_add_command;
+
 static bool
 #if SYSTEM_LINUX
 __attribute__((regparm(2)))
@@ -1342,6 +1410,7 @@ static const char* hook_CTextConsoleUnix_GetLine(void* _this)
 	}
 
 	const char* cmd = pLocalBuffer.front();
+
 #if ARCHITECTURE_X86
 	V_strncpy(buf, cmd, buflen);
 #else
@@ -1358,11 +1427,18 @@ static const char* hook_CTextConsoleUnix_GetLine(void* _this)
 #endif
 }
 
-static ConVar crashhandler_crashtime("holylib_crashhandler_crashtime", "10000", 0, "Time in ms after which the crash handler will catch and nuke the server");
+static ConVar crashhandler_crashtime(
+	"holylib_crashhandler_crashtime",
+	"10000",
+	0,
+	"Time in ms after which the crash handler will catch and nuke the server"
+);
+
 static constexpr int g_nThreadSleep = 10;
 static std::atomic<int> g_nLagCount = 0; // one count = (g_nThreadSleep)ms lag.
 static std::atomic<bool> g_bSkipWatcher = false;
 static std::atomic<int> g_nWatcherThreadState = ThreadState::STATE_NOTRUNNING;
+
 static SIMPLETHREAD_RETURNVALUE CrashWatcherThread(void* data)
 {
 	// ThreadSetDebugName(ThreadGetCurrentId(), PROJECT_NAME " - CrashWatcher");
@@ -1383,12 +1459,15 @@ static SIMPLETHREAD_RETURNVALUE CrashWatcherThread(void* data)
 			{
 				Lua::ScopedThreadAccess pThreadScope;
 				Lua::StateAccess pAccess(GetHolyLuaInterface());
+
 				if (pAccess.IsValid())
 				{
 					GarrysMod::Lua::ILuaInterface* pLua = pAccess.GetLua();
+
 					if (Lua::PushHook("HolyLib:DetermineServerCrash", pLua))
 					{
 						pLua->PushNumber(g_nLagCount.load() * g_nThreadSleep); // Push lag time in ms
+
 						if (pLua->CallFunctionProtected(2, 1, true))
 						{
 							bool bDontCrash = pLua->GetBool(-1);
@@ -1404,6 +1483,7 @@ static SIMPLETHREAD_RETURNVALUE CrashWatcherThread(void* data)
 				}
 			}
 #endif
+
 			printf(PROJECT_NAME " - crashhandler: Detected a freeze, attempting termination...\n");
 			ThreadSleep(5); // Sleep for the printf to reach the console (in testing it sometimes just never appeared)
 			ExecuteMainThread();
@@ -1464,6 +1544,7 @@ void CCrashHandlerModule::Think(bool bSimulating)
 
 static ThreadHandle_t g_pCrashWatcher = nullptr;
 static ThreadHandle_t g_pThreadedConsole = nullptr;
+
 void CCrashHandlerModule::Init(CreateInterfaceFn* appfn, CreateInterfaceFn* gamefn)
 {
 	(void)appfn;
@@ -1480,6 +1561,7 @@ void CCrashHandlerModule::Init(CreateInterfaceFn* appfn, CreateInterfaceFn* game
 #endif
 
 	g_pFullFileSystem->CreateDirHierarchy("holylib/crashes/", "MOD");
+
 #if SYSTEM_LINUX
 	SetupCrashHandlerStack();
 	SetupCrashHandler();
@@ -1493,6 +1575,7 @@ void CCrashHandlerModule::Shutdown()
 		if (g_nWatcherThreadState.load() != ThreadState::STATE_NOTRUNNING)
 		{
 			g_nWatcherThreadState.store(ThreadState::STATE_SHOULD_SHUTDOWN);
+
 			while (g_nWatcherThreadState.load() != ThreadState::STATE_NOTRUNNING) // Wait for shutdown
 				ThreadSleep(0);
 		}
@@ -1507,6 +1590,7 @@ void CCrashHandlerModule::Shutdown()
 		if (g_nConsoleThreadState.load() != ThreadState::STATE_NOTRUNNING)
 		{
 			g_nConsoleThreadState.store(ThreadState::STATE_SHOULD_SHUTDOWN);
+
 			while (g_nConsoleThreadState.load() != ThreadState::STATE_NOTRUNNING) // Wait for shutdown
 				ThreadSleep(0);
 		}
@@ -1527,17 +1611,24 @@ void CCrashHandlerModule::InitDetour(bool bPreServer)
 		return;
 
 	SourceSDK::FactoryLoader dedicated_loader("dedicated");
+
 #if ARCHITECTURE_X86
 	Detour::Create(
-		&detour_add_command, "add_command",
-		dedicated_loader.GetModule(), Symbols::add_commandSym,
-		(void*)hook_add_command, m_pID
+		&detour_add_command,
+		"add_command",
+		dedicated_loader.GetModule(),
+		Symbols::add_commandSym,
+		(void*)hook_add_command,
+		m_pID
 	);
 #endif
 
 	Detour::Create(
-		&detour_CTextConsoleUnix_GetLine, "CTextConsoleUnix::GetLine",
-		dedicated_loader.GetModule(), Symbols::CTextConsoleUnix_GetLineSym,
-		(void*)hook_CTextConsoleUnix_GetLine, m_pID
+		&detour_CTextConsoleUnix_GetLine,
+		"CTextConsoleUnix::GetLine",
+		dedicated_loader.GetModule(),
+		Symbols::CTextConsoleUnix_GetLineSym,
+		(void*)hook_CTextConsoleUnix_GetLine,
+		m_pID
 	);
 }
