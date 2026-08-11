@@ -192,12 +192,15 @@ do
 		sourceTvConVar:GetString() == "no_gluapack"
 	local requiredMode = requiredConVar and requiredConVar:GetBool() and not clientOptedOut
 	local requiredRecoveryEnabled = requiredMode and requiredRecoveryConVar and requiredRecoveryConVar:GetBool()
-	local retryGuardFlags = (FCVAR_DONTRECORD or 0) + (FCVAR_UNLOGGED or 0) +
-		(FCVAR_SERVER_CAN_EXECUTE or 0)
+	-- This bootstrap is prepended before the server's replacement includes/init.lua
+	-- runs, so the FCVAR enum globals are not guaranteed to exist yet. Keep the
+	-- security-critical server-executable bit explicit instead of silently losing it.
+	local retryGuardName = "holylib_luapack_required_retry_guard"
+	local retryGuardFlags = (FCVAR_DONTRECORD or 0) + (FCVAR_UNLOGGED or 0) + 268435456
 	local retryGuard
 	do
-		local ok, convar = pcall(CreateConVar, "holylib_luapack_required_retry_guard", "0", retryGuardFlags)
-		retryGuard = (ok and convar) or (getConVar and getConVar("holylib_luapack_required_retry_guard"))
+		local ok, convar = pcall(CreateConVar, retryGuardName, "0", retryGuardFlags)
+		retryGuard = (ok and convar) or (getConVar and getConVar(retryGuardName))
 	end
 
 	local function warn(message)
@@ -228,12 +231,16 @@ do
 	local recoverySignaled = false
 	local requiredFailureSignaled = false
 	local requiredRetryArmed = false
-	local requiredRetryWatchInstalled = false
+	local requiredRetryCallbackInstalled = false
+	local requiredRetryTimerInstalled = false
 	local recoveryScheduled = false
 	local recoveryRetried = false
+	local removeRequiredRetrySignal = function() end
 	local function issueRetry()
 		if recoveryRetried then return end
 		recoveryRetried = true
+		removeRequiredRetrySignal()
+		warn("authenticated required recovery signal received; opening one wholly native connection")
 		RunConsoleCommand("retry")
 	end
 	local function scheduleRetry()
@@ -243,16 +250,43 @@ do
 			timer.Simple(1, issueRetry)
 		end
 	end
+	local retryCallbackId = "holylib_luapack_required_retry"
+	local retryTimerId = "holylib_luapack_required_retry_watch"
+	removeRequiredRetrySignal = function()
+		if requiredRetryCallbackInstalled and cvars and cvars.RemoveChangeCallback then
+			pcall(cvars.RemoveChangeCallback, retryGuardName, retryCallbackId)
+			requiredRetryCallbackInstalled = false
+		end
+		if requiredRetryTimerInstalled and timer and timer.Remove then
+			timer.Remove(retryTimerId)
+			requiredRetryTimerInstalled = false
+		end
+	end
+	local function acceptRequiredRetrySignal()
+		if requiredRetryArmed and retryGuard and retryGuard:GetString() == "2" then
+			issueRetry()
+		end
+	end
 	local function awaitRequiredRetrySignal()
-		if not requiredRetryArmed or requiredRetryWatchInstalled or recoveryRetried then return end
-		if timer and timer.Create then
-			requiredRetryWatchInstalled = true
-			timer.Create("holylib_luapack_required_retry_watch", 0.1, 0, function()
-				if retryGuard and retryGuard:GetString() == "2" then
-					timer.Remove("holylib_luapack_required_retry_watch")
-					issueRetry()
-				end
-			end)
+		if not requiredRetryArmed or recoveryRetried then return end
+		acceptRequiredRetrySignal()
+		if recoveryRetried then return end
+		-- Replacement init files can fail before they require Garry's Mod's cvars module.
+		-- Load the local core module explicitly so an acknowledged signal is event-driven;
+		-- the timer path remains a compatibility fallback and neither path retries at 1.
+		if (not cvars or not cvars.AddChangeCallback) and require then
+			pcall(require, "cvars")
+		end
+		if not requiredRetryCallbackInstalled and cvars and cvars.AddChangeCallback then
+			local ok = pcall(cvars.AddChangeCallback, retryGuardName, function()
+				acceptRequiredRetrySignal()
+			end, retryCallbackId)
+			requiredRetryCallbackInstalled = ok
+		end
+		if not requiredRetryCallbackInstalled and not requiredRetryTimerInstalled and
+			timer and timer.Create then
+			requiredRetryTimerInstalled = true
+			timer.Create(retryTimerId, 0.1, 0, acceptRequiredRetrySignal)
 		end
 	end
 	local function stubRecovery(generation, required)
@@ -272,12 +306,21 @@ do
 					" could not resolve this Lua file; waiting for the server" ..
 					(requiredRetryArmed and " to request one authenticated native retry" or
 					" (opt out with +tv_nochat no_gluapack)"))
+				-- Install the listener before the failure command can reach the server and
+				-- provoke its authenticated acknowledgement.
+				awaitRequiredRetrySignal()
+				if requiredRetryArmed then
+					local flags = retryGuard.GetFlags and retryGuard:GetFlags() or -1
+					warn("required recovery listener armed (guard_flags=" .. tostring(flags) ..
+						", callback=" .. tostring(requiredRetryCallbackInstalled) ..
+						", timer=" .. tostring(requiredRetryTimerInstalled) .. ")")
+				end
 				RunConsoleCommand("holylib_luapack_failed", tostring(generation or ""))
 			end
 			-- The private ConVar is server-executable, unlike the engine's retry command.
 			-- Value 2 is therefore an authenticated acknowledgement that the account latch
-			-- is installed. If timer was unavailable for the first stub, later stubs retry
-			-- installing this watcher without reconnecting on an unacknowledged failure.
+			-- is installed. Later stubs retry installing a callback/fallback watcher without
+			-- reconnecting on an unacknowledged failure.
 			awaitRequiredRetrySignal()
 			return function() end
 		end
