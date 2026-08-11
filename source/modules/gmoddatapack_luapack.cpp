@@ -231,15 +231,17 @@ do
 	local recoverySignaled = false
 	local requiredFailureSignaled = false
 	local requiredRetryArmed = false
-	local requiredRetryCallbackInstalled = false
-	local requiredRetryTimerInstalled = false
+	local requiredRetryWatchInstalled = false
 	local recoveryScheduled = false
 	local recoveryRetried = false
-	local removeRequiredRetrySignal = function() end
+	local retryTimerId = "holylib_luapack_required_retry_watch"
 	local function issueRetry()
 		if recoveryRetried then return end
 		recoveryRetried = true
-		removeRequiredRetrySignal()
+		if requiredRetryWatchInstalled and timer and timer.Remove then
+			timer.Remove(retryTimerId)
+			requiredRetryWatchInstalled = false
+		end
 		warn("authenticated required recovery signal received; opening one wholly native connection")
 		RunConsoleCommand("retry")
 	end
@@ -250,43 +252,18 @@ do
 			timer.Simple(1, issueRetry)
 		end
 	end
-	local retryCallbackId = "holylib_luapack_required_retry"
-	local retryTimerId = "holylib_luapack_required_retry_watch"
-	removeRequiredRetrySignal = function()
-		if requiredRetryCallbackInstalled and cvars and cvars.RemoveChangeCallback then
-			pcall(cvars.RemoveChangeCallback, retryGuardName, retryCallbackId)
-			requiredRetryCallbackInstalled = false
-		end
-		if requiredRetryTimerInstalled and timer and timer.Remove then
-			timer.Remove(retryTimerId)
-			requiredRetryTimerInstalled = false
-		end
-	end
-	local function acceptRequiredRetrySignal()
-		if requiredRetryArmed and retryGuard and retryGuard:GetString() == "2" then
-			issueRetry()
-		end
-	end
 	local function awaitRequiredRetrySignal()
 		if not requiredRetryArmed or recoveryRetried then return end
-		acceptRequiredRetrySignal()
+		if retryGuard and retryGuard:GetString() == "2" then issueRetry() end
 		if recoveryRetried then return end
-		-- Replacement init files can fail before they require Garry's Mod's cvars module.
-		-- Load the local core module explicitly so an acknowledged signal is event-driven;
-		-- the timer path remains a compatibility fallback and neither path retries at 1.
-		if (not cvars or not cvars.AddChangeCallback) and require then
-			pcall(require, "cvars")
-		end
-		if not requiredRetryCallbackInstalled and cvars and cvars.AddChangeCallback then
-			local ok = pcall(cvars.AddChangeCallback, retryGuardName, function()
-				acceptRequiredRetrySignal()
-			end, retryCallbackId)
-			requiredRetryCallbackInstalled = ok
-		end
-		if not requiredRetryCallbackInstalled and not requiredRetryTimerInstalled and
-			timer and timer.Create then
-			requiredRetryTimerInstalled = true
-			timer.Create(retryTimerId, 0.1, 0, acceptRequiredRetrySignal)
+		-- timer is engine-registered before the replacement includes/init.lua runs. Do
+		-- not require any Lua module here: filesystem-backed requires can recursively
+		-- re-enter unresolved canonical paths while the required base is missing.
+		if not requiredRetryWatchInstalled and timer and timer.Create then
+			requiredRetryWatchInstalled = true
+			timer.Create(retryTimerId, 0.1, 0, function()
+				if retryGuard and retryGuard:GetString() == "2" then issueRetry() end
+			end)
 		end
 	end
 	local function stubRecovery(generation, required)
@@ -312,14 +289,13 @@ do
 				if requiredRetryArmed then
 					local flags = retryGuard.GetFlags and retryGuard:GetFlags() or -1
 					warn("required recovery listener armed (guard_flags=" .. tostring(flags) ..
-						", callback=" .. tostring(requiredRetryCallbackInstalled) ..
-						", timer=" .. tostring(requiredRetryTimerInstalled) .. ")")
+						", timer=" .. tostring(requiredRetryWatchInstalled) .. ")")
 				end
 				RunConsoleCommand("holylib_luapack_failed", tostring(generation or ""))
 			end
 			-- The private ConVar is server-executable, unlike the engine's retry command.
 			-- Value 2 is therefore an authenticated acknowledgement that the account latch
-			-- is installed. Later stubs retry installing a callback/fallback watcher without
+			-- is installed. Later stubs retry installing the engine timer watcher without
 			-- reconnecting on an unacknowledged failure.
 			awaitRequiredRetrySignal()
 			return function() end
