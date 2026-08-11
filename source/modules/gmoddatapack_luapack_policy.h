@@ -181,6 +181,11 @@ namespace HolyLib::LuaPack::Policy
 		return recoveryEnabled && !retryGuardArmed;
 	}
 
+	constexpr bool ShouldEnforceReadyDeadline(bool recoveryRetryIssued)
+	{
+		return !recoveryRetryIssued;
+	}
+
 	constexpr Action SelectBaseline(Lane lane, bool canonicalRegistration,
 		BaseAvailability base)
 	{

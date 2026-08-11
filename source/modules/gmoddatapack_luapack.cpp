@@ -1841,7 +1841,12 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			// spend many minutes in map load + the Requesting-Lua burst before its Lua state even
 			// exists; expiring the pin there would mark exactly the joins that matter fallback
 			// before their first file request arrives. ClientActive re-arms the deadline.
-			if (!client.generation.empty() && !client.ready && !client.fallback && client.active &&
+			// Once an authenticated failure has installed its latch and sent retry, the
+			// existing READY deadline must not race that command and tear down the channel.
+			// The five-second recoveryRetryDisconnectAt branch above remains the bounded
+			// fail-safe if the client ignores the requested reconnect.
+			if (Policy::ShouldEnforceReadyDeadline(client.recoveryRetryIssued) &&
+				!client.generation.empty() && !client.ready && !client.fallback && client.active &&
 				now > client.deadline)
 			{
 				if (client.requiredLane && !client.everReady)

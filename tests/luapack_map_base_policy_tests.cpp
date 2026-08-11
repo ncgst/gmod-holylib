@@ -92,6 +92,8 @@ int main()
 		assert(ShouldArmAutomaticRetry(true, false));
 		assert(!ShouldArmAutomaticRetry(true, true));
 		assert(!ShouldArmAutomaticRetry(false, false));
+		assert(ShouldEnforceReadyDeadline(false));
+		assert(!ShouldEnforceReadyDeadline(true));
 		assert(recovery.Arm(accountA, 500, 0.0, 30.0) == RecoveryArmResult::Armed);
 		assert(recovery.Consume(accountA, 501, 1.0) == RecoveryConsumeResult::Native);
 		assert(recovery.Arm(accountA, 502, 2.0, 30.0) == RecoveryArmResult::RetryExhausted);
