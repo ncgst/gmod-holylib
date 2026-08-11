@@ -99,8 +99,8 @@ namespace HolyLib::LuaPack
 	bool NeedsNativeHashUpdate(int slot);
 	DeliveryDecision DecideDeliveryForClient(int slot, const std::string& virtualPath, size_t nativeSourceBytes);
 	void DisconnectRequiredClient(int slot, const char* failure);
-	void ClientConnect(int slot);
+	bool ClientConnect(int slot);
 	void ClientActive(int slot);
-	void ClientDisconnect(int slot);
+	bool ClientDisconnect(int slot, bool gameLayerCallback = true);
 	MODULE_RESULT ClientCommand(int slot, const CCommand* args);
 }

@@ -953,6 +953,24 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		}
 	}
 
+	static bool PreserveClaimedRecoveryLifecycle(int slot, bool gameLayerCallback)
+	{
+		if (!IsValidSlot(slot))
+			return false;
+
+		ClientPin& client = state.clients[slot];
+		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		const std::uint64_t account = baseClient && baseClient->m_SteamID.IsValid()
+			? baseClient->m_SteamID.ConvertToUint64() : 0;
+		const bool identityMatches = account != 0 && client.resolvedIdentity &&
+			account == client.steamID64;
+		const bool ownsConsumedRecovery = state.requiredRecovery.OwnsConsumed(
+			client.steamID64, client.connectionSerial);
+		return Policy::ShouldPreserveRecoveryLifecycle(gameLayerCallback,
+			client.requiredRecovery && client.nativeLane, client.active,
+			client.recoveryStateCleared, identityMatches, ownsConsumedRecovery);
+	}
+
 	static void ProcessRequiredRecoveryHandoffs(double now)
 	{
 		for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
@@ -2235,10 +2253,19 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		}
 	}
 
-	void ClientConnect(int slot)
+	bool ClientConnect(int slot)
 	{
 		if (!IsValidSlot(slot))
-			return;
+			return false;
+
+		if (PreserveClaimedRecoveryLifecycle(slot, true))
+		{
+			const ClientPin& client = state.clients[slot];
+			Msg(PROJECT_NAME " - luapack: preserving claimed native recovery epoch %llu for slot %i (%llu) across its late game-layer ClientConnect callback\n",
+				static_cast<unsigned long long>(client.connectionSerial), slot,
+				static_cast<unsigned long long>(client.steamID64));
+			return true;
+		}
 
 		// A real network connection supersedes a merely queued request. Once the engine
 		// reconnect was invoked, preserve its gate across Source's disconnect/connect
@@ -2246,6 +2273,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		if (!state.recoveryHandoffs[slot].Invoked())
 			state.recoveryHandoffs[slot].Reset();
 		StartClientEpoch(slot);
+		return false;
 	}
 
 	void ClientActive(int slot)
@@ -2289,10 +2317,19 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		// repaired after spawn by switching the whole join to native or HTTP delivery.
 	}
 
-	void ClientDisconnect(int slot)
+	bool ClientDisconnect(int slot, bool gameLayerCallback)
 	{
 		if (!IsValidSlot(slot))
-			return;
+			return false;
+
+		if (PreserveClaimedRecoveryLifecycle(slot, gameLayerCallback))
+		{
+			const ClientPin& recovery = state.clients[slot];
+			Msg(PROJECT_NAME " - luapack: preserving claimed native recovery epoch %llu for slot %i (%llu) across its late game-layer ClientDisconnect callback\n",
+				static_cast<unsigned long long>(recovery.connectionSerial), slot,
+				static_cast<unsigned long long>(recovery.steamID64));
+			return true;
+		}
 
 		ClientPin& client = state.clients[slot];
 		// CBaseClient::Reconnect can report a disconnect before the replacement
@@ -2311,6 +2348,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 				slot, client.networkID.c_str(), client.joinOptimisticStubs);
 		}
 		ReleasePin(client);
+		return false;
 	}
 
 	MODULE_RESULT ClientCommand(int slot, const CCommand* args)
@@ -2327,6 +2365,17 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 				return MODULE_RESULT::STOP;
 
 			ClientPin& client = state.clients[slot];
+			const bool ownsConsumedRecovery = state.requiredRecovery.OwnsConsumed(
+				client.steamID64, client.connectionSerial);
+			if (Policy::ShouldIgnoreLateRecoveryFailure(
+				client.requiredRecovery && client.nativeLane, ownsConsumedRecovery,
+				client.recoveryStateCleared))
+			{
+				Warning(PROJECT_NAME " - luapack: ignored a late required-generation failure from the failed baseline during native recovery epoch %llu for slot %i (%llu)\n",
+					static_cast<unsigned long long>(client.connectionSerial), slot,
+					static_cast<unsigned long long>(client.steamID64));
+				return MODULE_RESULT::STOP;
+			}
 			const bool exactFailure = client.requiredLane && !client.requiredRecovery &&
 				args->ArgC() == 2 && !client.generation.empty() &&
 				client.generation == args->Arg(1);
@@ -2388,6 +2437,17 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 				return MODULE_RESULT::STOP;
 
 			ClientPin& client = state.clients[slot];
+			const bool ownsConsumedRecovery = state.requiredRecovery.OwnsConsumed(
+				client.steamID64, client.connectionSerial);
+			if (Policy::ShouldIgnoreLateRecoveryFailure(
+				client.requiredRecovery && client.nativeLane, ownsConsumedRecovery,
+				client.recoveryStateCleared))
+			{
+				Warning(PROJECT_NAME " - luapack: ignored a late legacy unready command from the failed baseline during native recovery epoch %llu for slot %i (%llu)\n",
+					static_cast<unsigned long long>(client.connectionSerial), slot,
+					static_cast<unsigned long long>(client.steamID64));
+				return MODULE_RESULT::STOP;
+			}
 			if (client.requiredLane)
 			{
 				DisconnectRequiredClient(slot, "the client reported an unresolvable required stub through the legacy recovery command");

@@ -108,6 +108,14 @@ namespace HolyLib::LuaPack::Policy
 			return true;
 		}
 
+		bool OwnsConsumed(std::uint64_t account, std::uint64_t connection) const
+		{
+			auto entry = entries.find(account);
+			return account != 0 && connection != 0 && entry != entries.end() &&
+				entry->second.phase == RecoveryPhase::Consumed &&
+				entry->second.recoveryConnection == connection;
+		}
+
 		bool Clear(std::uint64_t account)
 		{
 			return account != 0 && entries.erase(account) != 0;
@@ -353,6 +361,23 @@ namespace HolyLib::LuaPack::Policy
 	constexpr bool NeedsPerClientNativeHashes(Lane lane)
 	{
 		return lane == Lane::Required || lane == Lane::NativeRecovery;
+	}
+
+	constexpr bool ShouldPreserveRecoveryLifecycle(bool gameLayerCallback,
+		bool nativeRecovery, bool active, bool recoveryStateCleared,
+		bool identityMatches, bool ownsConsumedRecovery)
+	{
+		return gameLayerCallback && nativeRecovery && !active &&
+			!recoveryStateCleared && identityMatches && ownsConsumedRecovery;
+	}
+
+	constexpr bool ShouldIgnoreLateRecoveryFailure(bool nativeRecovery,
+		bool ownsConsumedRecovery, bool recoveryStateCleared)
+	{
+		// A native recovery baseline contains no stubs. A required/unready command
+		// observed during its consumed or successfully-completed epoch can only belong
+		// to the failed baseline.
+		return nativeRecovery && (ownsConsumedRecovery || recoveryStateCleared);
 	}
 
 	constexpr double RecoveryHandoffWindow(double recoveryTtlSeconds)

@@ -1917,7 +1917,7 @@ void CGModDataPackModule::OnClientDisconnect(CBaseClient* pClient)
 
 	g_pLuaDataPack.m_pPlayerQueue[slot].Clear();
 	ClearRequiredNativeLuaHashes(slot);
-	HolyLib::LuaPack::ClientDisconnect(slot);
+	HolyLib::LuaPack::ClientDisconnect(slot, false);
 }
 
 static double g_nLastSend = 0;
@@ -2096,8 +2096,8 @@ MODULE_RESULT CGModDataPackModule::ClientConnect(bool* bAllowConnect, edict_t* p
 	(void)maxrejectlen;
 
 	const int slot = ClientSlotFromEdict(pClient);
-	ClearRequiredNativeLuaHashes(slot);
-	HolyLib::LuaPack::ClientConnect(slot);
+	if (!HolyLib::LuaPack::ClientConnect(slot))
+		ClearRequiredNativeLuaHashes(slot);
 	return MODULE_RESULT::CONTINUE;
 }
 
@@ -2109,8 +2109,8 @@ void CGModDataPackModule::ClientActive(edict_t* pClient)
 void CGModDataPackModule::ClientDisconnect(edict_t* pClient)
 {
 	const int slot = ClientSlotFromEdict(pClient);
-	ClearRequiredNativeLuaHashes(slot);
-	HolyLib::LuaPack::ClientDisconnect(slot);
+	if (!HolyLib::LuaPack::ClientDisconnect(slot, true))
+		ClearRequiredNativeLuaHashes(slot);
 }
 
 MODULE_RESULT CGModDataPackModule::ClientCommand(edict_t* pClient, const CCommand* args)

@@ -50,9 +50,34 @@ int main()
 		assert(handoff.BeginBaseline(accountA, true, 12.0) == RecoveryHandoffResult::BeginBaseline);
 		assert(!handoff.Pending());
 		assert(recovery.Consume(accountA, 101, 12.0) == RecoveryConsumeResult::Native);
+		assert(recovery.OwnsConsumed(accountA, 101));
+		assert(!recovery.OwnsConsumed(accountA, 100));
 		assert(SelectBaseline(Lane::NativeRecovery, true, BaseAvailability::Ready) == Action::Native);
 		assert(SelectFile(Lane::NativeRecovery, BaseAvailability::Missing, false, false) == Action::Native);
 		assert(recovery.Consume(accountA, 102, 13.0) == RecoveryConsumeResult::RetryExhausted);
+	}
+
+	// CGameClient::Reconnect can begin the native ServerInfo baseline before the old
+	// game-layer disconnect/connect callbacks finish. Those late callbacks and commands
+	// must preserve the consumed native epoch; the lower-level physical disconnect still
+	// wins, and no different account/connection can inherit the fence.
+	{
+		RequiredRecoveryTracker recovery;
+		assert(recovery.Arm(accountA, 110, 0.0, 30.0) == RecoveryArmResult::Armed);
+		assert(recovery.Consume(accountA, 111, 1.0) == RecoveryConsumeResult::Native);
+		const bool ownsRecovery = recovery.OwnsConsumed(accountA, 111);
+		assert(ShouldPreserveRecoveryLifecycle(true, true, false, false, true, ownsRecovery));
+		assert(!ShouldPreserveRecoveryLifecycle(false, true, false, false, true, ownsRecovery));
+		assert(!ShouldPreserveRecoveryLifecycle(true, true, true, false, true, ownsRecovery));
+		assert(!ShouldPreserveRecoveryLifecycle(true, true, false, true, true, ownsRecovery));
+		assert(!ShouldPreserveRecoveryLifecycle(true, true, false, false, false, ownsRecovery));
+		assert(!ShouldPreserveRecoveryLifecycle(true, true, false, false, true,
+			recovery.OwnsConsumed(accountB, 111)));
+		assert(ShouldIgnoreLateRecoveryFailure(true, ownsRecovery, false));
+		assert(!ShouldIgnoreLateRecoveryFailure(false, ownsRecovery, false));
+		assert(!ShouldIgnoreLateRecoveryFailure(true,
+			recovery.OwnsConsumed(accountA, 112), false));
+		assert(ShouldIgnoreLateRecoveryFailure(true, false, true));
 	}
 
 	// A stale success callback from the connection that armed recovery cannot clear
