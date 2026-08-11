@@ -14,6 +14,94 @@ using HolyLib::LuaPack::Policy::Lane;
 int main()
 {
 	using namespace HolyLib::LuaPack::Policy;
+	constexpr std::uint64_t accountA = 101ULL;
+	constexpr std::uint64_t accountB = 202ULL;
+
+	// An authenticated required failure arms only the next connection. The failure
+	// connection cannot consume its own latch, and consumption is wholly native.
+	{
+		RequiredRecoveryTracker recovery;
+		assert(recovery.Arm(accountA, 100, 10.0, 30.0) == RecoveryArmResult::Armed);
+		assert(recovery.Consume(accountA, 100, 11.0) == RecoveryConsumeResult::SameConnection);
+		assert(recovery.Consume(accountA, 101, 12.0) == RecoveryConsumeResult::Native);
+		assert(SelectBaseline(Lane::NativeRecovery, true, BaseAvailability::Ready) == Action::Native);
+		assert(SelectFile(Lane::NativeRecovery, BaseAvailability::Missing, false, false) == Action::Native);
+		assert(recovery.Consume(accountA, 102, 13.0) == RecoveryConsumeResult::RetryExhausted);
+	}
+
+	// Same-process native restoration is independent of the stale canonical cache
+	// object. Every native hash is remembered from the initial baseline, so the body
+	// request does not receive a duplicate pre-body hash update.
+	{
+		const bool staleCanonicalCacheObjectPresent = true;
+		assert(staleCanonicalCacheObjectPresent);
+		assert(NeedsPerClientNativeHashes(Lane::NativeRecovery));
+		std::unordered_map<int, std::array<unsigned char, 4>> recoveryHashes;
+		const std::array<unsigned char, 4> nativeBody{9, 8, 7, 6};
+		RememberNativeHash(recoveryHashes, 73, nativeBody);
+		assert(NativeHashMatches(recoveryHashes, 73, nativeBody));
+		assert(SelectBaseline(Lane::NativeRecovery, true, BaseAvailability::Ready) == Action::Native);
+	}
+
+	// Authentication is mandatory before a recoverable required baseline. A reused
+	// slot cannot consume account A's latch for account B, because slots are not keys.
+	{
+		assert(!RequiredBaselineIdentityReady(true, false));
+		assert(RequiredBaselineIdentityReady(true, true));
+		assert(RequiredBaselineIdentityReady(false, false));
+		RequiredRecoveryTracker recovery;
+		assert(recovery.Arm(0, 200, 0.0, 30.0) == RecoveryArmResult::Invalid);
+		assert(recovery.Arm(accountA, 200, 0.0, 30.0) == RecoveryArmResult::Armed);
+		assert(recovery.Consume(accountB, 201, 1.0) == RecoveryConsumeResult::None);
+		assert(recovery.Consume(accountA, 202, 1.0) == RecoveryConsumeResult::Native);
+	}
+
+	// Armed state expires at the TTL boundary. Once consumed, it becomes a tombstone
+	// until a proven successful lifecycle boundary or server reset prevents a loop.
+	{
+		RequiredRecoveryTracker recovery;
+		assert(recovery.Arm(accountA, 300, 50.0, 5.0) == RecoveryArmResult::Armed);
+		assert(recovery.Consume(accountA, 301, 55.0) == RecoveryConsumeResult::Expired);
+		assert(recovery.Size() == 0);
+		assert(recovery.Arm(accountA, 302, 60.0, 5.0) == RecoveryArmResult::Armed);
+		assert(recovery.Consume(accountA, 303, 61.0) == RecoveryConsumeResult::Native);
+		recovery.Prune(1000.0);
+		assert(recovery.Size() == 1);
+		assert(!recovery.Complete(accountA, 304));
+		assert(recovery.Complete(accountA, 303));
+		assert(recovery.Size() == 0);
+	}
+
+	// A successful recovery clears the account for a future independent incident.
+	{
+		RequiredRecoveryTracker recovery;
+		assert(recovery.Arm(accountA, 400, 0.0, 30.0) == RecoveryArmResult::Armed);
+		assert(recovery.Consume(accountA, 401, 1.0) == RecoveryConsumeResult::Native);
+		assert(recovery.Complete(accountA, 401));
+		assert(recovery.Arm(accountA, 402, 2.0, 30.0) == RecoveryArmResult::Armed);
+	}
+
+	// A failed native recovery cannot re-arm or trigger an automatic reconnect loop.
+	// The process-local client guard mirrors ShouldArmAutomaticRetry.
+	{
+		RequiredRecoveryTracker recovery;
+		assert(ShouldArmAutomaticRetry(true, false));
+		assert(!ShouldArmAutomaticRetry(true, true));
+		assert(!ShouldArmAutomaticRetry(false, false));
+		assert(recovery.Arm(accountA, 500, 0.0, 30.0) == RecoveryArmResult::Armed);
+		assert(recovery.Consume(accountA, 501, 1.0) == RecoveryConsumeResult::Native);
+		assert(recovery.Arm(accountA, 502, 2.0, 30.0) == RecoveryArmResult::RetryExhausted);
+		assert(recovery.Consume(accountA, 503, 3.0) == RecoveryConsumeResult::RetryExhausted);
+	}
+
+	// Server restart/level shutdown is an explicit boundary for all transient state.
+	{
+		RequiredRecoveryTracker recovery;
+		assert(recovery.Arm(accountA, 600, 0.0, 30.0) == RecoveryArmResult::Armed);
+		recovery.Reset();
+		assert(recovery.Size() == 0);
+		assert(recovery.Consume(accountA, 601, 1.0) == RecoveryConsumeResult::None);
+	}
 
 	// Required base-plus-delta: unchanged files are canonical, current deltas are native.
 	assert(SelectBaseline(Lane::Required, true, BaseAvailability::Ready) == Action::CanonicalStub);

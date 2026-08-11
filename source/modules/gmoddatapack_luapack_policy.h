@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -11,7 +12,131 @@ namespace HolyLib::LuaPack::Policy
 	{
 		NativeRescue,
 		NativeOptOut,
+		NativeRecovery,
 		Required,
+	};
+
+	enum class RecoveryPhase
+	{
+		Armed,
+		Consumed,
+	};
+
+	enum class RecoveryArmResult
+	{
+		Armed,
+		Invalid,
+		RetryExhausted,
+	};
+
+	enum class RecoveryConsumeResult
+	{
+		None,
+		Native,
+		SameConnection,
+		RetryExhausted,
+		Expired,
+	};
+
+	struct RecoveryEntry
+	{
+		RecoveryPhase phase = RecoveryPhase::Armed;
+		std::uint64_t failedConnection = 0;
+		std::uint64_t recoveryConnection = 0;
+		double expiresAt = 0.0;
+	};
+
+	// Main-thread state machine for required-pack recovery. The account key prevents
+	// slot reuse from inheriting another player's lane, while connection serials make
+	// it impossible to consume a latch on the connection that armed it.
+	class RequiredRecoveryTracker
+	{
+	public:
+		RecoveryArmResult Arm(std::uint64_t account, std::uint64_t connection,
+			double now, double ttl)
+		{
+			if (account == 0 || connection == 0 || ttl <= 0.0)
+				return RecoveryArmResult::Invalid;
+
+			EraseExpired(account, now);
+			if (entries.find(account) != entries.end())
+				return RecoveryArmResult::RetryExhausted;
+
+			entries.emplace(account, RecoveryEntry{
+				RecoveryPhase::Armed, connection, 0, now + ttl});
+			return RecoveryArmResult::Armed;
+		}
+
+		RecoveryConsumeResult Consume(std::uint64_t account, std::uint64_t connection,
+			double now)
+		{
+			if (account == 0 || connection == 0)
+				return RecoveryConsumeResult::None;
+
+			auto entry = entries.find(account);
+			if (entry == entries.end())
+				return RecoveryConsumeResult::None;
+			if (entry->second.phase == RecoveryPhase::Armed && now >= entry->second.expiresAt)
+			{
+				entries.erase(entry);
+				return RecoveryConsumeResult::Expired;
+			}
+			if (entry->second.phase != RecoveryPhase::Armed)
+				return RecoveryConsumeResult::RetryExhausted;
+			if (entry->second.failedConnection == connection)
+				return RecoveryConsumeResult::SameConnection;
+
+			entry->second.phase = RecoveryPhase::Consumed;
+			entry->second.recoveryConnection = connection;
+			return RecoveryConsumeResult::Native;
+		}
+
+		bool Complete(std::uint64_t account, std::uint64_t connection)
+		{
+			auto entry = entries.find(account);
+			if (entry == entries.end() || entry->second.phase != RecoveryPhase::Consumed ||
+				entry->second.recoveryConnection != connection)
+				return false;
+			entries.erase(entry);
+			return true;
+		}
+
+		bool Clear(std::uint64_t account)
+		{
+			return account != 0 && entries.erase(account) != 0;
+		}
+
+		void Prune(double now)
+		{
+			for (auto entry = entries.begin(); entry != entries.end();)
+			{
+				if (entry->second.phase == RecoveryPhase::Armed && now >= entry->second.expiresAt)
+					entry = entries.erase(entry);
+				else
+					++entry;
+			}
+		}
+
+		void Reset()
+		{
+			entries.clear();
+		}
+
+		std::size_t Size() const
+		{
+			return entries.size();
+		}
+
+	private:
+		void EraseExpired(std::uint64_t account, double now)
+		{
+			auto entry = entries.find(account);
+			if (entry != entries.end() && entry->second.phase == RecoveryPhase::Armed &&
+				now >= entry->second.expiresAt)
+				entries.erase(entry);
+		}
+
+		std::unordered_map<std::uint64_t, RecoveryEntry> entries;
 	};
 
 	enum class BaseAvailability
@@ -32,6 +157,22 @@ namespace HolyLib::LuaPack::Policy
 	{
 		const bool optedOut = allowOptOut && tvNoChat && std::strcmp(tvNoChat, "no_gluapack") == 0;
 		return optedOut ? Lane::NativeOptOut : (required ? Lane::Required : Lane::NativeRescue);
+	}
+
+	constexpr bool RequiredBaselineIdentityReady(bool recoveryEnabled,
+		bool authenticatedIdentity)
+	{
+		return !recoveryEnabled || authenticatedIdentity;
+	}
+
+	constexpr bool NeedsPerClientNativeHashes(Lane lane)
+	{
+		return lane == Lane::Required || lane == Lane::NativeRecovery;
+	}
+
+	constexpr bool ShouldArmAutomaticRetry(bool recoveryEnabled, bool retryGuardArmed)
+	{
+		return recoveryEnabled && !retryGuardArmed;
 	}
 
 	constexpr Action SelectBaseline(Lane lane, bool canonicalRegistration,
@@ -94,6 +235,10 @@ namespace HolyLib::LuaPack::Policy
 		"an unusable required base must fail closed");
 	static_assert(SelectBaseline(Lane::NativeOptOut, true, BaseAvailability::Ready) == Action::Native,
 		"the explicit opt-out lane must remain wholly native");
+	static_assert(SelectBaseline(Lane::NativeRecovery, true, BaseAvailability::Ready) == Action::Native,
+		"a consumed recovery latch must be wholly native from its baseline");
+	static_assert(NeedsPerClientNativeHashes(Lane::NativeRecovery),
+		"required recovery still needs per-client native hash identity");
 	static_assert(SelectFile(Lane::Required, BaseAvailability::Ready, false, false) == Action::CanonicalStub,
 		"an unchanged base file must use the canonical stub");
 	static_assert(SelectFile(Lane::Required, BaseAvailability::Ready, false, true) == Action::Native,
