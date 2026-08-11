@@ -309,6 +309,15 @@ namespace HolyLib::LuaPack::Policy
 				phase == RecoveryHandoffPhase::ServerInfoClaimed;
 		}
 
+		bool ResetIfOwnedBy(std::uint64_t inputAccount)
+		{
+			if (inputAccount == 0 || phase == RecoveryHandoffPhase::Empty ||
+				account != inputAccount)
+				return false;
+			Reset();
+			return true;
+		}
+
 		std::uint64_t Account() const
 		{
 			return account;
@@ -369,6 +378,12 @@ namespace HolyLib::LuaPack::Policy
 	{
 		return gameLayerCallback && nativeRecovery && !active &&
 			!recoveryStateCleared && identityMatches && ownsConsumedRecovery;
+	}
+
+	constexpr bool ShouldKeepInvokedRecoveryHandoff(bool gameLayerCallback,
+		bool invoked)
+	{
+		return gameLayerCallback && invoked;
 	}
 
 	constexpr bool ShouldIgnoreLateRecoveryFailure(bool nativeRecovery,

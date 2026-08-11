@@ -73,11 +73,27 @@ int main()
 		assert(!ShouldPreserveRecoveryLifecycle(true, true, false, false, false, ownsRecovery));
 		assert(!ShouldPreserveRecoveryLifecycle(true, true, false, false, true,
 			recovery.OwnsConsumed(accountB, 111)));
+		assert(ShouldKeepInvokedRecoveryHandoff(true, true));
+		assert(!ShouldKeepInvokedRecoveryHandoff(false, true));
+		assert(!ShouldKeepInvokedRecoveryHandoff(true, false));
 		assert(ShouldIgnoreLateRecoveryFailure(true, ownsRecovery, false));
 		assert(!ShouldIgnoreLateRecoveryFailure(false, ownsRecovery, false));
 		assert(!ShouldIgnoreLateRecoveryFailure(true,
 			recovery.OwnsConsumed(accountA, 112), false));
 		assert(ShouldIgnoreLateRecoveryFailure(true, false, true));
+		assert(!recovery.Clear(accountB));
+		assert(recovery.Clear(accountA));
+		assert(!recovery.OwnsConsumed(accountA, 111));
+		assert(recovery.Arm(accountA, 112, 2.0, 30.0) == RecoveryArmResult::Armed);
+		assert(recovery.Clear(accountA));
+		assert(recovery.Consume(accountA, 113, 3.0) == RecoveryConsumeResult::None);
+
+		RequiredRecoveryHandoff physicalHandoff;
+		assert(physicalHandoff.Queue(accountA, 112, 2.0, 15.0));
+		assert(!physicalHandoff.ResetIfOwnedBy(accountB));
+		assert(physicalHandoff.Pending());
+		assert(physicalHandoff.ResetIfOwnedBy(accountA));
+		assert(!physicalHandoff.Pending());
 	}
 
 	// A stale success callback from the connection that armed recovery cannot clear

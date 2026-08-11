@@ -2332,10 +2332,11 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		}
 
 		ClientPin& client = state.clients[slot];
-		// CBaseClient::Reconnect can report a disconnect before the replacement
-		// ServerInfo. Keep an invoked handoff for that exact authenticated boundary, but
-		// discard a queued request that never reached the engine primitive.
-		if (!state.recoveryHandoffs[slot].Invoked())
+		// A late game-layer disconnect can precede the replacement ServerInfo. Keep an
+		// invoked handoff for that exact authenticated boundary, but discard a queued
+		// request or any handoff at the lower-level physical disconnect boundary.
+		if (!Policy::ShouldKeepInvokedRecoveryHandoff(gameLayerCallback,
+			state.recoveryHandoffs[slot].Invoked()))
 			state.recoveryHandoffs[slot].Reset();
 		// A speculated join that never acknowledged its generation is treated as failed even
 		// without the client's explicit recovery command: its channel may have died before
@@ -2349,6 +2350,35 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		}
 		ReleasePin(client);
 		return false;
+	}
+
+	void PhysicalClientDisconnect(int slot, std::uint64_t steamID64)
+	{
+		if (!IsValidSlot(slot))
+			return;
+
+		unsigned int clearedHandoffs = 0;
+		if (steamID64 != 0)
+		{
+			for (Policy::RequiredRecoveryHandoff& handoff : state.recoveryHandoffs)
+			{
+				if (handoff.ResetIfOwnedBy(steamID64))
+					++clearedHandoffs;
+			}
+		}
+
+		const bool clearedRecovery = steamID64 != 0 &&
+			state.requiredRecovery.Clear(steamID64);
+		if (clearedRecovery || clearedHandoffs > 0)
+		{
+			Msg(PROJECT_NAME " - luapack: physical Steam disconnect for slot %i (%llu) cleared required recovery state (%u handoffs)\n",
+				slot, static_cast<unsigned long long>(steamID64), clearedHandoffs);
+		}
+
+		// Unlike late game-layer callbacks around CGameClient::Reconnect, the Steam
+		// disconnect is a hard account boundary. It must also discard any unidentified
+		// per-slot handoff so a reused slot cannot inherit the reconnect gate.
+		ClientDisconnect(slot, false);
 	}
 
 	MODULE_RESULT ClientCommand(int slot, const CCommand* args)

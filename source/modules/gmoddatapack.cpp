@@ -1914,10 +1914,12 @@ void CGModDataPackModule::OnClientDisconnect(CBaseClient* pClient)
 	int slot = pClient->GetPlayerSlot();
 	if (slot < 0 || slot >= ABSOLUTE_PLAYER_LIMIT)
 		return;
+	const std::uint64_t steamID64 = pClient->m_SteamID.IsValid()
+		? pClient->m_SteamID.ConvertToUint64() : 0;
 
 	g_pLuaDataPack.m_pPlayerQueue[slot].Clear();
 	ClearRequiredNativeLuaHashes(slot);
-	HolyLib::LuaPack::ClientDisconnect(slot, false);
+	HolyLib::LuaPack::PhysicalClientDisconnect(slot, steamID64);
 }
 
 static double g_nLastSend = 0;

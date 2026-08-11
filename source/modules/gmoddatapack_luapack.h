@@ -3,6 +3,7 @@
 #include "interface.h"
 #include "public/imodule.h"
 
+#include <cstdint>
 #include <string>
 
 class CBaseClient;
@@ -102,5 +103,6 @@ namespace HolyLib::LuaPack
 	bool ClientConnect(int slot);
 	void ClientActive(int slot);
 	bool ClientDisconnect(int slot, bool gameLayerCallback = true);
+	void PhysicalClientDisconnect(int slot, std::uint64_t steamID64);
 	MODULE_RESULT ClientCommand(int slot, const CCommand* args);
 }
