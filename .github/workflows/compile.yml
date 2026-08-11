@@ -16,6 +16,16 @@ env:
   LOKI_PUBLIC: https://loki-public.raphaelit7.com # A completely seperate public loki server with bare minimum resources exposed for forks to use. (Yes anyone could abuse it but fk em, it doesn't have resources for any useful shit other than this.)
 
 jobs:
+  luapack_policy_tests:
+    name: "LuaPack map-base policy tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compile and run deterministic policy tests
+        run: |
+          c++ -std=c++17 -Wall -Wextra -pedantic -Isource tests/luapack_map_base_policy_tests.cpp -o /tmp/luapack_map_base_policy_tests
+          /tmp/luapack_map_base_policy_tests
+
   build_plugin_windows:
     name: "Build Plugin"
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow

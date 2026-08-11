@@ -1,5 +1,6 @@
 #include "httplib.h"
 #include "modules/gmoddatapack_luapack.h"
+#include "modules/gmoddatapack_luapack_policy.h"
 
 #include "LuaInterface.h"
 #include "detours.h"
@@ -51,6 +52,7 @@ namespace HolyLib::LuaPack
 		std::string virtualPath;
 		std::string sourcePath;
 		std::string contents;
+		std::string identity;
 		unsigned long long revision = 0;
 	};
 
@@ -62,11 +64,13 @@ namespace HolyLib::LuaPack
 		std::string resourcePath;
 		unsigned long long sourceRevision = 0;
 		double publishedAt = 0.0;
-		double retireAfter = 0.0;
 		bool engineDownloadable = false;
 		std::shared_ptr<Bootil::AutoBuffer> compressedStub;
 		std::shared_ptr<Bootil::AutoBuffer> compressedRequiredStub;
-		std::unordered_map<std::string, bool> files;
+		// Immutable SHA-256 identities for the map-base bodies. The live registry
+		// keeps current contents; comparing the two selects canonical base stubs or
+		// native deltas without building another downloadable generation.
+		std::unordered_map<std::string, std::string> files;
 		unsigned int pins = 0;
 	};
 
@@ -74,7 +78,6 @@ namespace HolyLib::LuaPack
 	{
 		std::string generation;
 		double deadline = 0.0;
-		double nextHandoffAt = 0.0;
 		bool ready = false;
 		bool everReady = false;
 		bool active = false;
@@ -107,7 +110,6 @@ namespace HolyLib::LuaPack
 		Bootil::AutoBuffer compressed;
 		std::string md5;
 		std::string error;
-		std::vector<std::string> changedPaths;
 		std::atomic<bool> complete{false};
 		bool success = false;
 	};
@@ -139,7 +141,6 @@ namespace HolyLib::LuaPack
 		std::map<std::string, Generation> generations;
 		std::string currentGeneration;
 		std::string salt;
-		std::unordered_map<std::string, bool> pendingChanges;
 		INetworkStringTableContainer* stringTables = nullptr;
 		INetworkStringTable* downloadables = nullptr;
 		std::string lockedDownloadUrl;
@@ -179,7 +180,6 @@ do
 	local clientOptedOut = allowOptOutConVar and allowOptOutConVar:GetBool() and sourceTvConVar and
 		sourceTvConVar:GetString() == "no_gluapack"
 	local requiredMode = requiredConVar and requiredConVar:GetBool() and not clientOptedOut
-	local installReceiver -- assigned by bootstrap(); installed later once net.Receive exists
 
 	local function warn(message)
 		Msg("[HolyLib luapack] " .. message .. "\n")
@@ -300,14 +300,19 @@ do
 			return
 		end
 
-		local function manifestFromSnapshot(value, wantedGeneration)
-			local _, refreshManifests = parseSnapshot(value)
-			return refreshManifests and refreshManifests[wantedGeneration] or nil
-		end
-
 		local function parsePack(contents, manifest)
 			if #contents < 1 or string.byte(contents, 1) ~= 1 then return nil, "unsupported pack version" end
 			local pack = {vfs = {}, vfsLCL = {}, salt = manifest.salt, manifest = manifest}
+			local function registerLocal(key, source)
+				local existing = pack.vfsLCL[key]
+				if existing == nil then
+					pack.vfsLCL[key] = source
+				elseif existing ~= source then
+					-- Local forms are compatibility fallbacks. A divergent collision must
+					-- fail lookup instead of selecting whichever full path was parsed last.
+					pack.vfsLCL[key] = false
+				end
+			end
 			local cursor = 2
 			while cursor <= #contents do
 				if #contents - cursor + 1 < 52 then return nil, "truncated entry header" end
@@ -320,8 +325,8 @@ do
 				local source = string.sub(contents, cursor, cursor + length - 1); cursor = cursor + length
 				if pack.vfs[sourceKey] ~= nil then return nil, "duplicate exact source key" end
 				pack.vfs[sourceKey] = source
-				pack.vfsLCL[localKeyOne] = source
-				pack.vfsLCL[localKeyTwo] = source
+				registerLocal(localKeyOne, source)
+				registerLocal(localKeyTwo, source)
 			end
 			return pack
 		end
@@ -393,7 +398,7 @@ do
 			function _G.__holypack(generation, required)
 				-- Canonical placeholders are deliberately generation-independent so their
 				-- SHA256 can be registered once in client_lua_files. The replicated manifest
-				-- selects the cold-join generation; autorefresh advances selectedGeneration.
+				-- selects the immutable map-base generation for this level.
 				if generation == nil then generation = selectedGeneration or currentGeneration end
 				local pack = packs[generation]
 				if not pack and not recoveryTaint and not lazyMountAttempted[generation] then
@@ -429,14 +434,6 @@ do
 			end
 
 			function _G.include(path)
-				-- extensions/net.lua (which defines net.Receive) is included later by this same
-				-- init file, so the autorefresh receiver is installed lazily from here.
-				if installReceiver and net and net.Receive then
-					local install = installReceiver
-					installReceiver = nil
-					local installed, message = pcall(install)
-					if not installed then warn("autorefresh receiver failed to install: " .. tostring(message)) end
-				end
 				local pack = selectedGeneration and packs[selectedGeneration]
 				local compiled = pack and compilePacked(pack, path)
 				if compiled then return compiled() end
@@ -444,70 +441,14 @@ do
 			end
 		end
 
-		installReceiver = function()
-			net.Receive("gmsv_holylib_luapack_autorefresh", function()
-				local generation = net.ReadString()
-				local refreshSnapshot = net.ReadString()
-				local downloadUrl = net.ReadString()
-
-				local manifest = manifestFromSnapshot(refreshSnapshot, generation)
-				if not manifest or downloadUrl == "" then
-					warn("autorefresh generation " .. tostring(generation) .. " has no usable FastDL manifest and cannot be acknowledged")
-					return
-				end
-				if packs[generation] then
-					selectedGeneration = generation
-					if not recoveryTaint then
-						RunConsoleCommand("holylib_luapack_ready", generation, manifest.md5)
-					end
-					return
-				end
-
-				local url = string.gsub(downloadUrl, "/+$", "") .. "/" .. string.gsub(manifest.resource, "^/+", "")
-				http.Fetch(url, function(compressed)
-					local contents = util.Decompress(compressed or "")
-					if not contents or string.lower(util.MD5(contents)) ~= manifest.md5 then
-						warn("autorefresh generation " .. generation .. " failed decompression or MD5 validation and cannot be acknowledged")
-						return
-					end
-
-					local pack, parseError = parsePack(contents, manifest)
-					if not pack then
-						warn("autorefresh generation " .. generation .. " is invalid (" .. tostring(parseError) .. ") and cannot be acknowledged")
-						return
-					end
-
-					-- Retained packs are immutable: the previous generation keeps resolving any
-					-- stubs that were issued against it. The engine's own autorefresh re-send
-					-- re-executes changed files, so nothing is re-included from here.
-					packs[generation] = pack
-					selectedGeneration = generation
-					if not recoveryTaint then
-						RunConsoleCommand("holylib_luapack_ready", generation, manifest.md5)
-					end
-				end, function(message)
-					warn("autorefresh FastDL fetch failed for generation " .. generation .. ": " .. tostring(message) .. "; the generation cannot be acknowledged")
-				end)
-			end)
-		end
-
 		activate = function()
 			installOverrides()
-			-- On late activation (after init has finished) net.Receive already exists, so the
-			-- receiver installs here; during init the include override installs it instead.
-			if installReceiver and net and net.Receive then
-				local install = installReceiver
-				installReceiver = nil
-				local installed, message = pcall(install)
-				if not installed then warn("autorefresh receiver failed to install: " .. tostring(message)) end
-			end
 		end
 
 		-- Boot mount pass. Acknowledge whatever is already on disk; stub delivery is gated
 		-- server-side on this exact ACK and must not depend on anything loaded later in init.
-		-- The bounded level-lifetime downloadables table may contain an earlier retained
-		-- generation, while the current generation can require the post-spawn HTTP handoff.
-		-- Mount every available retained object opportunistically, but only warn for current.
+		-- Map-base mode publishes one generation per level. Keep the table loop for manifest
+		-- parser compatibility, but only the current base is expected.
 		local pendingManifests = {}
 		local downloadFilter = getConVar("cl_downloadfilter")
 		local downloadsDisabled = downloadFilter and downloadFilter:GetString() == "none"
@@ -570,7 +511,6 @@ end
 )HOLYLUAPACK";
 
 	static const char* serverBridge = R"HLPACKSERVER(
-util.AddNetworkString("gmsv_holylib_luapack_autorefresh")
 concommand.Add("holylib_gmoddatapack_luapack_kill", function(caller)
 	if IsValid(caller) and not caller:IsSuperAdmin() then
 		caller:ChatPrint("HolyLib luapack kill-switch requires superadmin")
@@ -579,22 +519,6 @@ concommand.Add("holylib_gmoddatapack_luapack_kill", function(caller)
 	RunConsoleCommand("holylib_gmoddatapack_luapack_enable", "0")
 	Msg("[HolyLib luapack] kill-switch activated; all clients now use vanilla Lua delivery\n")
 end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua networking", FCVAR_DONTRECORD)
-hook.Add("HolyLib:LuaPackPublished", "HolyLib:LuaPackAutorefreshBridge", function(generation, manifest, recipients, changedPaths)
-	local targets = {}
-	for _, index in ipairs(recipients or {}) do
-		-- recipients carries entity indices (client slot + 1), not UserIDs.
-		local target = Entity(index)
-		if IsValid(target) and target:IsPlayer() then targets[#targets + 1] = target end
-	end
-	if #targets == 0 then return end
-
-	local downloadUrl = GetConVar("sv_downloadurl")
-	net.Start("gmsv_holylib_luapack_autorefresh")
-		net.WriteString(generation)
-		net.WriteString(manifest)
-		net.WriteString(downloadUrl and downloadUrl:GetString() or "")
-	net.Send(targets)
-end)
 )HLPACKSERVER";
 
 	static std::string NormalizePath(std::string path)
@@ -604,6 +528,11 @@ end)
 			path.erase(path.begin());
 
 		return path;
+	}
+
+	static std::string ContentIdentity(const std::string& contents)
+	{
+		return picosha2::hash256_hex_string(contents);
 	}
 
 	static bool StartsWith(const std::string& value, const char* prefix)
@@ -708,7 +637,7 @@ end)
 				return false;
 
 			const std::string sourceKey(reinterpret_cast<const char*>(data + offset), 16);
-			if (!sourceKeys.insert(sourceKey).second)
+			if (!Policy::RegisterExactKey(sourceKeys, sourceKey))
 				return false;
 			offset += 16 * 3;
 			const unsigned int contentLength =
@@ -857,9 +786,11 @@ end)
 		const Config& currentConfig = GetConfig();
 		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
 		const char* optOutValue = baseClient ? baseClient->GetUserSetting("tv_nochat") : nullptr;
-		client.optOut = currentConfig.allowOptOut && optOutValue && strcmp(optOutValue, "no_gluapack") == 0;
-		client.requiredLane = currentConfig.requiredStubbing && !client.optOut;
-		client.nativeLane = !client.requiredLane;
+		const Policy::Lane lane = Policy::ResolveLane(currentConfig.requiredStubbing,
+			currentConfig.allowOptOut, optOutValue);
+		client.optOut = lane == Policy::Lane::NativeOptOut;
+		client.requiredLane = lane == Policy::Lane::Required;
+		client.nativeLane = lane != Policy::Lane::Required;
 		client.deliveryLaneResolved = true;
 
 		if (client.nativeLane)
@@ -891,6 +822,56 @@ end)
 				}
 			}
 		}
+	}
+
+	static std::string DataDirectory(const std::string& packDirectory);
+
+	static Policy::Lane ClientLane(const ClientPin& client)
+	{
+		if (client.requiredLane)
+			return Policy::Lane::Required;
+		return client.optOut ? Policy::Lane::NativeOptOut : Policy::Lane::NativeRescue;
+	}
+
+	static Policy::BaseAvailability BaseAvailabilityForClient(const ClientPin& client, bool verifyLocalObject)
+	{
+		if (client.generation.empty())
+			return Policy::BaseAvailability::Missing;
+
+		auto generation = state.generations.find(client.generation);
+		if (generation == state.generations.end())
+			return Policy::BaseAvailability::Missing;
+
+		const Generation& base = generation->second;
+		const std::string expectedPath = DataDirectory(GetConfig().packDirectory) + "/" + base.id + ".bsp";
+		if (!base.engineDownloadable || !base.compressedRequiredStub || base.resourcePath != expectedPath ||
+			(verifyLocalObject && (!g_pFullFileSystem ||
+				!g_pFullFileSystem->FileExists(base.resourcePath.c_str(), "MOD"))))
+		{
+			return Policy::BaseAvailability::Unusable;
+		}
+
+		return Policy::BaseAvailability::Ready;
+	}
+
+	static bool IsNativeDelta(const Generation& base, const std::string& virtualPath)
+	{
+		const std::string path = NormalizePath(virtualPath);
+		auto baseFile = base.files.find(path);
+		std::string currentIdentity;
+		bool hasCurrent = false;
+		{
+			std::lock_guard<std::mutex> lock(state.registryMutex);
+			auto current = state.files.find(path);
+			if (current != state.files.end())
+			{
+				currentIdentity = current->second.identity;
+				hasCurrent = true;
+			}
+		}
+
+		return Policy::IsNativeDelta(baseFile != base.files.end() && hasCurrent,
+			baseFile == base.files.end() ? std::string() : baseFile->second, currentIdentity);
 	}
 
 	static std::string DataDirectory(const std::string& packDirectory)
@@ -1090,7 +1071,7 @@ end)
 		if (!downloadUrl)
 		{
 			if (publishing)
-				Warning(PROJECT_NAME " - luapack: sv_downloadurl is unavailable; refusing to publish a FastDL generation\n");
+				Warning(PROJECT_NAME " - luapack: sv_downloadurl is unavailable; refusing to publish the FastDL map base\n");
 			return false;
 		}
 
@@ -1099,7 +1080,7 @@ end)
 			if (downloadUrl->GetString()[0] == '\0')
 			{
 				if (publishing)
-					Warning(PROJECT_NAME " - luapack: sv_downloadurl is empty and policy=require; generation remains unpublished\n");
+					Warning(PROJECT_NAME " - luapack: sv_downloadurl is empty and policy=require; map base remains unpublished\n");
 				return false;
 			}
 			return true;
@@ -1194,7 +1175,7 @@ end)
 		const unsigned int registered = RegisteredPackObjectCount(downloadables, packDirectory);
 		if (registered >= limit)
 		{
-			Msg(PROJECT_NAME " - luapack: downloadables budget exhausted (%u/%u); generation '%s' is HTTP-only (fail-open joins hand off after spawn; required joins are rejected)\n",
+			Msg(PROJECT_NAME " - luapack: downloadables budget exhausted (%u/%u); map base '%s' cannot be engine-downloadable in this level lifecycle\n",
 				registered, limit, resourcePath.c_str());
 			return DownloadableRegistration::BudgetExhausted;
 		}
@@ -1280,6 +1261,11 @@ end)
 
 	static void StartBuild()
 	{
+		// One immutable generation is admitted to Source's level-lifetime
+		// downloadables table. Hot refreshes after this point are native deltas.
+		if (!state.currentGeneration.empty())
+			return;
+
 		BuildTask* task = new BuildTask;
 		{
 			std::lock_guard<std::mutex> lock(state.registryMutex);
@@ -1298,9 +1284,6 @@ end)
 
 				task->files.push_back(pair.second);
 			}
-			for (const auto& change : state.pendingChanges)
-				task->changedPaths.push_back(change.first);
-			state.pendingChanges.clear();
 			task->sourceRevision = state.revision;
 			state.buildRequested = false;
 		}
@@ -1335,11 +1318,11 @@ end)
 		"HTTP method for the optional pack ingest hook");
 	static ConVar luapack_downloadable_limit(
 		"holylib_gmoddatapack_luapack_downloadable_limit", "1", FCVAR_ARCHIVE,
-		"Maximum immutable pack objects appended to the level-lifetime downloadables table; later generations use post-spawn HTTP handoff",
+		"Maximum immutable pack objects appended to the level-lifetime downloadables table; LuaPack publishes only one map base and sends later changes natively",
 		true, 0.0f, true, 64.0f);
 	static ConVar luapack_retention_ttl(
 		"holylib_gmoddatapack_luapack_retention_ttl", "300", FCVAR_ARCHIVE,
-		"Minimum seconds to retain an immutable generation after its last pinned client leaves",
+		"Compatibility floor for immutable object retention; map-base mode does not rotate generations during a level",
 		true, 30.0f, true, 86400.0f);
 	static ConVar luapack_object_retention_ttl(
 		"holylib_gmoddatapack_luapack_object_retention_ttl", "604800", FCVAR_ARCHIVE,
@@ -1347,7 +1330,7 @@ end)
 		true, 0.0f, true, 31536000.0f);
 	static ConVar luapack_ready_deadline(
 		"holylib_gmoddatapack_luapack_ready_deadline", "180", FCVAR_ARCHIVE,
-		"Seconds a silent spawned client keeps its generation pinned (the clock starts at activation, not connect); a matching late acknowledgement is still accepted afterwards",
+		"Seconds a silent spawned client keeps its map base pinned (the clock starts at activation, not connect); a matching late acknowledgement is still accepted afterwards",
 		true, 1.0f, true, 3600.0f);
 	static ConVar luapack_required(
 		"holylib_gmoddatapack_luapack_required", "0", FCVAR_ARCHIVE | FCVAR_REPLICATED,
@@ -1374,7 +1357,7 @@ end)
 	// which would destroy the manifest snapshot. The client-created mirror adds the non-server flags.
 	static ConVar luapack_manifest(
 		"holylib_gmoddatapack_luapack_manifest", "", FCVAR_REPLICATED | FCVAR_DONTRECORD | FCVAR_UNLOGGED,
-		"Atomic retained-generation manifest used by the client bootstrap");
+		"Atomic immutable map-base manifest used by the client bootstrap");
 
 	static Config config;
 
@@ -1392,27 +1375,9 @@ end)
 	}
 
 	// The client engine truncates replicated convar values to 255 characters. The snapshot
-	// therefore only carries what the bootstrap cannot derive: a generation id doubles as
-	// the content MD5 and the FastDL object basename, and every generation in one server
-	// lifecycle shares the salt (state.generations and state.salt reset together).
+	// therefore only carries what the bootstrap cannot derive: the map-base id doubles as
+	// the content MD5 and FastDL object basename, plus the base directory and salt.
 	static const size_t MAXIMUM_MANIFEST_LENGTH = 255;
-
-	static std::string SingleGenerationManifest(const std::string& generationId)
-	{
-		auto generation = state.generations.find(generationId);
-		if (generation == state.generations.end())
-			return "";
-
-		const std::string packDirectory = GetConfig().packDirectory;
-		if (generation->second.resourcePath != DataDirectory(packDirectory) + "/" + generationId + ".bsp")
-			return "";
-
-		std::ostringstream serialized;
-		serialized << "1|" << generationId << '|' << HexEncode(packDirectory)
-			<< '|' << HexEncode(generation->second.salt) << '|' << generationId;
-		const std::string value = serialized.str();
-		return value.length() <= MAXIMUM_MANIFEST_LENGTH ? value : "";
-	}
 
 	static void PublishManifest()
 	{
@@ -1432,18 +1397,18 @@ end)
 		const std::string& packDirectory = GetConfig().packDirectory;
 		if (current->second.resourcePath != DataDirectory(packDirectory) + "/" + state.currentGeneration + ".bsp")
 		{
-			// The pack directory changed after this generation was built; a derived client
-			// path would point at nothing. The next build publishes under the new directory.
-			Warning(PROJECT_NAME " - luapack: pack directory changed after generation %s was built; refusing publication until the next build\n",
+			// The pack directory changed after the map base was built; a derived client
+			// path would point at nothing. Map-base immutability defers replacement.
+			Warning(PROJECT_NAME " - luapack: pack directory changed after map base %s was built; refusing publication until level shutdown\n",
 				state.currentGeneration.c_str());
 			luapack_manifest.SetValue("");
 			return;
 		}
 
-		std::ostringstream header;
-		header << "1|" << state.currentGeneration << '|' << HexEncode(packDirectory)
+		std::ostringstream manifest;
+		manifest << "1|" << state.currentGeneration << '|' << HexEncode(packDirectory)
 			<< '|' << HexEncode(current->second.salt) << '|' << state.currentGeneration;
-		std::string serialized = header.str();
+		const std::string serialized = manifest.str();
 		if (serialized.length() > MAXIMUM_MANIFEST_LENGTH)
 		{
 			Warning(PROJECT_NAME " - luapack: pack directory '%s' pushes the replicated manifest over %u characters; refusing publication\n",
@@ -1452,133 +1417,8 @@ end)
 			return;
 		}
 
-		for (const auto& pair : state.generations)
-		{
-			if (pair.first == state.currentGeneration)
-				continue;
-			// A retained generation that no longer fits, or that was built under a different
-			// directory or salt, stays valid server-side for late acknowledgements; new
-			// bootstraps only ever need the current generation.
-			if (pair.second.salt != current->second.salt ||
-				pair.second.resourcePath != DataDirectory(packDirectory) + "/" + pair.first + ".bsp" ||
-				serialized.length() + 1 + pair.first.length() > MAXIMUM_MANIFEST_LENGTH)
-				continue;
-			serialized += ';';
-			serialized += pair.first;
-		}
-
 		// One SetValue call is the publication barrier: clients never observe a partially-updated generation.
 		luapack_manifest.SetValue(serialized.c_str());
-	}
-
-	static bool SendGenerationHandoff(const std::string& generationId, const std::vector<int>& recipients,
-		const std::vector<std::string>& changedPaths)
-	{
-		if (!g_Lua || recipients.empty())
-			return false;
-
-		auto generation = state.generations.find(generationId);
-		if (generation == state.generations.end())
-			return false;
-		const std::string manifest = SingleGenerationManifest(generationId);
-		if (manifest.empty() || !Lua::PushHook("HolyLib:LuaPackPublished"))
-			return false;
-
-		g_Lua->PushString(generationId.c_str());
-		g_Lua->PushString(manifest.c_str());
-		g_Lua->PreCreateTable(recipients.size(), 0);
-		for (size_t index = 0; index < recipients.size(); ++index)
-		{
-			g_Lua->PushNumber(recipients[index] + 1);
-			Util::RawSetI(g_Lua, -2, index + 1);
-		}
-		g_Lua->PreCreateTable(changedPaths.size(), 0);
-		for (size_t index = 0; index < changedPaths.size(); ++index)
-		{
-			g_Lua->PushString(changedPaths[index].c_str());
-			Util::RawSetI(g_Lua, -2, index + 1);
-		}
-		g_Lua->CallFunctionProtected(5, 0, true);
-		return true;
-	}
-
-	static void NotifyAutorefresh(const std::string& previousGeneration, const BuildTask* task)
-	{
-		if (!g_Lua || previousGeneration.empty() || previousGeneration == state.currentGeneration ||
-			!task || task->changedPaths.empty())
-			return;
-
-		std::vector<int> recipients;
-		for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
-		{
-			const ClientPin& client = state.clients[slot];
-			if (client.active && client.ready && !client.fallback && client.generation == previousGeneration)
-				recipients.push_back(slot);
-		}
-		if (recipients.empty())
-			return;
-
-		auto generation = state.generations.find(state.currentGeneration);
-		if (generation == state.generations.end())
-			return;
-		if (!SendGenerationHandoff(state.currentGeneration, recipients, task->changedPaths))
-			return;
-
-		for (int slot : recipients)
-		{
-			ClientPin& client = state.clients[slot];
-			ReleaseGenerationReference(client);
-			client.generation = state.currentGeneration;
-			client.deadline = ServerTime() + GetConfig().readyDeadlineSeconds;
-			client.nextHandoffAt = ServerTime() + 10.0;
-			client.ready = false;
-			client.fallback = false;
-			client.holdsPin = true;
-			++generation->second.pins;
-		}
-	}
-
-	static void NotifyJoiningClient(int slot)
-	{
-		if (!IsValidSlot(slot))
-			return;
-
-		ClientPin& client = state.clients[slot];
-		if (!client.active || client.ready || client.fallback || client.generation.empty())
-			return;
-
-		if (SendGenerationHandoff(client.generation, std::vector<int>{slot}, std::vector<std::string>()))
-			client.nextHandoffAt = ServerTime() + 10.0;
-	}
-
-	static void CatchUpClient(int slot)
-	{
-		if (!IsValidSlot(slot) || state.currentGeneration.empty())
-			return;
-
-		ClientPin& client = state.clients[slot];
-		if (!client.active || !client.ready || client.fallback || client.generation.empty() ||
-			client.generation == state.currentGeneration)
-			return;
-
-		auto generation = state.generations.find(state.currentGeneration);
-		if (generation == state.generations.end() ||
-			!SendGenerationHandoff(state.currentGeneration, std::vector<int>{slot}, std::vector<std::string>()))
-		{
-			return;
-		}
-
-		const std::string previousGeneration = client.generation;
-		ReleaseGenerationReference(client);
-		client.generation = state.currentGeneration;
-		client.deadline = ServerTime() + GetConfig().readyDeadlineSeconds;
-		client.nextHandoffAt = ServerTime() + 10.0;
-		client.ready = false;
-		client.fallback = false;
-		client.holdsPin = true;
-		++generation->second.pins;
-		Msg(PROJECT_NAME " - luapack: client slot %i catching up from acknowledged generation %s to current generation %s\n",
-			slot, previousGeneration.c_str(), state.currentGeneration.c_str());
 	}
 
 	static void RefreshConfig()
@@ -1661,7 +1501,6 @@ end)
 
 		std::lock_guard<std::mutex> lock(state.registryMutex);
 		state.files.clear();
-		state.pendingChanges.clear();
 		state.buildRequested = false;
 		state.generations.clear();
 		state.currentGeneration.clear();
@@ -1700,7 +1539,6 @@ end)
 				// also prevents a runtime re-enable from publishing a stale pre-refresh snapshot.
 				std::lock_guard<std::mutex> lock(state.registryMutex);
 				state.files.clear();
-				state.pendingChanges.clear();
 				state.buildRequested = false;
 			}
 		}
@@ -1727,74 +1565,84 @@ end)
 		{
 			BuildTask* task = state.activeBuild;
 			state.activeBuild = nullptr;
+			auto retryBaseBuild = [](double delay) {
+				state.nextBuildAllowed = ServerTime() + delay;
+				std::lock_guard<std::mutex> lock(state.registryMutex);
+				state.buildRequested = true;
+			};
 
 			state.nextBuildAllowed = ServerTime() + 5.0;
 			if (!task->success)
 			{
-				Warning(PROJECT_NAME " - luapack: Failed to build pack: %s\n", task->error.c_str());
+				Warning(PROJECT_NAME " - luapack: Failed to build map-base pack: %s\n", task->error.c_str());
+				if (IsEnabled() && state.currentGeneration.empty())
+					retryBaseBuild(15.0);
 			} else if (IsEnabled()) {
-				std::string resourcePath;
-				if (!WriteImmutableObject(task, resourcePath))
+				if (!state.currentGeneration.empty())
 				{
-					Warning(PROJECT_NAME " - luapack: Failed to atomically write pack %s\n", task->md5.c_str());
-				} else if (!CoordinateDownloadUrl(true)) {
-					Warning(PROJECT_NAME " - luapack: Pack %s exists but was not published; fail-open joins remain native and required joins are rejected\n", task->md5.c_str());
-					state.nextBuildAllowed = ServerTime() + 15.0;
-					std::lock_guard<std::mutex> lock(state.registryMutex);
-					state.buildRequested = true;
+					Warning(PROJECT_NAME " - luapack: Discarding a completed replacement build because map base %s is immutable until level shutdown\n",
+						state.currentGeneration.c_str());
 				} else {
-					const Config& currentConfig = GetConfig();
-					const DownloadableRegistration registration = RegisterDownloadable(resourcePath,
-						currentConfig.packDirectory, currentConfig.downloadableLimit);
-					if (registration == DownloadableRegistration::Failed)
+					std::string resourcePath;
+					if (!WriteImmutableObject(task, resourcePath))
 					{
-						Warning(PROJECT_NAME " - luapack: Pack %s exists but was not published; fail-open joins remain native and required joins are rejected\n", task->md5.c_str());
-						state.nextBuildAllowed = ServerTime() + 15.0;
-						std::lock_guard<std::mutex> lock(state.registryMutex);
-						state.buildRequested = true;
-						delete task;
-						return;
+						Warning(PROJECT_NAME " - luapack: Failed to atomically write map-base pack %s\n", task->md5.c_str());
+						retryBaseBuild(15.0);
+					} else if (!CoordinateDownloadUrl(true)) {
+						Warning(PROJECT_NAME " - luapack: Map base %s exists but was not published; native lanes continue and required joins are rejected\n", task->md5.c_str());
+						retryBaseBuild(15.0);
+					} else {
+						const Config& currentConfig = GetConfig();
+						const DownloadableRegistration registration = RegisterDownloadable(resourcePath,
+							currentConfig.packDirectory, currentConfig.downloadableLimit);
+						if (registration == DownloadableRegistration::Failed)
+						{
+							Warning(PROJECT_NAME " - luapack: Map base %s could not enter the engine download queue; native lanes continue and required joins are rejected\n", task->md5.c_str());
+							retryBaseBuild(15.0);
+						}
+						else if (registration == DownloadableRegistration::BudgetExhausted)
+						{
+							Warning(PROJECT_NAME " - luapack: No engine-downloadable slot remains for map base %s; refusing an HTTP-only base until level shutdown\n", task->md5.c_str());
+							std::lock_guard<std::mutex> lock(state.registryMutex);
+							state.buildRequested = false;
+						}
+						else
+						{
+							Generation generation;
+							generation.id = task->md5;
+							generation.md5 = task->md5;
+							generation.salt = task->salt;
+							generation.resourcePath = resourcePath;
+							generation.engineDownloadable = true;
+							generation.sourceRevision = task->sourceRevision;
+							generation.publishedAt = ServerTime();
+							generation.compressedStub = BuildCompressedStub();
+							generation.compressedRequiredStub = generation.compressedStub;
+							for (const FileRecord& file : task->files)
+								generation.files[NormalizePath(file.virtualPath)] = file.identity;
+							if (!generation.compressedStub || !generation.compressedRequiredStub)
+							{
+								Warning(PROJECT_NAME " - luapack: Failed to build the canonical map-base stub; required joins remain rejected\n");
+								retryBaseBuild(15.0);
+							}
+							else
+							{
+								state.generations[generation.id] = generation;
+								state.currentGeneration = generation.id;
+								{
+									std::lock_guard<std::mutex> lock(state.registryMutex);
+									// Captures newer than the build snapshot stay in state.files
+									// and are selected as native deltas.
+									state.buildRequested = false;
+								}
+								PublishManifest();
+								NotifyPackBuilt(task, generation);
+								HousekeepObjects();
+								Msg(PROJECT_NAME " - luapack: Published immutable map base %s (%u compressed bytes, %u files); subsequent changes use per-client native deltas\n",
+									generation.id.c_str(), task->compressed.GetWritten(), static_cast<unsigned int>(task->files.size()));
+							}
+						}
 					}
-
-					Generation generation;
-					generation.id = task->md5;
-					generation.md5 = task->md5;
-					generation.salt = task->salt;
-					generation.resourcePath = resourcePath;
-					generation.engineDownloadable = registration == DownloadableRegistration::Registered;
-					generation.sourceRevision = task->sourceRevision;
-					generation.publishedAt = ServerTime();
-					generation.compressedStub = BuildCompressedStub();
-					generation.compressedRequiredStub = generation.compressedStub;
-					for (const FileRecord& file : task->files)
-						generation.files[NormalizePath(file.virtualPath)] = true;
-					if (!generation.compressedStub || !generation.compressedRequiredStub)
-					{
-						Warning(PROJECT_NAME " - luapack: Failed to build generation stub; pack remains unpublished\n");
-						delete task;
-						return;
-					}
-					auto existing = state.generations.find(generation.id);
-					if (existing != state.generations.end())
-						generation.pins = existing->second.pins;
-
-					const std::string previousGeneration = state.currentGeneration;
-					if (!previousGeneration.empty() && previousGeneration != generation.id)
-					{
-						auto previous = state.generations.find(previousGeneration);
-						if (previous != state.generations.end())
-							previous->second.retireAfter = ServerTime() + GetConfig().generationRetentionSeconds;
-					}
-
-					state.generations[generation.id] = generation;
-					state.currentGeneration = generation.id;
-					PublishManifest();
-					NotifyAutorefresh(previousGeneration, task);
-					NotifyPackBuilt(task, generation);
-					HousekeepObjects();
-					Msg(PROJECT_NAME " - luapack: Built immutable generation %s (%u compressed bytes, %u files, engine-downloadable=%s)\n",
-						generation.id.c_str(), task->compressed.GetWritten(), static_cast<unsigned int>(task->files.size()),
-						generation.engineDownloadable ? "yes" : "no");
 				}
 			}
 
@@ -1822,17 +1670,6 @@ end)
 		for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
 		{
 			ClientPin& client = state.clients[slot];
-			if (client.active && client.ready && !client.fallback &&
-				!client.generation.empty() && client.generation != state.currentGeneration)
-			{
-				CatchUpClient(slot);
-			}
-			if (!client.generation.empty() && !client.ready && !client.fallback && client.active &&
-				now >= client.nextHandoffAt)
-			{
-				NotifyJoiningClient(slot);
-			}
-
 			// The deadline only runs for spawned clients. A connecting client can legitimately
 			// spend many minutes in map load + the Requesting-Lua burst before its Lua state even
 			// exists; expiring the pin there would mark exactly the joins that matter fallback
@@ -1842,7 +1679,7 @@ end)
 			{
 				if (client.requiredLane && !client.everReady)
 				{
-					DisconnectRequiredClient(slot, "the client did not acknowledge its required generation before the READY deadline");
+					DisconnectRequiredClient(slot, "the client did not acknowledge its required map base before the READY deadline");
 					continue;
 				}
 				MarkFallback(client);
@@ -1857,22 +1694,6 @@ end)
 				++latch;
 		}
 
-		bool retiredGeneration = false;
-		for (auto generation = state.generations.begin(); generation != state.generations.end();)
-		{
-			if (generation->first != state.currentGeneration && generation->second.pins == 0 &&
-				generation->second.retireAfter > 0.0 && now >= generation->second.retireAfter)
-			{
-				Msg(PROJECT_NAME " - luapack: Retired unpinned generation %s; object remains protected while registered and is later eligible for housekeeping\n",
-					generation->first.c_str());
-				generation = state.generations.erase(generation);
-				retiredGeneration = true;
-				continue;
-			}
-			++generation;
-		}
-		if (retiredGeneration)
-			PublishManifest();
 		if (luapack_manifest.GetString()[0] == '\0' && !state.currentGeneration.empty())
 			PublishManifest();
 		if (state.activeBuild)
@@ -1881,10 +1702,10 @@ end)
 		bool shouldBuild = false;
 		{
 			std::lock_guard<std::mutex> lock(state.registryMutex);
-			// The quiesce window batches multi-file deploys/refreshes into one whole-pack
-			// build instead of one per touched file; nextBuildAllowed backs off retries so a
-			// failed publish cannot degenerate into a per-frame LZMA loop.
-			shouldBuild = state.buildRequested && now >= state.nextBuildAllowed &&
+			// The quiesce window captures the level's initial registration burst as one
+			// map base; nextBuildAllowed backs off failed initial publication retries.
+			shouldBuild = Policy::ShouldBuildMapBase(!state.currentGeneration.empty(), state.buildRequested) &&
+				now >= state.nextBuildAllowed &&
 				now - state.lastCaptureAt >= 2.0;
 		}
 		if (shouldBuild)
@@ -1907,6 +1728,8 @@ end)
 		const std::string virtualPath = NormalizePath(file->name);
 		if (virtualPath.empty())
 			return;
+		const std::string identity = ContentIdentity(file->contents);
+		const bool needsMapBase = state.currentGeneration.empty();
 
 		{
 			std::lock_guard<std::mutex> lock(state.registryMutex);
@@ -1921,19 +1744,18 @@ end)
 			record.virtualPath = virtualPath;
 			record.sourcePath = sourcePath;
 			record.contents = file->contents;
+			record.identity = identity;
 			record.revision = ++state.revision;
-			state.buildRequested = true;
-			state.pendingChanges[virtualPath] = true;
+			if (needsMapBase)
+			{
+				state.buildRequested = true;
+			}
 			state.lastCaptureAt = ServerTime(); // quiesce window: batch deploys build once, not per file
 		}
 
-		// A changed file must stop being stubbed immediately: every retained generation's
-		// pack body still holds the previous contents, so a stub would make the engine's
-		// autorefresh re-send re-run STALE code on ready clients. Excluding the path here
-		// routes those sends through the real updated file; the next published generation
-		// restores stub coverage. Main thread only, like all generation-map access.
-		for (auto& pair : state.generations)
-			pair.second.files.erase(virtualPath);
+		// Once the immutable map base exists, no replacement generation is queued.
+		// Selection compares this current identity with the base identity: changed or
+		// late paths go native, and an exact restoration becomes canonical again.
 	}
 
 	std::string PrepareVanillaFile(const std::string& virtualPath, const std::string& contents)
@@ -1961,21 +1783,52 @@ end)
 
 		ClientPin& client = state.clients[slot];
 		ResolveDeliveryLane(slot, client);
-		if (client.nativeLane)
-			return {BaselineAction::NativeSource, nullptr};
+		const Policy::BaseAvailability base = BaseAvailabilityForClient(client, true);
+		switch (Policy::SelectBaseline(ClientLane(client), SupportsCanonicalRegistration(), base))
+		{
+			case Policy::Action::Native:
+				return {BaselineAction::NativeSource, nullptr};
+			case Policy::Action::CanonicalStub:
+				return {BaselineAction::BasePlusDelta, nullptr};
+			case Policy::Action::Reject:
+				if (!SupportsCanonicalRegistration())
+					return {BaselineAction::Reject, "canonical Lua placeholder registration is unavailable on this platform"};
+				if (base == Policy::BaseAvailability::Missing)
+					return {BaselineAction::Reject, "no immutable map base was pinned before the client string-table baseline"};
+				return {BaselineAction::Reject, "the pinned map base is absent, invalid, or not in the engine download queue"};
+		}
 
-		if (!SupportsCanonicalRegistration())
-			return {BaselineAction::Reject, "canonical Lua placeholder registration is unavailable on this platform"};
-		if (client.generation.empty())
-			return {BaselineAction::Reject, "no generation was pinned before the client string-table baseline"};
+		return {BaselineAction::Reject, "invalid map-base baseline policy result"};
+	}
 
-		auto generation = state.generations.find(client.generation);
-		if (generation == state.generations.end() || !generation->second.compressedRequiredStub)
-			return {BaselineAction::Reject, "the pinned generation is unavailable before the client string-table baseline"};
-		if (!generation->second.engineDownloadable)
-			return {BaselineAction::Reject, "the pinned generation is not in the engine download queue"};
+	BaselineDecision DecideFileBaselineForClient(int slot, const std::string& virtualPath)
+	{
+		if (!IsEnabled() || !IsValidSlot(slot))
+			return BaselineDecision();
 
-		return {BaselineAction::CanonicalStub, nullptr};
+		ClientPin& client = state.clients[slot];
+		ResolveDeliveryLane(slot, client);
+		const Policy::BaseAvailability base = BaseAvailabilityForClient(client, false);
+		bool nativeDelta = true;
+		if (base == Policy::BaseAvailability::Ready)
+		{
+			auto generation = state.generations.find(client.generation);
+			if (generation != state.generations.end())
+				nativeDelta = IsNativeDelta(generation->second, virtualPath);
+		}
+
+		switch (Policy::SelectFile(ClientLane(client), base, IsInitFile(virtualPath), nativeDelta))
+		{
+			case Policy::Action::Native:
+				return {BaselineAction::NativeSource, nullptr};
+			case Policy::Action::CanonicalStub:
+				return {BaselineAction::CanonicalStub, nullptr};
+			case Policy::Action::Reject:
+				return {BaselineAction::Reject, base == Policy::BaseAvailability::Missing
+					? "the immutable map base is not pinned" : "the immutable map base is unusable"};
+		}
+
+		return {BaselineAction::Reject, "invalid per-file map-base policy result"};
 	}
 
 	bool NeedsNativeHashUpdate(int slot)
@@ -1985,9 +1838,9 @@ end)
 
 		ClientPin& client = state.clients[slot];
 		ResolveDeliveryLane(slot, client);
-		// Native-baseline connections already received real source hashes. A required
-		// connection only sends a native body during the post-READY hot-refresh handoff,
-		// where its canonical baseline must be advanced to the changed source first.
+		// Global registration remains canonical while LuaPack is enabled. Every native
+		// body on a required connection therefore receives its current per-client hash,
+		// both for JIP deltas and for active-client hot refreshes.
 		return client.requiredLane;
 	}
 
@@ -1999,101 +1852,26 @@ end)
 
 		ClientPin& client = state.clients[slot];
 		ResolveDeliveryLane(slot, client);
-		if (client.nativeLane)
+		const BaselineDecision fileBaseline = DecideFileBaselineForClient(slot, virtualPath);
+		if (fileBaseline.action == BaselineAction::Reject)
+			return {DeliveryAction::Reject, nullptr, fileBaseline.failure};
+		if (fileBaseline.action == BaselineAction::NativeSource || fileBaseline.action == BaselineAction::Unchanged)
 		{
 			RecordNativeJoin(client, nativeSourceBytes);
 			return decision;
 		}
-		if (!SupportsCanonicalRegistration())
-			return {DeliveryAction::Reject, nullptr, "canonical Lua placeholder registration is unavailable on this platform"};
 
-		const std::string path = NormalizePath(virtualPath);
-		if (client.requiredLane)
+		auto generation = state.generations.find(client.generation);
+		if (generation == state.generations.end() || !generation->second.compressedRequiredStub)
+			return {DeliveryAction::Reject, nullptr, "the immutable map base became unavailable during Lua transfer"};
+		if (!client.active)
 		{
-			// Required mode governs admission. After this connection has mounted at least one
-			// generation, preserve the established hot-refresh behavior: changed paths remain
-			// native while a replacement HTTP generation is in flight, then stubs resume on READY.
-			if (client.active && client.everReady)
-			{
-				auto activeGeneration = state.generations.find(client.generation);
-				const bool stubbable = activeGeneration != state.generations.end() &&
-					activeGeneration->second.compressedRequiredStub && !IsInitFile(path) &&
-					activeGeneration->second.files.find(path) != activeGeneration->second.files.end();
-				if (client.ready && stubbable)
-					return {DeliveryAction::Stub, activeGeneration->second.compressedRequiredStub.get(), nullptr};
-				return decision;
-			}
-
-			if (client.generation.empty())
-				return {DeliveryAction::Reject, nullptr, "no generation was pinned before Lua transfer"};
-
-			auto generation = state.generations.find(client.generation);
-			if (generation == state.generations.end() || !generation->second.compressedRequiredStub)
-				return {DeliveryAction::Reject, nullptr, "the pinned generation is no longer available"};
-
-			// A connecting client can only mount an object already present in Source's resource
-			// phase. Spawned clients may receive later generations through the HTTP handoff.
-			if (!client.active && !generation->second.engineDownloadable)
-				return {DeliveryAction::Reject, nullptr, "the pinned generation is not in the engine download queue"};
-
-			// includes/init.lua must remain real because it installs __holypack. Every other
-			// request has to exist in the immutable generation; required mode never substitutes
-			// a native body when publication is stale or incomplete.
-			if (IsInitFile(path))
-			{
-				RecordNativeJoin(client, nativeSourceBytes);
-				return decision;
-			}
-			if (generation->second.files.find(path) == generation->second.files.end())
-				return {DeliveryAction::Reject, nullptr, "the requested path is absent from the pinned generation"};
-
 			++client.joinRequiredStubs;
 			if (client.joinRequiredStubs == 1)
-				Msg(PROJECT_NAME " - luapack: client slot %i is using required generation %s; stubbing the join without waiting for READY\n",
+				Msg(PROJECT_NAME " - luapack: client slot %i is using required map base %s with per-path native deltas; stubbing unchanged files without waiting for READY\n",
 					slot, client.generation.c_str());
-			return {DeliveryAction::Stub, generation->second.compressedRequiredStub.get(), nullptr};
 		}
-
-		if (client.fallback || client.generation.empty())
-			return decision;
-		auto generation = state.generations.find(client.generation);
-		if (generation == state.generations.end() || !generation->second.compressedStub)
-			return decision;
-
-		const bool stubbable = !IsInitFile(path) &&
-			generation->second.files.find(path) != generation->second.files.end();
-
-		if (client.ready)
-		{
-			if (!stubbable)
-				return decision;
-			if (!client.active)
-				++client.joinReadyStubs;
-			return {DeliveryAction::Stub, generation->second.compressedStub.get(), nullptr};
-		}
-
-		// Everything below is the pre-acknowledgement join burst. Requests from a spawned
-		// client that never acknowledged stay native: it may hold no mountable pack at all.
-		if (client.active)
-			return decision;
-
-		const Config& currentConfig = GetConfig();
-		const bool prefixDelivered = client.joinNativeFiles >= currentConfig.optimisticPrefixFiles &&
-			client.joinNativeBytes >= currentConfig.optimisticPrefixBytes;
-		if (!currentConfig.optimisticStubbing || !generation->second.engineDownloadable ||
-			client.nativeLatched || !stubbable || !prefixDelivered)
-		{
-			// Counted even while speculation is off or latched: the join summary is the
-			// measurement that sizes the prefix thresholds in the first place.
-			RecordNativeJoin(client, nativeSourceBytes);
-			return decision;
-		}
-
-		++client.joinOptimisticStubs;
-		if (client.joinOptimisticStubs == 1)
-			Msg(PROJECT_NAME " - luapack: client slot %i crossed the native prefix (%u files, %llu source bytes) before acknowledging generation %s; speculatively stubbing the rest of the join\n",
-				slot, client.joinNativeFiles, client.joinNativeBytes, client.generation.c_str());
-		return {DeliveryAction::Stub, generation->second.compressedStub.get(), nullptr};
+		return {DeliveryAction::Stub, generation->second.compressedRequiredStub.get(), nullptr};
 	}
 
 	void DisconnectRequiredClient(int slot, const char* failure)
@@ -2181,11 +1959,9 @@ end)
 				client.fallback ? "yes" : "no");
 		}
 
-		// A generation published after the level's bounded downloadables budget is exhausted
-		// is intentionally absent from the engine download queue. Once the Lua state is active,
-		// hand the pinned generation to the same validated HTTP path used by autorefresh. This is
-		// also a harmless retry when the engine-downloaded object mounted but READY is still queued.
-		NotifyJoiningClient(slot);
+		// The required map base is admitted only through Source's pre-spawn resource
+		// phase. A missing/corrupt base must fail closed in the bootstrap; it is never
+		// repaired after spawn by switching the whole join to native or HTTP delivery.
 	}
 
 	void ClientDisconnect(int slot)
@@ -2281,8 +2057,7 @@ end)
 			}
 			if (client.active)
 				ReleaseGenerationReference(client);
-			Msg(PROJECT_NAME " - luapack: client slot %i acknowledged pinned generation %s\n", slot, generationId.c_str());
-			CatchUpClient(slot);
+			Msg(PROJECT_NAME " - luapack: client slot %i acknowledged required map base %s\n", slot, generationId.c_str());
 		}
 
 		return MODULE_RESULT::STOP;

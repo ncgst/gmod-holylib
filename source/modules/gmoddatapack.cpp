@@ -55,10 +55,9 @@ static ConVar gmoddatapack_fastnetworking("holylib_gmoddatapack_fastnetworking",
 static CGModDataPackModule g_pGModDataPackModule;
 IModule* pGModDataPackModule = &g_pGModDataPackModule;
 
-// Required-lane connections begin with the canonical placeholder hash for every
-// non-bootstrap file. A hot refresh may temporarily move individual entries to
-// their native hash; remember only those entries so the next placeholder body can
-// restore the canonical identity without repeating 1,600+ no-op updates on join.
+// Required-lane connections begin with canonical hashes for unchanged map-base
+// files and native hashes for current deltas. Remember the native entries so an
+// exact restoration can switch that client back to the canonical placeholder.
 static std::array<std::unordered_set<int>, ABSOLUTE_PLAYER_LIMIT> g_requiredNativeLuaHashes;
 
 static void ClearRequiredNativeLuaHashes(int slot)
@@ -1220,9 +1219,10 @@ struct ClientLuaBaselineHashOverride
 class ScopedClientLuaBaseline
 {
 public:
-	explicit ScopedClientLuaBaseline(HolyLib::LuaPack::BaselineAction action)
+	explicit ScopedClientLuaBaseline(int slot, HolyLib::LuaPack::BaselineAction action)
 	{
-		if (action != HolyLib::LuaPack::BaselineAction::CanonicalStub &&
+		if (action != HolyLib::LuaPack::BaselineAction::BasePlusDelta &&
+			action != HolyLib::LuaPack::BaselineAction::CanonicalStub &&
 			action != HolyLib::LuaPack::BaselineAction::NativeSource)
 		{
 			failure = "unsupported Lua baseline action";
@@ -1233,6 +1233,11 @@ public:
 		{
 			failure = "client_lua_files is unavailable";
 			return;
+		}
+		if (slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT &&
+			action == HolyLib::LuaPack::BaselineAction::BasePlusDelta)
+		{
+			g_requiredNativeLuaHashes[slot].clear();
 		}
 
 		INetworkStringTable* networkTable = g_pDataPack->m_pClientLuaFiles;
@@ -1250,9 +1255,23 @@ public:
 			const char* fileName = networkTable->GetString(fileID);
 			if (!fileName)
 				continue;
+			HolyLib::LuaPack::BaselineAction fileAction = action;
+			if (action == HolyLib::LuaPack::BaselineAction::BasePlusDelta)
+			{
+				const HolyLib::LuaPack::BaselineDecision fileBaseline =
+					HolyLib::LuaPack::DecideFileBaselineForClient(slot, fileName);
+				if (fileBaseline.action == HolyLib::LuaPack::BaselineAction::Reject)
+				{
+					failure = std::string(fileBaseline.failure ? fileBaseline.failure : "map-base selection failed") +
+						" for " + fileName;
+					Restore();
+					return;
+				}
+				fileAction = fileBaseline.action;
+			}
 
 			std::string baselineSource;
-			if (action == HolyLib::LuaPack::BaselineAction::CanonicalStub &&
+			if (fileAction == HolyLib::LuaPack::BaselineAction::CanonicalStub &&
 				!HolyLib::LuaPack::IsInitFile(fileName))
 			{
 				// Required delivery uses one generation-independent placeholder for every
@@ -1318,8 +1337,20 @@ public:
 			std::copy(hash.begin(), hash.end(), replacement.replacementHash.begin());
 			item.m_pUserData = replacement.replacementHash.data();
 			item.m_nUserDataLength = static_cast<int>(replacement.replacementHash.size());
+			if (action == HolyLib::LuaPack::BaselineAction::BasePlusDelta &&
+				fileAction == HolyLib::LuaPack::BaselineAction::NativeSource &&
+				!HolyLib::LuaPack::IsInitFile(fileName))
+			{
+				nativeBaselineFileIDs.push_back(fileID);
+			}
 		}
 
+		if (slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT &&
+			action == HolyLib::LuaPack::BaselineAction::BasePlusDelta)
+		{
+			auto& nativeHashes = g_requiredNativeLuaHashes[slot];
+			nativeHashes.insert(nativeBaselineFileIDs.begin(), nativeBaselineFileIDs.end());
+		}
 		valid = true;
 	}
 
@@ -1346,6 +1377,7 @@ private:
 	}
 
 	std::vector<ClientLuaBaselineHashOverride> overrides;
+	std::vector<int> nativeBaselineFileIDs;
 	std::string failure;
 	bool valid = false;
 };
@@ -1367,7 +1399,7 @@ static bool hook_CBaseClient_SendServerInfo(CBaseClient* client)
 		return detour_CBaseClient_SendServerInfo.GetTrampoline<Symbols::CBaseClient_SendServerInfo>()(client);
 	}
 
-	ScopedClientLuaBaseline clientBaseline(baseline.action);
+	ScopedClientLuaBaseline clientBaseline(slot, baseline.action);
 	if (!clientBaseline.IsValid())
 	{
 		if (client)
