@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace HolyLib::LuaPack::Policy
@@ -62,6 +63,27 @@ namespace HolyLib::LuaPack::Policy
 	inline bool RegisterExactKey(std::unordered_set<std::string>& keys, const std::string& key)
 	{
 		return keys.insert(key).second;
+	}
+
+	template <typename Hash>
+	inline bool NativeHashMatches(const std::unordered_map<int, Hash>& hashes,
+		int fileID, const Hash& current)
+	{
+		auto known = hashes.find(fileID);
+		return known != hashes.end() && known->second == current;
+	}
+
+	template <typename Hash>
+	inline void RememberNativeHash(std::unordered_map<int, Hash>& hashes,
+		int fileID, const Hash& current)
+	{
+		hashes[fileID] = current;
+	}
+
+	template <typename Hash>
+	inline bool RestoreCanonicalHash(std::unordered_map<int, Hash>& hashes, int fileID)
+	{
+		return hashes.erase(fileID) != 0;
 	}
 
 	static_assert(SelectBaseline(Lane::Required, true, BaseAvailability::Ready) == Action::CanonicalStub,

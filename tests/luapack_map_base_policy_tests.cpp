@@ -1,8 +1,10 @@
 #include "modules/gmoddatapack_luapack_policy.h"
 
 #include <cassert>
+#include <array>
 #include <iostream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 using HolyLib::LuaPack::Policy::Action;
@@ -27,6 +29,22 @@ int main()
 	assert(IsNativeDelta(true, baseIdentity, "hotfix-sha256"));
 	assert(!IsNativeDelta(true, baseIdentity, baseIdentity));
 	assert(IsNativeDelta(false, "", "late-registration-sha256"));
+
+	// A JIP delta hash is already present in its mixed server-info baseline. Do not
+	// send the same hash again before the body (that can stall signon), but do send
+	// after a global canonical update or when a later hotfix changes the identity.
+	using TestHash = std::array<unsigned char, 4>;
+	const TestHash hotfixOne{1, 2, 3, 4};
+	const TestHash hotfixTwo{4, 3, 2, 1};
+	std::unordered_map<int, TestHash> clientNativeHashes;
+	RememberNativeHash(clientNativeHashes, 42, hotfixOne);
+	assert(NativeHashMatches(clientNativeHashes, 42, hotfixOne));
+	assert(!NativeHashMatches(clientNativeHashes, 42, hotfixTwo));
+	assert(RestoreCanonicalHash(clientNativeHashes, 42));
+	assert(!NativeHashMatches(clientNativeHashes, 42, hotfixOne));
+	assert(!RestoreCanonicalHash(clientNativeHashes, 42));
+	RememberNativeHash(clientNativeHashes, 42, hotfixTwo);
+	assert(NativeHashMatches(clientNativeHashes, 42, hotfixTwo));
 
 	// Exact-key duplicates are rejected by the same registry used by pack validation.
 	std::unordered_set<std::string> exactKeys;

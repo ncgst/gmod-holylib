@@ -10,6 +10,7 @@
 #include "sourcesdk/net_chan.h"
 #include "sourcesdk/netmessages.h"
 #include "modules/gmoddatapack_luapack.h"
+#include "modules/gmoddatapack_luapack_policy.h"
 #include "networkstringtable.h"
 #include "networkstringtableitem.h"
 #include "picosha2/picosha2.h"
@@ -17,7 +18,7 @@
 #include <array>
 #include <atomic>
 #include <deque>
-#include <unordered_set>
+#include <unordered_map>
 
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
@@ -56,14 +57,22 @@ static CGModDataPackModule g_pGModDataPackModule;
 IModule* pGModDataPackModule = &g_pGModDataPackModule;
 
 // Required-lane connections begin with canonical hashes for unchanged map-base
-// files and native hashes for current deltas. Remember the native entries so an
-// exact restoration can switch that client back to the canonical placeholder.
-static std::array<std::unordered_set<int>, ABSOLUTE_PLAYER_LIMIT> g_requiredNativeLuaHashes;
+// files and native hashes for current deltas. Remember the exact per-client
+// native identities so the initial delta request does not redundantly rewrite
+// its already-installed baseline hash, while later hotfixes still can.
+using ClientLuaHash = std::array<unsigned char, 32>;
+static std::array<std::unordered_map<int, ClientLuaHash>, ABSOLUTE_PLAYER_LIMIT> g_requiredNativeLuaHashes;
 
 static void ClearRequiredNativeLuaHashes(int slot)
 {
 	if (slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT)
 		g_requiredNativeLuaHashes[slot].clear();
+}
+
+static void ClearRequiredNativeLuaHashForAllClients(int fileID)
+{
+	for (auto& nativeHashes : g_requiredNativeLuaHashes)
+		nativeHashes.erase(fileID);
 }
 
 static int ClientSlotFromEdict(edict_t* pClient)
@@ -890,6 +899,7 @@ public:
 		if (bSameSource && pEntry.IsContentReady() && bSameProcessConfig) // Nothing changed
 		{
 			std::vector<unsigned char> pHash = HashString(pEntry.content.c_str(), pEntry.content.length() + 1);
+			ClearRequiredNativeLuaHashForAllClients(fileID);
 			g_pDataPack->m_pClientLuaFiles->SetStringUserData(fileID, pHash.size(), pHash.data());
 
 			return;
@@ -1341,7 +1351,7 @@ public:
 				fileAction == HolyLib::LuaPack::BaselineAction::NativeSource &&
 				!HolyLib::LuaPack::IsInitFile(fileName))
 			{
-				nativeBaselineFileIDs.push_back(fileID);
+				nativeBaselineHashes.emplace(fileID, replacement.replacementHash);
 			}
 		}
 
@@ -1349,7 +1359,7 @@ public:
 			action == HolyLib::LuaPack::BaselineAction::BasePlusDelta)
 		{
 			auto& nativeHashes = g_requiredNativeLuaHashes[slot];
-			nativeHashes.insert(nativeBaselineFileIDs.begin(), nativeBaselineFileIDs.end());
+			nativeHashes.insert(nativeBaselineHashes.begin(), nativeBaselineHashes.end());
 		}
 		valid = true;
 	}
@@ -1377,7 +1387,7 @@ private:
 	}
 
 	std::vector<ClientLuaBaselineHashOverride> overrides;
-	std::vector<int> nativeBaselineFileIDs;
+	std::unordered_map<int, ClientLuaHash> nativeBaselineHashes;
 	std::string failure;
 	bool valid = false;
 };
@@ -1584,14 +1594,22 @@ static bool SendNativeLuaFile(GModDataPack* pDataPack, int clientIdx, int fileID
 	if (HolyLib::LuaPack::NeedsNativeHashUpdate(clientIdx) && !HolyLib::LuaPack::IsInitFile(fileName))
 	{
 		std::array<unsigned char, 32> nativeHash{};
-		if (!GetNativeLuaHash(fileID, luaFile, nativeHash) ||
-			!SendClientLuaHashUpdate(clientIdx, fileID, nativeHash.data(), nativeHash.size()))
+		if (!GetNativeLuaHash(fileID, luaFile, nativeHash))
 		{
-			DisconnectLuaHashFailure(clientIdx, fileName.c_str(), "the native hash update could not be sent");
+			DisconnectLuaHashFailure(clientIdx, fileName.c_str(), "the native hash could not be built");
 			return false;
 		}
 
-		g_requiredNativeLuaHashes[clientIdx].insert(fileID);
+		auto& nativeHashes = g_requiredNativeLuaHashes[clientIdx];
+		if (!HolyLib::LuaPack::Policy::NativeHashMatches(nativeHashes, fileID, nativeHash))
+		{
+			if (!SendClientLuaHashUpdate(clientIdx, fileID, nativeHash.data(), nativeHash.size()))
+			{
+				DisconnectLuaHashFailure(clientIdx, fileName.c_str(), "the native hash update could not be sent");
+				return false;
+			}
+			HolyLib::LuaPack::Policy::RememberNativeHash(nativeHashes, fileID, nativeHash);
+		}
 	}
 
 	SendOriginalLuaFile(pDataPack, clientIdx, fileID);
@@ -1644,7 +1662,7 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 					DisconnectLuaHashFailure(clientIdx, fileName.c_str(), "the canonical placeholder hash could not be restored");
 					return;
 				}
-				nativeHashes.erase(nativeHash);
+				HolyLib::LuaPack::Policy::RestoreCanonicalHash(nativeHashes, fileID);
 			}
 		}
 		SendCompressedLuaFile(clientIdx, fileID, *delivery.compressed);
@@ -1955,6 +1973,9 @@ void CGModDataPackModule::Think(bool bSimulating)
 			std::lock_guard<std::shared_mutex> entryLock(pEntry->mutex);
 
 			std::vector<unsigned char> pHash = HashString(pEntry->content.c_str(), pEntry->content.length() + 1);
+			// SetStringUserData broadcasts the canonical hash to every active client.
+			// Forget any per-client native identity before a later body decision.
+			ClearRequiredNativeLuaHashForAllClients(fileID);
 			g_pDataPack->m_pClientLuaFiles->SetStringUserData(fileID, pHash.size(), pHash.data());
 		}
 		g_pLuaDataPack.m_pStringTableUpdateQueue.clear();
