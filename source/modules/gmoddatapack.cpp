@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <unordered_set>
 
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
@@ -53,6 +54,18 @@ static ConVar gmoddatapack_fastnetworking("holylib_gmoddatapack_fastnetworking",
 
 static CGModDataPackModule g_pGModDataPackModule;
 IModule* pGModDataPackModule = &g_pGModDataPackModule;
+
+// Required-lane connections begin with the canonical placeholder hash for every
+// non-bootstrap file. A hot refresh may temporarily move individual entries to
+// their native hash; remember only those entries so the next placeholder body can
+// restore the canonical identity without repeating 1,600+ no-op updates on join.
+static std::array<std::unordered_set<int>, ABSOLUTE_PLAYER_LIMIT> g_requiredNativeLuaHashes;
+
+static void ClearRequiredNativeLuaHashes(int slot)
+{
+	if (slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT)
+		g_requiredNativeLuaHashes[slot].clear();
+}
 
 static int ClientSlotFromEdict(edict_t* pClient)
 {
@@ -1536,7 +1549,7 @@ static void DisconnectLuaHashFailure(int clientIdx, const char* fileName, const 
 static bool SendNativeLuaFile(GModDataPack* pDataPack, int clientIdx, int fileID,
 	const std::string& fileName, GarrysMod::Lua::LuaFile* luaFile)
 {
-	if (HolyLib::LuaPack::IsEnabled() && !HolyLib::LuaPack::IsInitFile(fileName))
+	if (HolyLib::LuaPack::NeedsNativeHashUpdate(clientIdx) && !HolyLib::LuaPack::IsInitFile(fileName))
 	{
 		std::array<unsigned char, 32> nativeHash{};
 		if (!GetNativeLuaHash(fileID, luaFile, nativeHash) ||
@@ -1545,6 +1558,8 @@ static bool SendNativeLuaFile(GModDataPack* pDataPack, int clientIdx, int fileID
 			DisconnectLuaHashFailure(clientIdx, fileName.c_str(), "the native hash update could not be sent");
 			return false;
 		}
+
+		g_requiredNativeLuaHashes[clientIdx].insert(fileID);
 	}
 
 	SendOriginalLuaFile(pDataPack, clientIdx, fileID);
@@ -1577,12 +1592,28 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 	{
 		// A stub is a normal, reliably delivered LuaFileDownload. It preserves the engine's
 		// per-file barrier contract while the multi-megabyte payload stays exclusively on FastDL.
-		if (delivery.compressed->GetWritten() < 32 ||
-			!SendClientLuaHashUpdate(clientIdx, fileID,
-				static_cast<const unsigned char*>(delivery.compressed->GetBase()), 32))
+		// Its identity is already canonical in this connection's server-info baseline, so a
+		// same-hash string-table update here would only make the client process 1 update per file.
+		if (delivery.compressed->GetWritten() < 32)
 		{
-			DisconnectLuaHashFailure(clientIdx, fileName.c_str(), "the canonical placeholder hash update could not be sent");
+			DisconnectLuaHashFailure(clientIdx, fileName.c_str(), "the canonical placeholder payload is incomplete");
 			return;
+		}
+
+		if (clientIdx >= 0 && clientIdx < ABSOLUTE_PLAYER_LIMIT)
+		{
+			auto& nativeHashes = g_requiredNativeLuaHashes[clientIdx];
+			auto nativeHash = nativeHashes.find(fileID);
+			if (nativeHash != nativeHashes.end())
+			{
+				if (!SendClientLuaHashUpdate(clientIdx, fileID,
+					static_cast<const unsigned char*>(delivery.compressed->GetBase()), 32))
+				{
+					DisconnectLuaHashFailure(clientIdx, fileName.c_str(), "the canonical placeholder hash could not be restored");
+					return;
+				}
+				nativeHashes.erase(nativeHash);
+			}
 		}
 		SendCompressedLuaFile(clientIdx, fileID, *delivery.compressed);
 		return;
@@ -1833,6 +1864,7 @@ void CGModDataPackModule::OnClientDisconnect(CBaseClient* pClient)
 		return;
 
 	g_pLuaDataPack.m_pPlayerQueue[slot].Clear();
+	ClearRequiredNativeLuaHashes(slot);
 	HolyLib::LuaPack::ClientDisconnect(slot);
 }
 
@@ -2009,6 +2041,7 @@ MODULE_RESULT CGModDataPackModule::ClientConnect(bool* bAllowConnect, edict_t* p
 	(void)maxrejectlen;
 
 	const int slot = ClientSlotFromEdict(pClient);
+	ClearRequiredNativeLuaHashes(slot);
 	HolyLib::LuaPack::ClientConnect(slot);
 	return MODULE_RESULT::CONTINUE;
 }
@@ -2021,6 +2054,7 @@ void CGModDataPackModule::ClientActive(edict_t* pClient)
 void CGModDataPackModule::ClientDisconnect(edict_t* pClient)
 {
 	const int slot = ClientSlotFromEdict(pClient);
+	ClearRequiredNativeLuaHashes(slot);
 	HolyLib::LuaPack::ClientDisconnect(slot);
 }
 

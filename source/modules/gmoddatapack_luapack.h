@@ -92,6 +92,7 @@ namespace HolyLib::LuaPack
 	std::string PrepareVanillaFile(const std::string& virtualPath, const std::string& contents);
 	bool ConsumeBootstrapRefresh();
 	BaselineDecision DecideBaselineForClient(int slot);
+	bool NeedsNativeHashUpdate(int slot);
 	DeliveryDecision DecideDeliveryForClient(int slot, const std::string& virtualPath, size_t nativeSourceBytes);
 	void DisconnectRequiredClient(int slot, const char* failure);
 	void ClientConnect(int slot);

@@ -1969,6 +1969,19 @@ end)
 		return {BaselineAction::CanonicalStub, nullptr};
 	}
 
+	bool NeedsNativeHashUpdate(int slot)
+	{
+		if (!IsEnabled() || !IsValidSlot(slot))
+			return false;
+
+		ClientPin& client = state.clients[slot];
+		ResolveDeliveryLane(slot, client);
+		// Native-baseline connections already received real source hashes. A required
+		// connection only sends a native body during the post-READY hot-refresh handoff,
+		// where its canonical baseline must be advanced to the changed source first.
+		return client.requiredLane;
+	}
+
 	DeliveryDecision DecideDeliveryForClient(int slot, const std::string& virtualPath, size_t nativeSourceBytes)
 	{
 		DeliveryDecision decision;
