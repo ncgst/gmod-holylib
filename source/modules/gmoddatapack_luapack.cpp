@@ -87,7 +87,13 @@ namespace HolyLib::LuaPack
 		bool requiredLane = false;
 		bool optOut = false;
 		bool nativeLane = false;
+		bool requiredRecovery = false;
+		bool resolvedIdentity = false;
+		bool authenticatedIdentity = false;
+		bool recoveryStateCleared = false;
 		bool disconnectIssued = false;
+		std::uint64_t steamID64 = 0;
+		std::uint64_t connectionSerial = 0;
 
 		// Join delivery accounting. All of this is per-connection state; ReleasePin resets it.
 		std::string networkID;
@@ -150,6 +156,9 @@ namespace HolyLib::LuaPack
 		// not be resolved client-side). Keyed by engine network ID, value is the expiry time.
 		// Main thread only, like the generation map.
 		std::unordered_map<std::string, double> nativeLatches;
+		Policy::RequiredRecoveryTracker requiredRecovery;
+		Policy::RequiredRecoveryHandoff recoveryHandoffs[ABSOLUTE_PLAYER_LIMIT];
+		std::uint64_t nextConnectionSerial = 0;
 		bool featureEnabledLastFrame = false;
 		bool bootstrapRefresh = false;
 		double lastCaptureAt = 0.0; // guarded by registryMutex
@@ -202,7 +211,9 @@ do
 	-- on the wire before the reconnect tears the channel down, hence the timer; the server
 	-- also latches on its own when a speculated connection dies unacknowledged, so a lost
 	-- unready command still converges.
-	-- Required stubs pass a second true argument and never enter the retry/native-latch path.
+	-- Required stubs pass a second true argument. They never switch this connection
+	-- or execute retry locally. The exact failure command lets the authenticated server
+	-- queue at most one engine-level reconnect whose new ServerInfo baseline is native.
 	local recoveryTaint = false
 	local recoverySignaled = false
 	local requiredFailureSignaled = false
@@ -229,7 +240,8 @@ do
 			if not requiredFailureSignaled then
 				requiredFailureSignaled = true
 				warn("required pack " .. tostring(generation) ..
-					" could not resolve this Lua file; waiting for the server to disconnect (opt out with +tv_nochat no_gluapack)")
+					" could not resolve this Lua file; requesting one authenticated engine reconnect" ..
+					" (manual opt out: +tv_nochat no_gluapack)")
 				RunConsoleCommand("holylib_luapack_failed", tostring(generation or ""))
 			end
 			return function() end
@@ -778,6 +790,196 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		client.joinNativeBytes += nativeSourceBytes;
 	}
 
+	static bool BindResolvedIdentity(int slot, ClientPin& client)
+	{
+		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		if (!baseClient || !baseClient->m_SteamID.IsValid())
+			return false;
+
+		const std::uint64_t steamID64 = baseClient->m_SteamID.ConvertToUint64();
+		if (steamID64 == 0 || (client.resolvedIdentity && client.steamID64 != steamID64))
+			return false;
+
+		client.steamID64 = steamID64;
+		client.resolvedIdentity = true;
+		return true;
+	}
+
+	static bool BindAuthenticatedIdentity(int slot, ClientPin& client)
+	{
+		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		if (!baseClient || !BindResolvedIdentity(slot, client) || !baseClient->IsFullyAuthenticated())
+			return false;
+
+		client.authenticatedIdentity = true;
+		return true;
+	}
+
+	static void StartClientEpoch(int slot)
+	{
+		ReleasePin(state.clients[slot]);
+		ClientPin& client = state.clients[slot];
+		++state.nextConnectionSerial;
+		if (state.nextConnectionSerial == 0)
+			++state.nextConnectionSerial;
+		client.connectionSerial = state.nextConnectionSerial;
+		if (!IsEnabled())
+			return;
+
+		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		const char* networkID = baseClient ? baseClient->GetNetworkIDString() : nullptr;
+		if (networkID && networkID[0] != '\0' &&
+			V_stricmp(networkID, "BOT") != 0 && V_stricmp(networkID, "UNKNOWN") != 0)
+			client.networkID = networkID;
+
+		if (state.currentGeneration.empty())
+			return;
+		auto generation = state.generations.find(state.currentGeneration);
+		if (generation == state.generations.end())
+			return;
+
+		client.generation = generation->first;
+		client.deadline = ServerTime() + GetConfig().readyDeadlineSeconds;
+		client.fallback = false;
+		client.holdsPin = true;
+		++generation->second.pins;
+	}
+
+	static const char* BeginPendingRecoveryBaseline(int slot)
+	{
+		Policy::RequiredRecoveryHandoff& handoff = state.recoveryHandoffs[slot];
+		if (!handoff.Pending())
+			return nullptr;
+
+		ClientPin& failedClient = state.clients[slot];
+		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		const std::uint64_t account = baseClient && baseClient->m_SteamID.IsValid()
+			? baseClient->m_SteamID.ConvertToUint64() : 0;
+		const bool authenticated = baseClient && baseClient->IsFullyAuthenticated();
+		const std::uint64_t failedConnection = failedClient.connectionSerial;
+		const std::uint64_t expectedAccount = handoff.Account();
+		const std::uint64_t expectedConnection = handoff.FailedConnection();
+		const Policy::RecoveryHandoffResult begin = handoff.BeginBaseline(
+			account, failedConnection, authenticated, ServerTime());
+		if (begin == Policy::RecoveryHandoffResult::OwnershipMismatch)
+		{
+			handoff.Reset();
+			Warning(PROJECT_NAME " - luapack: ignored a stale recovery handoff at ServerInfo for slot %i; expected account %llu connection %llu, got %llu connection %llu\n",
+				slot, static_cast<unsigned long long>(expectedAccount),
+				static_cast<unsigned long long>(expectedConnection),
+				static_cast<unsigned long long>(account),
+				static_cast<unsigned long long>(failedConnection));
+			return nullptr;
+		}
+		if (begin != Policy::RecoveryHandoffResult::BeginBaseline)
+			return "the engine reconnect did not begin an authenticated recovery baseline within its bounded handoff window";
+
+		// This is the first instruction at the engine's new ServerInfo boundary. Until
+		// here the failed ClientPin remained required, so no old-join request could see
+		// native delivery. Advance the epoch now and consume the account latch atomically.
+		StartClientEpoch(slot);
+		ClientPin& recovery = state.clients[slot];
+		if (!BindResolvedIdentity(slot, recovery) || recovery.steamID64 != expectedAccount ||
+			!baseClient->IsFullyAuthenticated())
+		{
+			return "SteamID64 ownership changed while the engine reconnect entered ServerInfo";
+		}
+		recovery.authenticatedIdentity = true;
+		const Policy::RecoveryConsumeResult consumed = state.requiredRecovery.Consume(
+			recovery.steamID64, recovery.connectionSerial, ServerTime());
+		if (consumed != Policy::RecoveryConsumeResult::Native)
+		{
+			return "the one-shot recovery latch could not be consumed at the new ServerInfo baseline";
+		}
+
+		recovery.requiredLane = true;
+		recovery.requiredRecovery = true;
+		recovery.nativeLane = true;
+		recovery.nativeLatched = true;
+		recovery.deliveryLaneResolved = true;
+		MarkFallback(recovery);
+		Msg(PROJECT_NAME " - luapack: client slot %i (%llu) began engine reconnect epoch %llu with a wholly native initial baseline\n",
+			slot, static_cast<unsigned long long>(recovery.steamID64),
+			static_cast<unsigned long long>(recovery.connectionSerial));
+		return nullptr;
+	}
+
+	static void ClearProvenRecoveryState(int slot, ClientPin& client)
+	{
+		if (client.recoveryStateCleared || !client.active || !BindAuthenticatedIdentity(slot, client))
+			return;
+
+		if (client.requiredRecovery)
+		{
+			if (!state.requiredRecovery.Complete(client.steamID64, client.connectionSerial))
+				return;
+			client.recoveryStateCleared = true;
+			Msg(PROJECT_NAME " - luapack: client slot %i (%llu) completed its authenticated native recovery connection; retry state cleared\n",
+				slot, static_cast<unsigned long long>(client.steamID64));
+			return;
+		}
+
+		if (client.optOut || (client.requiredLane && client.ready))
+		{
+			state.requiredRecovery.Clear(client.steamID64);
+			client.recoveryStateCleared = true;
+		}
+	}
+
+	static void ProcessRequiredRecoveryHandoffs(double now)
+	{
+		for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
+		{
+			Policy::RequiredRecoveryHandoff& handoff = state.recoveryHandoffs[slot];
+			if (!handoff.Pending())
+				continue;
+
+			ClientPin& client = state.clients[slot];
+			CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+			const std::uint64_t account = baseClient && baseClient->m_SteamID.IsValid()
+				? baseClient->m_SteamID.ConvertToUint64() : 0;
+			const std::uint64_t expectedAccount = handoff.Account();
+			const std::uint64_t expectedConnection = handoff.FailedConnection();
+			const bool authenticated = baseClient && baseClient->IsFullyAuthenticated();
+			const bool channelReady = baseClient && baseClient->IsConnected() && baseClient->GetNetChannel();
+			const Policy::RecoveryHandoffResult result = handoff.TryInvoke(account,
+				client.connectionSerial, authenticated, channelReady, now);
+			switch (result)
+			{
+				case Policy::RecoveryHandoffResult::Invoke:
+					Msg(PROJECT_NAME " - luapack: invoking one engine reconnect for slot %i (%llu) after failed connection epoch %llu\n",
+						slot, static_cast<unsigned long long>(account),
+						static_cast<unsigned long long>(client.connectionSerial));
+					// Virtual dispatch reaches CGameClient::Reconnect. The ServerInfo hook either
+					// begins a new recovery epoch synchronously or observes this invoked gate later.
+					baseClient->Reconnect();
+					break;
+				case Policy::RecoveryHandoffResult::AlreadyInvoked:
+					break;
+				case Policy::RecoveryHandoffResult::Expired:
+					DisconnectRequiredClient(slot,
+						"the engine reconnect did not begin its native ServerInfo baseline within the bounded handoff window");
+					break;
+				case Policy::RecoveryHandoffResult::OwnershipMismatch:
+					handoff.Reset();
+					Warning(PROJECT_NAME " - luapack: cancelled stale recovery handoff for slot %i; expected account %llu connection %llu, got %llu connection %llu\n",
+						slot, static_cast<unsigned long long>(expectedAccount),
+						static_cast<unsigned long long>(expectedConnection),
+						static_cast<unsigned long long>(account),
+						static_cast<unsigned long long>(client.connectionSerial));
+					break;
+				case Policy::RecoveryHandoffResult::Invalid:
+					handoff.Reset();
+					DisconnectRequiredClient(slot,
+						"the authenticated engine reconnect could not be invoked safely");
+					break;
+				case Policy::RecoveryHandoffResult::None:
+				case Policy::RecoveryHandoffResult::BeginBaseline:
+					break;
+			}
+		}
+	}
+
 	static void ResolveDeliveryLane(int slot, ClientPin& client)
 	{
 		if (client.deliveryLaneResolved)
@@ -795,12 +997,44 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 
 		if (client.nativeLane)
 		{
+			// Explicit opt-out remains the highest-priority lane. Capture a resolved
+			// identity when available so a successful manual recovery can heal a pending
+			// automatic latch, but never reject opt-out for an authentication race.
+			if (client.optOut)
+				BindResolvedIdentity(slot, client);
 			MarkFallback(client);
 			if (client.optOut)
 				Msg(PROJECT_NAME " - luapack: client slot %i selected native delivery with tv_nochat=no_gluapack\n", slot);
 			else
 				Msg(PROJECT_NAME " - luapack: client slot %i selected the explicit native rescue lane because required mode is disabled\n", slot);
 			return;
+		}
+
+		if (currentConfig.requiredRecovery)
+		{
+			// The ticket-provided SteamID is resolved before ServerInfo, while Source's
+			// fully-authenticated flag normally arrives later in signon. Resolution is
+			// sufficient to select an account-keyed baseline; arming and successful clear
+			// still require the later authenticated identity to match exactly.
+			if (!BindResolvedIdentity(slot, client))
+			{
+				Warning(PROJECT_NAME " - luapack: client slot %i has no resolved SteamID64 before its required Lua baseline; failing closed\n",
+					slot);
+				return;
+			}
+
+			const Policy::RecoveryConsumeResult recovery = state.requiredRecovery.Consume(
+				client.steamID64, client.connectionSerial, ServerTime());
+			if (recovery == Policy::RecoveryConsumeResult::Native)
+			{
+				client.requiredRecovery = true;
+				client.nativeLane = true;
+				client.nativeLatched = true;
+				MarkFallback(client);
+				Msg(PROJECT_NAME " - luapack: client slot %i (%llu) consumed its one-shot required recovery latch; the initial baseline is wholly native\n",
+					slot, static_cast<unsigned long long>(client.steamID64));
+				return;
+			}
 		}
 
 		// The old optimistic-recovery latch only belongs to the fail-open lane. Required
@@ -828,6 +1062,8 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 
 	static Policy::Lane ClientLane(const ClientPin& client)
 	{
+		if (client.requiredRecovery)
+			return Policy::Lane::NativeRecovery;
 		if (client.requiredLane)
 			return Policy::Lane::Required;
 		return client.optOut ? Policy::Lane::NativeOptOut : Policy::Lane::NativeRescue;
@@ -1338,6 +1574,13 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 	static ConVar luapack_allow_optout(
 		"holylib_gmoddatapack_luapack_allow_optout", "1", FCVAR_ARCHIVE | FCVAR_REPLICATED,
 		"Allow a client whose tv_nochat userinfo is exactly no_gluapack to use native Lua for its entire connection");
+	static ConVar luapack_required_recovery(
+		"holylib_gmoddatapack_luapack_required_recovery", "1", FCVAR_ARCHIVE,
+		"Allow one authenticated engine reconnect whose next ServerInfo baseline is wholly native after a required map-base failure");
+	static ConVar luapack_required_recovery_ttl(
+		"holylib_gmoddatapack_luapack_required_recovery_ttl", "120", FCVAR_ARCHIVE,
+		"Seconds an authenticated one-shot required recovery latch remains valid",
+		true, 5.0f, true, 900.0f);
 	static ConVar luapack_optimistic(
 		"holylib_gmoddatapack_luapack_optimistic", "0", FCVAR_ARCHIVE,
 		"Speculatively deliver generation stubs to fail-open joins before the client acknowledges its pack. Ignored by connections on the required lane");
@@ -1436,6 +1679,8 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		config.readyDeadlineSeconds = luapack_ready_deadline.GetFloat();
 		config.requiredStubbing = luapack_required.GetBool();
 		config.allowOptOut = luapack_allow_optout.GetBool();
+		config.requiredRecovery = luapack_required_recovery.GetBool();
+		config.requiredRecoveryTtlSeconds = luapack_required_recovery_ttl.GetFloat();
 		config.optimisticStubbing = luapack_optimistic.GetBool();
 		config.optimisticPrefixFiles = static_cast<unsigned int>(luapack_optimistic_prefix_files.GetInt());
 		config.optimisticPrefixBytes = static_cast<unsigned long long>(luapack_optimistic_prefix_bytes.GetInt());
@@ -1514,7 +1759,11 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		state.nextBuildAllowed = 0.0;
 		for (ClientPin& client : state.clients)
 			client = ClientPin();
+		for (Policy::RequiredRecoveryHandoff& handoff : state.recoveryHandoffs)
+			handoff.Reset();
 		state.nativeLatches.clear();
+		state.requiredRecovery.Reset();
+		state.nextConnectionSerial = 0;
 		luapack_manifest.SetValue("");
 	}
 
@@ -1657,9 +1906,12 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 				if (!client.generation.empty())
 					ReleasePin(client);
 			}
+			for (Policy::RequiredRecoveryHandoff& handoff : state.recoveryHandoffs)
+				handoff.Reset();
 			// Disabling the feature forgets speculation-failure history; nothing consults it
 			// while all delivery is native anyway.
 			state.nativeLatches.clear();
+			state.requiredRecovery.Reset();
 			if (luapack_manifest.GetString()[0] != '\0')
 				luapack_manifest.SetValue("");
 			return;
@@ -1667,9 +1919,14 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 
 		CoordinateDownloadUrl(false);
 		const double now = ServerTime();
+		ProcessRequiredRecoveryHandoffs(now);
 		for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
 		{
 			ClientPin& client = state.clients[slot];
+			// Steam authentication commonly completes after SendServerInfo. If the client
+			// reached full entry first, retain the consumed tombstone until
+			// the same connection's authenticated SteamID64 can be revalidated here.
+			ClearProvenRecoveryState(slot, client);
 			// The deadline only runs for spawned clients. A connecting client can legitimately
 			// spend many minutes in map load + the Requesting-Lua burst before its Lua state even
 			// exists; expiring the pin there would mark exactly the joins that matter fallback
@@ -1693,6 +1950,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			else
 				++latch;
 		}
+		state.requiredRecovery.Prune(now);
 
 		if (luapack_manifest.GetString()[0] == '\0' && !state.currentGeneration.empty())
 			PublishManifest();
@@ -1752,7 +2010,6 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			}
 			state.lastCaptureAt = ServerTime(); // quiesce window: batch deploys build once, not per file
 		}
-
 		// Once the immutable map base exists, no replacement generation is queued.
 		// Selection compares this current identity with the base identity: changed or
 		// late paths go native, and an exact restoration becomes canonical again.
@@ -1780,9 +2037,17 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 	{
 		if (!IsEnabled() || !IsValidSlot(slot))
 			return BaselineDecision();
+		if (const char* recoveryFailure = BeginPendingRecoveryBaseline(slot))
+			return {BaselineAction::Reject, recoveryFailure};
 
 		ClientPin& client = state.clients[slot];
 		ResolveDeliveryLane(slot, client);
+		if (client.requiredLane && !Policy::RequiredBaselineIdentityReady(
+			GetConfig().requiredRecovery, client.resolvedIdentity))
+		{
+			return {BaselineAction::Reject,
+				"a resolved SteamID64 was unavailable before the required Lua baseline"};
+		}
 		const Policy::BaseAvailability base = BaseAvailabilityForClient(client, true);
 		switch (Policy::SelectBaseline(ClientLane(client), SupportsCanonicalRegistration(), base))
 		{
@@ -1841,7 +2106,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		// Global registration remains canonical while LuaPack is enabled. Every native
 		// body on a required connection therefore receives its current per-client hash,
 		// both for JIP deltas and for active-client hot refreshes.
-		return client.requiredLane;
+		return Policy::NeedsPerClientNativeHashes(ClientLane(client));
 	}
 
 	DeliveryDecision DecideDeliveryForClient(int slot, const std::string& virtualPath, size_t nativeSourceBytes)
@@ -1890,7 +2155,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		if (baseClient)
 		{
 			baseClient->Disconnect("%s",
-				"Required LuaPack failed. Opt out: set launch option +tv_nochat no_gluapack, restart Garry's Mod, then reconnect.");
+				"Required LuaPack failed. Automatic native recovery was unavailable or exhausted. Manual opt out: set launch option +tv_nochat no_gluapack, restart Garry's Mod, then reconnect.");
 		}
 	}
 
@@ -1899,31 +2164,10 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		if (!IsValidSlot(slot))
 			return;
 
-		ReleasePin(state.clients[slot]);
-		ClientPin& client = state.clients[slot];
-		if (!IsEnabled())
-			return;
-
-		// Capture the account now; once the first Lua request selects a lane, fail-open
-		// delivery consults any optimistic-recovery latch by account rather than by slot.
-		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
-		const char* networkID = baseClient ? baseClient->GetNetworkIDString() : nullptr;
-		if (networkID && networkID[0] != '\0' &&
-			V_stricmp(networkID, "BOT") != 0 && V_stricmp(networkID, "UNKNOWN") != 0)
-			client.networkID = networkID;
-
-		if (state.currentGeneration.empty())
-			return;
-
-		auto generation = state.generations.find(state.currentGeneration);
-		if (generation == state.generations.end())
-			return;
-
-		client.generation = generation->first;
-		client.deadline = ServerTime() + GetConfig().readyDeadlineSeconds;
-		client.fallback = false;
-		client.holdsPin = true;
-		++generation->second.pins;
+		// A real network connection supersedes any per-slot engine handoff request. The
+		// SteamID64 latch remains account-keyed and may be consumed by this new epoch.
+		state.recoveryHandoffs[slot].Reset();
+		StartClientEpoch(slot);
 	}
 
 	void ClientActive(int slot)
@@ -1940,6 +2184,8 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		if (!client.ready && !client.fallback && !client.generation.empty())
 			client.deadline = ServerTime() + GetConfig().readyDeadlineSeconds;
 
+		ClearProvenRecoveryState(slot, client);
+
 		if (IsEnabled() && !client.joinSummaryLogged &&
 			(client.joinNativeFiles > 0 || client.joinOptimisticStubs > 0 ||
 				client.joinRequiredStubs > 0 || client.joinReadyStubs > 0))
@@ -1952,7 +2198,8 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 				client.networkID.empty() ? "?" : client.networkID.c_str(),
 				client.joinNativeFiles, client.joinNativeBytes,
 				client.joinRequiredStubs, client.joinOptimisticStubs, client.joinReadyStubs,
-				client.optOut ? "optout-native" : (client.requiredLane ? "required" : "fail-open"),
+				client.requiredRecovery ? "recovery-native" :
+					(client.optOut ? "optout-native" : (client.requiredLane ? "required" : "fail-open")),
 				client.generation.empty() ? "-" : client.generation.c_str(),
 				client.ready ? "yes" : "no",
 				client.nativeLatched ? "yes" : "no",
@@ -1970,6 +2217,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			return;
 
 		ClientPin& client = state.clients[slot];
+		state.recoveryHandoffs[slot].Reset();
 		// A speculated join that never acknowledged its generation is treated as failed even
 		// without the client's explicit recovery command: its channel may have died before
 		// that command flushed. Latching here is what makes every failure path converge —
@@ -1990,10 +2238,62 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 
 		if (V_stricmp(args->Arg(0), "holylib_luapack_failed") == 0)
 		{
-			// Required stubs use this fail-closed signal instead of the optimistic retry/latch
-			// path. Forging the private command can only disconnect the sending client.
-			if (IsEnabled() && IsValidSlot(slot) && state.clients[slot].requiredLane)
-				DisconnectRequiredClient(slot, "the client reported that its required generation could not resolve a stub");
+			// Always consume the private command. Only an exact failure for this connection's
+			// pinned required generation may arm recovery; malformed/stale commands still fail
+			// closed and can only disconnect the sender.
+			if (!IsEnabled() || !IsValidSlot(slot))
+				return MODULE_RESULT::STOP;
+
+			ClientPin& client = state.clients[slot];
+			const bool exactFailure = client.requiredLane && !client.requiredRecovery &&
+				args->ArgC() == 2 && !client.generation.empty() &&
+				client.generation == args->Arg(1);
+			bool handoffQueued = false;
+			if (exactFailure && GetConfig().requiredRecovery)
+			{
+				const std::uint64_t expectedSteamID64 = client.steamID64;
+				const bool authenticatedNow = BindAuthenticatedIdentity(slot, client);
+				if (Policy::RequiredFailureIdentityReady(true, client.resolvedIdentity,
+					client.authenticatedIdentity) && authenticatedNow &&
+					client.steamID64 == expectedSteamID64)
+				{
+					const double ttl = GetConfig().requiredRecoveryTtlSeconds;
+					const Policy::RecoveryArmResult armed = state.requiredRecovery.Arm(
+						client.steamID64, client.connectionSerial, ServerTime(), ttl);
+					if (armed == Policy::RecoveryArmResult::Armed)
+					{
+						const double handoffWindow = Policy::RecoveryHandoffWindow(ttl);
+						handoffQueued = state.recoveryHandoffs[slot].Queue(
+							client.steamID64, client.connectionSerial, ServerTime(), handoffWindow);
+						if (handoffQueued)
+						{
+							Msg(PROJECT_NAME " - luapack: authenticated required failure for slot %i (%llu); one wholly native next connection armed for %.0f seconds and one engine reconnect queued with a %.0f-second ServerInfo window\n",
+								slot, static_cast<unsigned long long>(client.steamID64), ttl,
+								handoffWindow);
+						}
+						else
+						{
+							state.requiredRecovery.Clear(client.steamID64);
+							Warning(PROJECT_NAME " - luapack: required recovery handoff could not be queued for slot %i (%llu); latch removed and join remains fail-closed\n",
+								slot, static_cast<unsigned long long>(client.steamID64));
+						}
+					}
+					else
+					{
+						Warning(PROJECT_NAME " - luapack: required recovery was not re-armed for slot %i (%llu); its one-shot state is already pending or consumed\n",
+							slot, static_cast<unsigned long long>(client.steamID64));
+					}
+				}
+				else
+				{
+					Warning(PROJECT_NAME " - luapack: required recovery was not armed for slot %i because authenticated SteamID64 ownership could not be revalidated\n",
+						slot);
+				}
+			}
+			if (client.requiredLane && !handoffQueued)
+				DisconnectRequiredClient(slot, exactFailure
+					? "the authenticated client reported that its required generation could not resolve a stub"
+					: "the client reported a stale or malformed required-generation failure");
 			return MODULE_RESULT::STOP;
 		}
 
@@ -2056,7 +2356,10 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 				++generation->second.pins;
 			}
 			if (client.active)
+			{
 				ReleaseGenerationReference(client);
+				ClearProvenRecoveryState(slot, client);
+			}
 			Msg(PROJECT_NAME " - luapack: client slot %i acknowledged required map base %s\n", slot, generationId.c_str());
 		}
 
