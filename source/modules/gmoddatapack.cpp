@@ -8,9 +8,13 @@
 #include "sourcesdk/iluashared.h"
 #include "sourcesdk/baseclient.h"
 #include "sourcesdk/net_chan.h"
+#include "sourcesdk/netmessages.h"
 #include "modules/gmoddatapack_luapack.h"
 #include "networkstringtable.h"
+#include "networkstringtableitem.h"
 #include "picosha2/picosha2.h"
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <deque>
 
@@ -1191,6 +1195,208 @@ void LuaDataPack::Shutdown()
 	//	m_pLuaFileCache[i].Clear();
 }
 
+#if defined(SYSTEM_LINUX)
+struct ClientLuaBaselineHashOverride
+{
+	CNetworkStringTableItem* item = nullptr;
+	unsigned char* originalData = nullptr;
+	int originalLength = 0;
+	std::array<unsigned char, 32> nativeHash{};
+};
+
+class ScopedNativeLuaBaseline
+{
+public:
+	ScopedNativeLuaBaseline()
+	{
+		if (!g_pDataPack || !g_pDataPack->m_pClientLuaFiles)
+		{
+			failure = "client_lua_files is unavailable";
+			return;
+		}
+
+		INetworkStringTable* networkTable = g_pDataPack->m_pClientLuaFiles;
+		CNetworkStringTable* table = static_cast<CNetworkStringTable*>(networkTable);
+		if (!table->m_pItems)
+		{
+			failure = "client_lua_files has no item dictionary";
+			return;
+		}
+
+		const int fileCount = networkTable->GetNumStrings();
+		overrides.reserve(fileCount);
+		for (int fileID = 1; fileID < fileCount; ++fileID)
+		{
+			const char* fileName = networkTable->GetString(fileID);
+			if (!fileName || HolyLib::LuaPack::IsInitFile(fileName))
+				continue;
+
+			std::string source;
+			bool hasSource = false;
+			LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID);
+			if (entry)
+			{
+				std::shared_lock<std::shared_mutex> lock(entry->mutex);
+				if (entry->hasSourceContent)
+				{
+					source = entry->sourceContent;
+					hasSource = true;
+				}
+			}
+
+			if (!hasSource)
+			{
+				GarrysMod::Lua::LuaFile* luaFile = Lua::GetShared()->GetCache(fileName);
+				if (luaFile)
+				{
+					source = luaFile->contents;
+					hasSource = true;
+				}
+			}
+
+			if (!hasSource)
+			{
+				failure = std::string("native source is unavailable for ") + fileName;
+				Restore();
+				return;
+			}
+
+			std::vector<unsigned char> hash = HashString(source.c_str(), source.length() + 1);
+			if (hash.size() != 32)
+			{
+				failure = std::string("native SHA256 could not be built for ") + fileName;
+				Restore();
+				return;
+			}
+
+			CNetworkStringTableItem& item = table->m_pItems->Element(fileID);
+			overrides.emplace_back();
+			ClientLuaBaselineHashOverride& replacement = overrides.back();
+			replacement.item = &item;
+			replacement.originalData = item.m_pUserData;
+			replacement.originalLength = item.m_nUserDataLength;
+			std::copy(hash.begin(), hash.end(), replacement.nativeHash.begin());
+			item.m_pUserData = replacement.nativeHash.data();
+			item.m_nUserDataLength = static_cast<int>(replacement.nativeHash.size());
+		}
+
+		valid = true;
+	}
+
+	~ScopedNativeLuaBaseline()
+	{
+		Restore();
+	}
+
+	bool IsValid() const { return valid; }
+	const char* Failure() const { return failure.c_str(); }
+
+private:
+	void Restore()
+	{
+		for (ClientLuaBaselineHashOverride& replacement : overrides)
+		{
+			if (!replacement.item)
+				continue;
+			replacement.item->m_pUserData = replacement.originalData;
+			replacement.item->m_nUserDataLength = replacement.originalLength;
+			replacement.item = nullptr;
+		}
+		overrides.clear();
+	}
+
+	std::vector<ClientLuaBaselineHashOverride> overrides;
+	std::string failure;
+	bool valid = false;
+};
+
+static bool ValidateCanonicalLuaBaseline(std::string& failure)
+{
+	if (!g_pDataPack || !g_pDataPack->m_pClientLuaFiles)
+	{
+		failure = "client_lua_files is unavailable";
+		return false;
+	}
+
+	INetworkStringTable* table = g_pDataPack->m_pClientLuaFiles;
+	for (int fileID = 1; fileID < table->GetNumStrings(); ++fileID)
+	{
+		const char* fileName = table->GetString(fileID);
+		if (!fileName || HolyLib::LuaPack::IsInitFile(fileName))
+			continue;
+
+		LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID);
+		if (!entry)
+		{
+			failure = std::string("canonical cache entry is unavailable for ") + fileName;
+			return false;
+		}
+
+		std::vector<unsigned char> expectedHash;
+		{
+			std::shared_lock<std::shared_mutex> lock(entry->mutex);
+			if (!entry->hasSourceContent || !entry->IsReady() ||
+				entry->content != HolyLib::LuaPack::PrepareVanillaFile(fileName, entry->sourceContent))
+			{
+				failure = std::string("canonical placeholder is not ready for ") + fileName;
+				return false;
+			}
+			expectedHash = HashString(entry->content.c_str(), entry->content.length() + 1);
+		}
+
+		int actualLength = 0;
+		const void* actualHash = table->GetStringUserData(fileID, &actualLength);
+		if (!actualHash || actualLength != static_cast<int>(expectedHash.size()) ||
+			memcmp(actualHash, expectedHash.data(), expectedHash.size()) != 0)
+		{
+			failure = std::string("client_lua_files still has a noncanonical hash for ") + fileName;
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static Detouring::Hook detour_CBaseClient_SendServerInfo;
+static bool hook_CBaseClient_SendServerInfo(CBaseClient* client)
+{
+	const int slot = client ? client->GetPlayerSlot() : -1;
+	const HolyLib::LuaPack::BaselineDecision baseline = HolyLib::LuaPack::DecideBaselineForClient(slot);
+	if (baseline.action == HolyLib::LuaPack::BaselineAction::Reject)
+	{
+		if (client)
+			client->Disconnect("%s", baseline.failure ? baseline.failure : "required LuaPack baseline was rejected");
+		return false;
+	}
+
+	if (baseline.action == HolyLib::LuaPack::BaselineAction::CanonicalStub)
+	{
+		std::string validationFailure;
+		if (!ValidateCanonicalLuaBaseline(validationFailure))
+		{
+			if (client)
+				client->Disconnect("Required LuaPack baseline is not ready: %s", validationFailure.c_str());
+			return false;
+		}
+	}
+
+	if (baseline.action != HolyLib::LuaPack::BaselineAction::NativeSource)
+	{
+		return detour_CBaseClient_SendServerInfo.GetTrampoline<Symbols::CBaseClient_SendServerInfo>()(client);
+	}
+
+	ScopedNativeLuaBaseline nativeBaseline;
+	if (!nativeBaseline.IsValid())
+	{
+		if (client)
+			client->Disconnect("Native Lua rescue could not prepare a consistent file baseline: %s", nativeBaseline.Failure());
+		return false;
+	}
+
+	return detour_CBaseClient_SendServerInfo.GetTrampoline<Symbols::CBaseClient_SendServerInfo>()(client);
+}
+#endif
+
 static Detouring::Hook detour_GModDataPack_AddOrUpdateFile;
 static void hook_GModDataPack_AddOrUpdateFile(GModDataPack* pDataPack, GarrysMod::Lua::LuaFile* file, bool bReCompress)
 {
@@ -1272,6 +1478,110 @@ static void SendOriginalLuaFile(GModDataPack* pDataPack, int clientIdx, int file
 	detour_GModDataPack_SendFileToClient.GetTrampoline<Symbols::GModDataPack_SendFileToClient>()(pDataPack, clientIdx, fileID);
 }
 
+static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned char* hash, size_t hashLength)
+{
+	if (!g_pDataPack || !g_pDataPack->m_pClientLuaFiles || !hash || hashLength != 32)
+		return false;
+
+	CBaseClient* client = Util::server ? Util::GetClientByIndex(clientIdx) : nullptr;
+	if (!client || !client->GetNetChannel())
+		return false;
+
+	INetworkStringTable* table = g_pDataPack->m_pClientLuaFiles;
+	CNetworkStringTable* concreteTable = static_cast<CNetworkStringTable*>(table);
+	if (fileID <= 0 || fileID >= table->GetNumStrings())
+		return false;
+
+	int entryBits = 0;
+	for (int maxEntries = table->GetMaxStrings(); maxEntries > 1; maxEntries >>= 1)
+		++entryBits;
+
+	char updateBuffer[64];
+	SVC_UpdateStringTable update;
+	update.m_DataOut.StartWriting(updateBuffer, sizeof(updateBuffer));
+	update.m_nTableID = table->GetTableId();
+	update.m_nChangedEntries = 1;
+
+	// One existing entry, encoded exactly like CNetworkStringTable::WriteUpdate:
+	// explicit index, no string body, then the replacement userdata.
+	update.m_DataOut.WriteOneBit(0);
+	update.m_DataOut.WriteUBitLong(fileID, entryBits);
+	update.m_DataOut.WriteOneBit(0);
+	update.m_DataOut.WriteOneBit(1);
+	if (concreteTable->m_bUserDataFixedSize)
+	{
+		if (concreteTable->m_nUserDataSizeBits != static_cast<int>(hashLength * 8))
+			return false;
+		update.m_DataOut.WriteBits(hash, concreteTable->m_nUserDataSizeBits);
+	}
+	else
+	{
+		update.m_DataOut.WriteUBitLong(static_cast<unsigned int>(hashLength), CNetworkStringTableItem::MAX_USERDATA_BITS);
+		update.m_DataOut.WriteBits(hash, static_cast<int>(hashLength * 8));
+	}
+
+	return !update.m_DataOut.IsOverflowed() && client->SendNetMsg(update, true);
+}
+
+static bool GetNativeLuaHash(int fileID, GarrysMod::Lua::LuaFile* luaFile, std::array<unsigned char, 32>& output)
+{
+	std::string source;
+	bool hasSource = false;
+	if (luaFile)
+	{
+		source = luaFile->contents;
+		hasSource = true;
+	}
+	else
+	{
+		LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID);
+		if (entry)
+		{
+			std::shared_lock<std::shared_mutex> lock(entry->mutex);
+			if (entry->hasSourceContent)
+			{
+				source = entry->sourceContent;
+				hasSource = true;
+			}
+		}
+	}
+
+	if (!hasSource)
+		return false;
+	std::vector<unsigned char> hash = HashString(source.c_str(), source.length() + 1);
+	if (hash.size() != output.size())
+		return false;
+	std::copy(hash.begin(), hash.end(), output.begin());
+	return true;
+}
+
+static void DisconnectLuaHashFailure(int clientIdx, const char* fileName, const char* failure)
+{
+	Warning(PROJECT_NAME " - luapack: disconnecting client slot %i because %s for %s\n",
+		clientIdx, failure ? failure : "Lua hash identity failed", fileName ? fileName : "?");
+	CBaseClient* client = Util::server ? Util::GetClientByIndex(clientIdx) : nullptr;
+	if (client)
+		client->Disconnect("Lua delivery identity failed for %s", fileName ? fileName : "an unknown file");
+}
+
+static bool SendNativeLuaFile(GModDataPack* pDataPack, int clientIdx, int fileID,
+	const std::string& fileName, GarrysMod::Lua::LuaFile* luaFile)
+{
+	if (HolyLib::LuaPack::IsEnabled() && !HolyLib::LuaPack::IsInitFile(fileName))
+	{
+		std::array<unsigned char, 32> nativeHash{};
+		if (!GetNativeLuaHash(fileID, luaFile, nativeHash) ||
+			!SendClientLuaHashUpdate(clientIdx, fileID, nativeHash.data(), nativeHash.size()))
+		{
+			DisconnectLuaHashFailure(clientIdx, fileName.c_str(), "the native hash update could not be sent");
+			return false;
+		}
+	}
+
+	SendOriginalLuaFile(pDataPack, clientIdx, fileID);
+	return true;
+}
+
 static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clientIdx, int fileID)
 {
 	if (!pDataPack || !pDataPack->m_pClientLuaFiles)
@@ -1298,6 +1608,13 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 	{
 		// A stub is a normal, reliably delivered LuaFileDownload. It preserves the engine's
 		// per-file barrier contract while the multi-megabyte payload stays exclusively on FastDL.
+		if (delivery.compressed->GetWritten() < 32 ||
+			!SendClientLuaHashUpdate(clientIdx, fileID,
+				static_cast<const unsigned char*>(delivery.compressed->GetBase()), 32))
+		{
+			DisconnectLuaHashFailure(clientIdx, fileName.c_str(), "the canonical placeholder hash update could not be sent");
+			return;
+		}
 		SendCompressedLuaFile(clientIdx, fileID, *delivery.compressed);
 		return;
 	}
@@ -1311,7 +1628,12 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 	{
 		DevWarning(PROJECT_NAME " - gmoddatapack: Client requested file but doesn't exist! \"%s\"\n", fileName.c_str());
 		if (HolyLib::LuaPack::IsEnabled())
-			SendOriginalLuaFile(pDataPack, clientIdx, fileID);
+		{
+			if (HolyLib::LuaPack::IsInitFile(fileName))
+				DisconnectLuaHashFailure(clientIdx, fileName.c_str(), "the bootstrap source is unavailable");
+			else
+				SendNativeLuaFile(pDataPack, clientIdx, fileID, fileName, nullptr);
+		}
 		return;
 	}
 
@@ -1320,7 +1642,7 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 		// The init file must take HolyLib's normal full-file path because it carries the bootstrap.
 		// Every other uncertain/non-ready request goes through the engine implementation itself;
 		// this is the fail-open invariant and deliberately bypasses all luapack decisions.
-		SendOriginalLuaFile(pDataPack, clientIdx, fileID);
+		SendNativeLuaFile(pDataPack, clientIdx, fileID, fileName, luaFile);
 		return;
 	}
 
@@ -1331,7 +1653,12 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 		{
 			Warning(PROJECT_NAME " - gmoddatapack: Client requested a file which we couldn't get an entry for! (%i)\n", fileID);
 			if (HolyLib::LuaPack::IsEnabled())
-				SendOriginalLuaFile(pDataPack, clientIdx, fileID);
+			{
+				if (HolyLib::LuaPack::IsInitFile(fileName))
+					DisconnectLuaHashFailure(clientIdx, fileName.c_str(), "the bootstrap entry is unavailable");
+				else
+					SendNativeLuaFile(pDataPack, clientIdx, fileID, fileName, luaFile);
+			}
 			return;
 		}
 
@@ -1363,7 +1690,7 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 	// Last-resort fail-open. This is reached only when HolyLib's async cache cannot produce a
 	// vanilla payload; never consume a request merely because luapack is active.
 	if (HolyLib::LuaPack::IsEnabled())
-		SendOriginalLuaFile(pDataPack, clientIdx, fileID);
+		SendNativeLuaFile(pDataPack, clientIdx, fileID, fileName, luaFile);
 }
 
 
@@ -1712,7 +2039,8 @@ MODULE_RESULT CGModDataPackModule::ClientConnect(bool* bAllowConnect, edict_t* p
 	(void)reject;
 	(void)maxrejectlen;
 
-	HolyLib::LuaPack::ClientConnect(ClientSlotFromEdict(pClient));
+	const int slot = ClientSlotFromEdict(pClient);
+	HolyLib::LuaPack::ClientConnect(slot);
 	return MODULE_RESULT::CONTINUE;
 }
 
@@ -1723,7 +2051,8 @@ void CGModDataPackModule::ClientActive(edict_t* pClient)
 
 void CGModDataPackModule::ClientDisconnect(edict_t* pClient)
 {
-	HolyLib::LuaPack::ClientDisconnect(ClientSlotFromEdict(pClient));
+	const int slot = ClientSlotFromEdict(pClient);
+	HolyLib::LuaPack::ClientDisconnect(slot);
 }
 
 MODULE_RESULT CGModDataPackModule::ClientCommand(edict_t* pClient, const CCommand* args)
@@ -1737,6 +2066,15 @@ void CGModDataPackModule::InitDetour(bool bPreServer)
 		return;
 
 	DETOUR_PREPARE_THISCALL();
+#if defined(SYSTEM_LINUX)
+	SourceSDK::FactoryLoader engine_loader("engine");
+	Detour::Create(
+		&detour_CBaseClient_SendServerInfo, "CBaseClient::SendServerInfo",
+		engine_loader.GetModule(), Symbols::CBaseClient_SendServerInfoSym,
+		(void*)hook_CBaseClient_SendServerInfo, m_pID
+	);
+#endif
+
 	SourceSDK::FactoryLoader server_loader("server");
 	Detour::Create(
 		&detour_GModDataPack_AddOrUpdateFile, "GModDataPack::AddOrUpdateFile",

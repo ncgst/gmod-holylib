@@ -1026,6 +1026,11 @@ namespace Symbols
 		Symbol::FromSignature("\x55\x8B\x87\xA0\x01\x00\x00\x48"), // 55 8B 87 A0 01 00 00 48 (x64 260706; reverified 260709, m_nSignonState [rdi+0x1A0]; was +0x1A8)
 	};
 
+	const std::vector<Symbol> CBaseClient_SendServerInfoSym = {
+		Symbol::FromName("_ZN11CBaseClient14SendServerInfoEv"),
+		Symbol::FromSignature("\x55\x48\x89\xE5\x41\x57\x41\x56\x41\x55\x4C\x8D\xAD\xA0\xEE\xFF\xFF\x41\x54\x4C\x8D\xA5\x20\xEE\xFF\xFF\x53\x48\x89\xFB"), // GMod Linux x86-64 260709/260803; unique prologue, writes per-client string-table baselines before replicated cvars
+	};
+
 	const std::vector<Symbol> CGameClient_SetSignonStateSym = {
 		Symbol::FromName("_ZN11CGameClient14SetSignonStateEii"),
 #if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)

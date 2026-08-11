@@ -48,6 +48,24 @@ namespace HolyLib::LuaPack
 		Reject,
 	};
 
+	enum class BaselineAction
+	{
+		Unchanged,
+		CanonicalStub,
+		NativeSource,
+		Reject,
+	};
+
+	struct BaselineDecision
+	{
+		BaselineDecision(BaselineAction baselineAction = BaselineAction::Unchanged,
+			const char* rejectionFailure = nullptr)
+			: action(baselineAction), failure(rejectionFailure) {}
+
+		BaselineAction action;
+		const char* failure;
+	};
+
 	struct DeliveryDecision
 	{
 		DeliveryDecision(DeliveryAction deliveryAction = DeliveryAction::Native,
@@ -61,6 +79,7 @@ namespace HolyLib::LuaPack
 
 	const Config& GetConfig();
 	bool IsEnabled();
+	bool SupportsCanonicalRegistration();
 	bool IsInitFile(const std::string& virtualPath);
 
 	void Init(CreateInterfaceFn* appfn);
@@ -72,6 +91,7 @@ namespace HolyLib::LuaPack
 	void CaptureFile(const GarrysMod::Lua::LuaFile* file);
 	std::string PrepareVanillaFile(const std::string& virtualPath, const std::string& contents);
 	bool ConsumeBootstrapRefresh();
+	BaselineDecision DecideBaselineForClient(int slot);
 	DeliveryDecision DecideDeliveryForClient(int slot, const std::string& virtualPath, size_t nativeSourceBytes);
 	void DisconnectRequiredClient(int slot, const char* failure);
 	void ClientConnect(int slot);

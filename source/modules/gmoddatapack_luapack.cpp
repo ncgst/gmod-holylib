@@ -43,6 +43,8 @@
 
 namespace HolyLib::LuaPack
 {
+	static constexpr const char* canonicalStubSource = "return __holypack()()";
+
 	struct FileRecord
 	{
 		std::string virtualPath;
@@ -80,6 +82,7 @@ namespace HolyLib::LuaPack
 		bool deliveryLaneResolved = false;
 		bool requiredLane = false;
 		bool optOut = false;
+		bool nativeLane = false;
 		bool disconnectIssued = false;
 
 		// Join delivery accounting. All of this is per-connection state; ReleasePin resets it.
@@ -386,6 +389,10 @@ do
 			local originalCompileFile, originalInclude = CompileFile, include
 
 			function _G.__holypack(generation, required)
+				-- Canonical placeholders are deliberately generation-independent so their
+				-- SHA256 can be registered once in client_lua_files. The replicated manifest
+				-- selects the cold-join generation; autorefresh advances selectedGeneration.
+				if generation == nil then generation = selectedGeneration or currentGeneration end
 				local pack = packs[generation]
 				if not pack and not recoveryTaint and not lazyMountAttempted[generation] then
 					-- A speculative stub can arrive while the pack's FastDL download is still
@@ -776,10 +783,9 @@ end)
 		task->complete.store(true);
 	}
 
-	static std::shared_ptr<Bootil::AutoBuffer> BuildCompressedStub(const std::string& generation, bool required)
+	static std::shared_ptr<Bootil::AutoBuffer> BuildCompressedStub()
 	{
-		const std::string source = "return __holypack(\"" + generation + "\"" +
-			(required ? ",true)()" : ",false)()");
+		const std::string source = canonicalStubSource;
 		std::vector<unsigned char> hash(32);
 		picosha2::hash256_one_by_one hasher;
 		hasher.process(source.c_str(), source.c_str() + source.length() + 1);
@@ -847,12 +853,16 @@ end)
 		const char* optOutValue = baseClient ? baseClient->GetUserSetting("tv_nochat") : nullptr;
 		client.optOut = currentConfig.allowOptOut && optOutValue && strcmp(optOutValue, "no_gluapack") == 0;
 		client.requiredLane = currentConfig.requiredStubbing && !client.optOut;
+		client.nativeLane = !client.requiredLane;
 		client.deliveryLaneResolved = true;
 
-		if (client.optOut)
+		if (client.nativeLane)
 		{
 			MarkFallback(client);
-			Msg(PROJECT_NAME " - luapack: client slot %i selected native delivery with tv_nochat=no_gluapack\n", slot);
+			if (client.optOut)
+				Msg(PROJECT_NAME " - luapack: client slot %i selected native delivery with tv_nochat=no_gluapack\n", slot);
+			else
+				Msg(PROJECT_NAME " - luapack: client slot %i selected the explicit native rescue lane because required mode is disabled\n", slot);
 			return;
 		}
 
@@ -1597,6 +1607,18 @@ end)
 		return luapack_enable.GetBool();
 	}
 
+	bool SupportsCanonicalRegistration()
+	{
+		// The per-client baseline detour is currently verified against GMod's Linux
+		// engine. Other platforms retain native registration instead of advertising a
+		// required mode whose placeholder identity cannot be made valid.
+#if defined(SYSTEM_LINUX)
+		return true;
+#else
+		return false;
+#endif
+	}
+
 	void Init(CreateInterfaceFn* appfn)
 	{
 		if (appfn && appfn[0])
@@ -1736,8 +1758,8 @@ end)
 					generation.engineDownloadable = registration == DownloadableRegistration::Registered;
 					generation.sourceRevision = task->sourceRevision;
 					generation.publishedAt = ServerTime();
-					generation.compressedStub = BuildCompressedStub(generation.id, false);
-					generation.compressedRequiredStub = BuildCompressedStub(generation.id, true);
+					generation.compressedStub = BuildCompressedStub();
+					generation.compressedRequiredStub = generation.compressedStub;
 					for (const FileRecord& file : task->files)
 						generation.files[NormalizePath(file.virtualPath)] = true;
 					if (!generation.compressedStub || !generation.compressedRequiredStub)
@@ -1907,10 +1929,13 @@ end)
 
 	std::string PrepareVanillaFile(const std::string& virtualPath, const std::string& contents)
 	{
-		if (!IsEnabled() || !IsInitFile(virtualPath))
+		if (!IsEnabled() || !SupportsCanonicalRegistration())
 			return contents;
 
-		return std::string(clientBootstrap) + "\n" + contents;
+		if (IsInitFile(virtualPath))
+			return std::string(clientBootstrap) + "\n" + contents;
+
+		return canonicalStubSource;
 	}
 
 	bool ConsumeBootstrapRefresh()
@@ -1918,6 +1943,30 @@ end)
 		const bool refresh = state.bootstrapRefresh;
 		state.bootstrapRefresh = false;
 		return refresh;
+	}
+
+	BaselineDecision DecideBaselineForClient(int slot)
+	{
+		if (!IsEnabled() || !IsValidSlot(slot))
+			return BaselineDecision();
+
+		ClientPin& client = state.clients[slot];
+		ResolveDeliveryLane(slot, client);
+		if (client.nativeLane)
+			return {BaselineAction::NativeSource, nullptr};
+
+		if (!SupportsCanonicalRegistration())
+			return {BaselineAction::Reject, "canonical Lua placeholder registration is unavailable on this platform"};
+		if (client.generation.empty())
+			return {BaselineAction::Reject, "no generation was pinned before the client string-table baseline"};
+
+		auto generation = state.generations.find(client.generation);
+		if (generation == state.generations.end() || !generation->second.compressedRequiredStub)
+			return {BaselineAction::Reject, "the pinned generation is unavailable before the client string-table baseline"};
+		if (!generation->second.engineDownloadable)
+			return {BaselineAction::Reject, "the pinned generation is not in the engine download queue"};
+
+		return {BaselineAction::CanonicalStub, nullptr};
 	}
 
 	DeliveryDecision DecideDeliveryForClient(int slot, const std::string& virtualPath, size_t nativeSourceBytes)
@@ -1928,11 +1977,13 @@ end)
 
 		ClientPin& client = state.clients[slot];
 		ResolveDeliveryLane(slot, client);
-		if (client.optOut)
+		if (client.nativeLane)
 		{
 			RecordNativeJoin(client, nativeSourceBytes);
 			return decision;
 		}
+		if (!SupportsCanonicalRegistration())
+			return {DeliveryAction::Reject, nullptr, "canonical Lua placeholder registration is unavailable on this platform"};
 
 		const std::string path = NormalizePath(virtualPath);
 		if (client.requiredLane)
@@ -2182,7 +2233,7 @@ end)
 			return MODULE_RESULT::STOP;
 
 		ClientPin& client = state.clients[slot];
-		if (client.optOut)
+		if (client.nativeLane)
 			return MODULE_RESULT::STOP;
 		const std::string generationId = args->Arg(1);
 		const std::string md5 = args->Arg(2);
