@@ -843,10 +843,11 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			Util::engineserver->ClientCommand(edict, "holylib_luapack_required_retry_guard 0\n");
 	}
 
-	static bool IssueClientRetry(int slot, ClientPin& client)
+	static bool IssueClientRetry(int slot, ClientPin& client, double commandWindowSeconds)
 	{
 		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
-		if (!baseClient || !Util::engineserver || baseClient->m_nEntityIndex <= 0)
+		if (!baseClient || !Util::engineserver || baseClient->m_nEntityIndex <= 0 ||
+			commandWindowSeconds <= 0.0)
 			return false;
 
 		edict_t* edict = Util::engineserver->PEntityOfEntIndex(baseClient->m_nEntityIndex);
@@ -855,10 +856,10 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 
 		// This runs only after the authenticated failure command reached the server, so
 		// the latch is already installed before the client is told to make a new
-		// connection. A short fail-safe below disconnects if the command is ignored.
+		// connection. A TTL-derived fail-safe below disconnects if the command is ignored.
 		Util::engineserver->ClientCommand(edict, "retry\n");
 		client.recoveryRetryIssued = true;
-		client.recoveryRetryDisconnectAt = ServerTime() + 5.0;
+		client.recoveryRetryDisconnectAt = ServerTime() + commandWindowSeconds;
 		return true;
 	}
 
@@ -1830,7 +1831,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 					state.requiredRecovery.Clear(client.steamID64);
 				client.recoveryRetryIssued = false;
 				DisconnectRequiredClient(slot,
-					"the client did not begin its armed native retry within five seconds");
+					"the client did not begin its armed native retry before the bounded command deadline");
 				continue;
 			}
 			// Steam authentication commonly completes after SendServerInfo. If the client
@@ -1843,7 +1844,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			// before their first file request arrives. ClientActive re-arms the deadline.
 			// Once an authenticated failure has installed its latch and sent retry, the
 			// existing READY deadline must not race that command and tear down the channel.
-			// The five-second recoveryRetryDisconnectAt branch above remains the bounded
+			// The TTL-derived recoveryRetryDisconnectAt branch above remains the bounded
 			// fail-safe if the client ignores the requested reconnect.
 			if (Policy::ShouldEnforceReadyDeadline(client.recoveryRetryIssued) &&
 				!client.generation.empty() && !client.ready && !client.fallback && client.active &&
@@ -2199,11 +2200,13 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 						client.steamID64, client.connectionSerial, ServerTime(), ttl);
 					if (armed == Policy::RecoveryArmResult::Armed)
 					{
-						retryIssued = IssueClientRetry(slot, client);
+						const double commandWindow = Policy::RecoveryRetryCommandWindow(ttl);
+						retryIssued = IssueClientRetry(slot, client, commandWindow);
 						if (retryIssued)
 						{
-							Msg(PROJECT_NAME " - luapack: authenticated required failure for slot %i (%llu); one wholly native next connection armed for %.0f seconds and retry requested\n",
-								slot, static_cast<unsigned long long>(client.steamID64), ttl);
+							Msg(PROJECT_NAME " - luapack: authenticated required failure for slot %i (%llu); one wholly native next connection armed for %.0f seconds and retry requested with a %.0f-second command deadline\n",
+								slot, static_cast<unsigned long long>(client.steamID64), ttl,
+								commandWindow);
 						}
 						else
 						{

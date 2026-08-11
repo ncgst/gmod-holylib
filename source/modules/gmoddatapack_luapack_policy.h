@@ -186,6 +186,14 @@ namespace HolyLib::LuaPack::Policy
 		return !recoveryRetryIssued;
 	}
 
+	constexpr double RecoveryRetryCommandWindow(double recoveryTtlSeconds)
+	{
+		if (recoveryTtlSeconds <= 0.0)
+			return 0.0;
+		const double halfTtl = recoveryTtlSeconds * 0.5;
+		return halfTtl < 30.0 ? halfTtl : 30.0;
+	}
+
 	constexpr Action SelectBaseline(Lane lane, bool canonicalRegistration,
 		BaseAvailability base)
 	{

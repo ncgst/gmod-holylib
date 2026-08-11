@@ -94,6 +94,10 @@ int main()
 		assert(!ShouldArmAutomaticRetry(false, false));
 		assert(ShouldEnforceReadyDeadline(false));
 		assert(!ShouldEnforceReadyDeadline(true));
+		assert(RecoveryRetryCommandWindow(120.0) == 30.0);
+		assert(RecoveryRetryCommandWindow(40.0) == 20.0);
+		assert(RecoveryRetryCommandWindow(5.0) == 2.5);
+		assert(RecoveryRetryCommandWindow(0.0) == 0.0);
 		assert(recovery.Arm(accountA, 500, 0.0, 30.0) == RecoveryArmResult::Armed);
 		assert(recovery.Consume(accountA, 501, 1.0) == RecoveryConsumeResult::Native);
 		assert(recovery.Arm(accountA, 502, 2.0, 30.0) == RecoveryArmResult::RetryExhausted);
