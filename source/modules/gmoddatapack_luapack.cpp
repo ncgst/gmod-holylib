@@ -228,6 +228,7 @@ do
 	local recoverySignaled = false
 	local requiredFailureSignaled = false
 	local requiredRetryArmed = false
+	local requiredRetryWatchInstalled = false
 	local recoveryScheduled = false
 	local recoveryRetried = false
 	local function issueRetry()
@@ -242,6 +243,18 @@ do
 			timer.Simple(1, issueRetry)
 		end
 	end
+	local function awaitRequiredRetrySignal()
+		if not requiredRetryArmed or requiredRetryWatchInstalled or recoveryRetried then return end
+		if timer and timer.Create then
+			requiredRetryWatchInstalled = true
+			timer.Create("holylib_luapack_required_retry_watch", 0.1, 0, function()
+				if retryGuard and retryGuard:GetString() == "2" then
+					timer.Remove("holylib_luapack_required_retry_watch")
+					issueRetry()
+				end
+			end)
+		end
+	end
 	local function stubRecovery(generation, required)
 		-- A cached pre-required stub has no second argument. Fall back to replicated lane
 		-- policy so enabling required mode cannot resurrect the old automatic retry loop.
@@ -250,7 +263,7 @@ do
 		if required then
 			if not requiredFailureSignaled then
 				requiredFailureSignaled = true
-				local guardArmed = retryGuard and retryGuard:GetString() == "1"
+				local guardArmed = retryGuard and retryGuard:GetString() ~= "0"
 				if requiredRecoveryEnabled and not guardArmed and retryGuard then
 					local ok = pcall(function() retryGuard:SetString("1") end)
 					requiredRetryArmed = ok and retryGuard:GetString() == "1"
@@ -261,6 +274,11 @@ do
 					" (opt out with +tv_nochat no_gluapack)"))
 				RunConsoleCommand("holylib_luapack_failed", tostring(generation or ""))
 			end
+			-- The private ConVar is server-executable, unlike the engine's retry command.
+			-- Value 2 is therefore an authenticated acknowledgement that the account latch
+			-- is installed. If timer was unavailable for the first stub, later stubs retry
+			-- installing this watcher without reconnecting on an unacknowledged failure.
+			awaitRequiredRetrySignal()
 			return function() end
 		end
 		if not recoverySignaled then
@@ -855,9 +873,10 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			return false;
 
 		// This runs only after the authenticated failure command reached the server, so
-		// the latch is already installed before the client is told to make a new
-		// connection. A TTL-derived fail-safe below disconnects if the command is ignored.
-		Util::engineserver->ClientCommand(edict, "retry\n");
+		// the latch is already installed before value 2 tells the bootstrap to execute
+		// retry locally. The private ConVar is explicitly server-executable; retry itself
+		// is not. A TTL-derived fail-safe below disconnects if the signal is ignored.
+		Util::engineserver->ClientCommand(edict, "holylib_luapack_required_retry_guard 2\n");
 		client.recoveryRetryIssued = true;
 		client.recoveryRetryDisconnectAt = ServerTime() + commandWindowSeconds;
 		return true;
