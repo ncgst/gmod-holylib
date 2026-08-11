@@ -1244,11 +1244,8 @@ public:
 			failure = "client_lua_files is unavailable";
 			return;
 		}
-		const bool trackNativeBaseline = slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT &&
-			(action == HolyLib::LuaPack::BaselineAction::BasePlusDelta ||
-				(action == HolyLib::LuaPack::BaselineAction::NativeSource &&
-					HolyLib::LuaPack::NeedsNativeHashUpdate(slot)));
-		if (trackNativeBaseline)
+		if (slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT &&
+			action == HolyLib::LuaPack::BaselineAction::BasePlusDelta)
 		{
 			g_requiredNativeLuaHashes[slot].clear();
 		}
@@ -1350,7 +1347,7 @@ public:
 			std::copy(hash.begin(), hash.end(), replacement.replacementHash.begin());
 			item.m_pUserData = replacement.replacementHash.data();
 			item.m_nUserDataLength = static_cast<int>(replacement.replacementHash.size());
-			if (trackNativeBaseline &&
+			if (action == HolyLib::LuaPack::BaselineAction::BasePlusDelta &&
 				fileAction == HolyLib::LuaPack::BaselineAction::NativeSource &&
 				!HolyLib::LuaPack::IsInitFile(fileName))
 			{
@@ -1358,7 +1355,8 @@ public:
 			}
 		}
 
-		if (trackNativeBaseline)
+		if (slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT &&
+			action == HolyLib::LuaPack::BaselineAction::BasePlusDelta)
 		{
 			auto& nativeHashes = g_requiredNativeLuaHashes[slot];
 			nativeHashes.insert(nativeBaselineHashes.begin(), nativeBaselineHashes.end());

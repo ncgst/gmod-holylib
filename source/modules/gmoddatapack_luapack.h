@@ -35,8 +35,6 @@ namespace HolyLib::LuaPack
 		double readyDeadlineSeconds = 30.0;
 		bool requiredStubbing = false;
 		bool allowOptOut = true;
-		bool requiredRecovery = true;
-		double requiredRecoveryTtlSeconds = 120.0;
 		bool optimisticStubbing = false;
 		unsigned int optimisticPrefixFiles = 256;
 		unsigned long long optimisticPrefixBytes = 262144;
