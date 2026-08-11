@@ -847,23 +847,36 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 
 	static const char* BeginPendingRecoveryBaseline(int slot)
 	{
-		Policy::RequiredRecoveryHandoff& handoff = state.recoveryHandoffs[slot];
-		if (!handoff.Pending())
-			return nullptr;
-
-		ClientPin& failedClient = state.clients[slot];
 		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
 		const std::uint64_t account = baseClient && baseClient->m_SteamID.IsValid()
 			? baseClient->m_SteamID.ConvertToUint64() : 0;
 		const bool authenticated = baseClient && baseClient->IsFullyAuthenticated();
+		Policy::RequiredRecoveryHandoff* handoff = nullptr;
+		for (int handoffSlot = 0; handoffSlot < ABSOLUTE_PLAYER_LIMIT; ++handoffSlot)
+		{
+			Policy::RequiredRecoveryHandoff& candidate = state.recoveryHandoffs[handoffSlot];
+			if (!candidate.Pending() || candidate.Account() != account)
+				continue;
+			if (handoff)
+				return "multiple recovery handoffs matched the authenticated SteamID64";
+			handoff = &candidate;
+		}
+		if (!handoff)
+		{
+			if (state.recoveryHandoffs[slot].Pending())
+				return "the recovery ServerInfo boundary did not have its authenticated SteamID64";
+			return nullptr;
+		}
+
+		ClientPin& failedClient = state.clients[slot];
 		const std::uint64_t failedConnection = failedClient.connectionSerial;
-		const std::uint64_t expectedAccount = handoff.Account();
-		const std::uint64_t expectedConnection = handoff.FailedConnection();
-		const Policy::RecoveryHandoffResult begin = handoff.BeginBaseline(
+		const std::uint64_t expectedAccount = handoff->Account();
+		const std::uint64_t expectedConnection = handoff->FailedConnection();
+		const Policy::RecoveryHandoffResult begin = handoff->BeginBaseline(
 			account, authenticated, ServerTime());
 		if (begin == Policy::RecoveryHandoffResult::OwnershipMismatch)
 		{
-			handoff.Reset();
+			handoff->Reset();
 			Warning(PROJECT_NAME " - luapack: ignored a stale recovery handoff at ServerInfo for slot %i; expected account %llu connection %llu, got %llu connection %llu\n",
 				slot, static_cast<unsigned long long>(expectedAccount),
 				static_cast<unsigned long long>(expectedConnection),
@@ -964,12 +977,50 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 					Msg(PROJECT_NAME " - luapack: invoking one engine reconnect for slot %i (%llu) after failed connection epoch %llu\n",
 						slot, static_cast<unsigned long long>(account),
 						static_cast<unsigned long long>(client.connectionSerial));
-					// Virtual dispatch reaches CGameClient::Reconnect. The ServerInfo hook either
-					// begins a new recovery epoch synchronously or observes this invoked gate later.
+					// Virtual dispatch reaches CGameClient::Reconnect. A later frame may dispatch
+					// exactly one ServerInfo only after the engine has returned to CONNECTED.
 					baseClient->Reconnect();
+					// Reconnect may synchronously run disconnect/connect callbacks. Re-resolve the
+					// slot instead of dereferencing the pre-reconnect client pointer afterward.
+					if (CBaseClient* restarted = Util::server ? Util::GetClientByIndex(slot) : nullptr)
+					{
+						Msg(PROJECT_NAME " - luapack: engine reconnect returned for slot %i (%llu): signon=%i send_server_info=%s channel=%s authenticated=%s\n",
+							slot, static_cast<unsigned long long>(account),
+							restarted->m_nSignonState, restarted->m_bSendServerInfo ? "yes" : "no",
+							restarted->GetNetChannel() ? "yes" : "no",
+							restarted->IsFullyAuthenticated() ? "yes" : "no");
+					}
+					else
+					{
+						Msg(PROJECT_NAME " - luapack: engine reconnect returned for slot %i (%llu) with the slot temporarily unavailable\n",
+							slot, static_cast<unsigned long long>(account));
+					}
 					break;
 				case Policy::RecoveryHandoffResult::AlreadyInvoked:
+				{
+					const bool signonRestarted = baseClient &&
+						baseClient->m_nSignonState == SIGNONSTATE_CONNECTED;
+					const Policy::RecoveryHandoffResult dispatch = handoff.TryDispatchServerInfo(
+						account, authenticated, channelReady, signonRestarted, now);
+					if (dispatch == Policy::RecoveryHandoffResult::DispatchServerInfo)
+					{
+						const bool engineQueued = baseClient->m_bSendServerInfo;
+						// Reconnect resets the sign-on state but does not reliably queue the next
+						// baseline on this engine branch. At exact CONNECTED, this is the engine's
+						// normal pre-ServerInfo flag; the detoured call atomically consumes the
+						// account latch before any Lua string-table hashes are serialized.
+						baseClient->m_bSendServerInfo = true;
+						Msg(PROJECT_NAME " - luapack: dispatching one native ServerInfo for slot %i (%llu) after sign-on restart (engine_queued=%s)\n",
+							slot, static_cast<unsigned long long>(account),
+							engineQueued ? "yes" : "no");
+						if (!baseClient->SendServerInfo())
+						{
+							Warning(PROJECT_NAME " - luapack: native recovery ServerInfo failed for slot %i (%llu); the consumed one-shot will not retry\n",
+								slot, static_cast<unsigned long long>(account));
+						}
+					}
 					break;
+				}
 				case Policy::RecoveryHandoffResult::Expired:
 					if (account == expectedAccount)
 					{
@@ -991,6 +1042,8 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 						"the authenticated engine reconnect could not be invoked safely");
 					break;
 				case Policy::RecoveryHandoffResult::None:
+				case Policy::RecoveryHandoffResult::NotReady:
+				case Policy::RecoveryHandoffResult::DispatchServerInfo:
 				case Policy::RecoveryHandoffResult::BeginBaseline:
 					break;
 			}

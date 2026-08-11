@@ -25,16 +25,28 @@ int main()
 		assert(recovery.Arm(accountA, 100, 10.0, 30.0) == RecoveryArmResult::Armed);
 		assert(handoff.Queue(accountA, 100, 10.0, 15.0));
 		assert(!handoff.Queue(accountA, 100, 10.0, 15.0));
+		assert(handoff.TryDispatchServerInfo(accountA, true, true, true, 10.5) ==
+			RecoveryHandoffResult::Invalid);
 		// Queuing and invoking the engine primitive do not consume the latch or change
 		// the failed connection's lane. Consumption happens only at new ServerInfo.
 		assert(recovery.Consume(accountA, 100, 11.0) == RecoveryConsumeResult::SameConnection);
 		assert(handoff.BeginBaseline(accountA, true, 11.0) == RecoveryHandoffResult::Invalid);
 		assert(handoff.TryInvoke(accountA, 100, true, true, 11.0) == RecoveryHandoffResult::Invoke);
 		assert(handoff.TryInvoke(accountA, 100, true, true, 11.5) == RecoveryHandoffResult::AlreadyInvoked);
+		assert(handoff.TryDispatchServerInfo(accountA, true, true, false, 11.6) ==
+			RecoveryHandoffResult::NotReady);
+		assert(handoff.TryDispatchServerInfo(0, false, false, true, 11.7) ==
+			RecoveryHandoffResult::NotReady);
+		assert(handoff.TryDispatchServerInfo(accountB, true, true, true, 11.8) ==
+			RecoveryHandoffResult::NotReady);
 		// Source may clear the old slot or assign a new connection serial before
 		// ServerInfo. Once invoked, neither transition discards or reinvokes the handoff.
 		assert(handoff.TryInvoke(0, 0, false, false, 11.75) == RecoveryHandoffResult::AlreadyInvoked);
-		assert(handoff.TryInvoke(accountB, 999, true, true, 11.8) == RecoveryHandoffResult::AlreadyInvoked);
+		assert(handoff.TryInvoke(accountB, 999, true, true, 11.9) == RecoveryHandoffResult::AlreadyInvoked);
+		assert(handoff.TryDispatchServerInfo(accountA, true, true, true, 11.95) ==
+			RecoveryHandoffResult::DispatchServerInfo);
+		assert(handoff.TryDispatchServerInfo(accountA, true, true, true, 11.96) ==
+			RecoveryHandoffResult::AlreadyInvoked);
 		assert(handoff.BeginBaseline(accountA, true, 12.0) == RecoveryHandoffResult::BeginBaseline);
 		assert(!handoff.Pending());
 		assert(recovery.Consume(accountA, 101, 12.0) == RecoveryConsumeResult::Native);
@@ -119,6 +131,11 @@ int main()
 		assert(!handoff.Pending());
 		assert(recovery.Consume(accountA, 301, 55.0) == RecoveryConsumeResult::Expired);
 		assert(recovery.Size() == 0);
+		assert(handoff.Queue(accountA, 301, 60.0, 2.0));
+		assert(handoff.TryInvoke(accountA, 301, true, true, 60.5) == RecoveryHandoffResult::Invoke);
+		assert(handoff.TryDispatchServerInfo(accountA, true, true, true, 62.0) ==
+			RecoveryHandoffResult::Expired);
+		assert(!handoff.Pending());
 		assert(recovery.Arm(accountA, 302, 60.0, 5.0) == RecoveryArmResult::Armed);
 		assert(recovery.Consume(accountA, 303, 61.0) == RecoveryConsumeResult::Native);
 		recovery.Prune(1000.0);
@@ -151,6 +168,10 @@ int main()
 		assert(handoff.Queue(accountA, 500, 0.0, 15.0));
 		assert(handoff.TryInvoke(accountA, 500, true, true, 1.0) == RecoveryHandoffResult::Invoke);
 		assert(handoff.TryInvoke(accountA, 500, true, true, 2.0) == RecoveryHandoffResult::AlreadyInvoked);
+		assert(handoff.TryDispatchServerInfo(accountA, true, true, true, 2.0) ==
+			RecoveryHandoffResult::DispatchServerInfo);
+		assert(handoff.TryDispatchServerInfo(accountA, true, true, true, 2.1) ==
+			RecoveryHandoffResult::AlreadyInvoked);
 		assert(handoff.BeginBaseline(accountA, true, 2.0) == RecoveryHandoffResult::BeginBaseline);
 		assert(recovery.Consume(accountA, 501, 1.0) == RecoveryConsumeResult::Native);
 		assert(recovery.Arm(accountA, 502, 2.0, 30.0) == RecoveryArmResult::RetryExhausted);

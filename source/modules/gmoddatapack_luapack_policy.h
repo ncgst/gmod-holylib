@@ -171,6 +171,7 @@ namespace HolyLib::LuaPack::Policy
 		Empty,
 		Queued,
 		Invoked,
+		ServerInfoClaimed,
 	};
 
 	enum class RecoveryHandoffResult
@@ -178,6 +179,8 @@ namespace HolyLib::LuaPack::Policy
 		None,
 		Invoke,
 		AlreadyInvoked,
+		NotReady,
+		DispatchServerInfo,
 		BeginBaseline,
 		OwnershipMismatch,
 		Invalid,
@@ -217,7 +220,8 @@ namespace HolyLib::LuaPack::Policy
 			// Reconnect may temporarily clear or replace the slot before its next
 			// ServerInfo. Once invoked, ownership is checked at that baseline instead;
 			// this gate must neither invoke twice nor discard the account handoff.
-			if (phase == RecoveryHandoffPhase::Invoked)
+			if (phase == RecoveryHandoffPhase::Invoked ||
+				phase == RecoveryHandoffPhase::ServerInfoClaimed)
 				return RecoveryHandoffResult::AlreadyInvoked;
 			if (currentAccount != account || currentConnection != failedConnection)
 				return RecoveryHandoffResult::OwnershipMismatch;
@@ -227,6 +231,34 @@ namespace HolyLib::LuaPack::Policy
 				return RecoveryHandoffResult::Invalid;
 			phase = RecoveryHandoffPhase::Invoked;
 			return RecoveryHandoffResult::Invoke;
+		}
+
+		RecoveryHandoffResult TryDispatchServerInfo(std::uint64_t currentAccount,
+			bool authenticated, bool channelReady, bool signonRestarted, double now)
+		{
+			if (phase == RecoveryHandoffPhase::Empty)
+				return RecoveryHandoffResult::None;
+			if (now >= expiresAt)
+			{
+				Reset();
+				return RecoveryHandoffResult::Expired;
+			}
+			if (phase == RecoveryHandoffPhase::Queued)
+				return RecoveryHandoffResult::Invalid;
+			if (phase == RecoveryHandoffPhase::ServerInfoClaimed)
+				return RecoveryHandoffResult::AlreadyInvoked;
+			// Reconnect can temporarily clear the slot, and the replacement connection can
+			// be admitted in another slot. Never dispatch through an unidentified or reused
+			// slot; the account-owned handoff remains available to that connection's normal
+			// ServerInfo hook until the bounded expiry.
+			if (currentAccount == 0 || !authenticated || !channelReady)
+				return RecoveryHandoffResult::NotReady;
+			if (currentAccount != account)
+				return RecoveryHandoffResult::NotReady;
+			if (!signonRestarted)
+				return RecoveryHandoffResult::NotReady;
+			phase = RecoveryHandoffPhase::ServerInfoClaimed;
+			return RecoveryHandoffResult::DispatchServerInfo;
 		}
 
 		RecoveryHandoffResult BeginBaseline(std::uint64_t currentAccount,
@@ -243,7 +275,8 @@ namespace HolyLib::LuaPack::Policy
 				return RecoveryHandoffResult::OwnershipMismatch;
 			if (!authenticated)
 				return RecoveryHandoffResult::Invalid;
-			if (phase != RecoveryHandoffPhase::Invoked)
+			if (phase != RecoveryHandoffPhase::Invoked &&
+				phase != RecoveryHandoffPhase::ServerInfoClaimed)
 				return RecoveryHandoffResult::Invalid;
 			Reset();
 			return RecoveryHandoffResult::BeginBaseline;
@@ -264,7 +297,8 @@ namespace HolyLib::LuaPack::Policy
 
 		bool Invoked() const
 		{
-			return phase == RecoveryHandoffPhase::Invoked;
+			return phase == RecoveryHandoffPhase::Invoked ||
+				phase == RecoveryHandoffPhase::ServerInfoClaimed;
 		}
 
 		std::uint64_t Account() const
