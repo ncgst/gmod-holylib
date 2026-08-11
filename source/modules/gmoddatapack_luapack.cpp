@@ -88,7 +88,9 @@ namespace HolyLib::LuaPack
 		bool optOut = false;
 		bool nativeLane = false;
 		bool requiredRecovery = false;
+		bool resolvedIdentity = false;
 		bool authenticatedIdentity = false;
+		bool retryStateCleared = false;
 		bool disconnectIssued = false;
 		bool recoveryRetryIssued = false;
 		double recoveryRetryDisconnectAt = 0.0;
@@ -805,17 +807,27 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		client.joinNativeBytes += nativeSourceBytes;
 	}
 
-	static bool BindAuthenticatedIdentity(int slot, ClientPin& client)
+	static bool BindResolvedIdentity(int slot, ClientPin& client)
 	{
 		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
-		if (!baseClient || !baseClient->IsFullyAuthenticated() || !baseClient->m_SteamID.IsValid())
+		if (!baseClient || !baseClient->m_SteamID.IsValid())
 			return false;
 
 		const std::uint64_t steamID64 = baseClient->m_SteamID.ConvertToUint64();
-		if (steamID64 == 0 || (client.authenticatedIdentity && client.steamID64 != steamID64))
+		if (steamID64 == 0 || (client.resolvedIdentity && client.steamID64 != steamID64))
 			return false;
 
 		client.steamID64 = steamID64;
+		client.resolvedIdentity = true;
+		return true;
+	}
+
+	static bool BindAuthenticatedIdentity(int slot, ClientPin& client)
+	{
+		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		if (!baseClient || !BindResolvedIdentity(slot, client) || !baseClient->IsFullyAuthenticated())
+			return false;
+
 		client.authenticatedIdentity = true;
 		return true;
 	}
@@ -850,6 +862,30 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		return true;
 	}
 
+	static void ClearProvenRetryState(int slot, ClientPin& client)
+	{
+		if (client.retryStateCleared || !client.active || !BindAuthenticatedIdentity(slot, client))
+			return;
+
+		if (client.requiredRecovery)
+		{
+			if (!state.requiredRecovery.Complete(client.steamID64, client.connectionSerial))
+				return;
+			ClearClientRetryGuard(slot);
+			client.retryStateCleared = true;
+			Msg(PROJECT_NAME " - luapack: client slot %i (%llu) completed its authenticated native recovery connection; retry state cleared\n",
+				slot, static_cast<unsigned long long>(client.steamID64));
+			return;
+		}
+
+		if (client.optOut || (client.requiredLane && client.ready))
+		{
+			state.requiredRecovery.Clear(client.steamID64);
+			ClearClientRetryGuard(slot);
+			client.retryStateCleared = true;
+		}
+	}
+
 	static void ResolveDeliveryLane(int slot, ClientPin& client)
 	{
 		if (client.deliveryLaneResolved)
@@ -867,11 +903,11 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 
 		if (client.nativeLane)
 		{
-			// Explicit opt-out remains the highest-priority lane. Capture an authenticated
+			// Explicit opt-out remains the highest-priority lane. Capture a resolved
 			// identity when available so a successful manual recovery can heal a pending
 			// automatic latch, but never reject opt-out for an authentication race.
 			if (client.optOut)
-				BindAuthenticatedIdentity(slot, client);
+				BindResolvedIdentity(slot, client);
 			MarkFallback(client);
 			if (client.optOut)
 				Msg(PROJECT_NAME " - luapack: client slot %i selected native delivery with tv_nochat=no_gluapack\n", slot);
@@ -882,9 +918,13 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 
 		if (currentConfig.requiredRecovery)
 		{
-			if (!BindAuthenticatedIdentity(slot, client))
+			// The ticket-provided SteamID is resolved before ServerInfo, while Source's
+			// fully-authenticated flag normally arrives later in signon. Resolution is
+			// sufficient to select an account-keyed baseline; arming and successful clear
+			// still require the later authenticated identity to match exactly.
+			if (!BindResolvedIdentity(slot, client))
 			{
-				Warning(PROJECT_NAME " - luapack: client slot %i has no authenticated SteamID64 before its required Lua baseline; failing closed\n",
+				Warning(PROJECT_NAME " - luapack: client slot %i has no resolved SteamID64 before its required Lua baseline; failing closed\n",
 					slot);
 				return;
 			}
@@ -1793,6 +1833,10 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 					"the client did not begin its armed native retry within five seconds");
 				continue;
 			}
+			// Steam authentication commonly completes after SendServerInfo. If the client
+			// reached full entry first, retain the consumed tombstone and process guard until
+			// the same connection's authenticated SteamID64 can be revalidated here.
+			ClearProvenRetryState(slot, client);
 			// The deadline only runs for spawned clients. A connecting client can legitimately
 			// spend many minutes in map load + the Requesting-Lua burst before its Lua state even
 			// exists; expiring the pin there would mark exactly the joins that matter fallback
@@ -1907,10 +1951,10 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		ClientPin& client = state.clients[slot];
 		ResolveDeliveryLane(slot, client);
 		if (client.requiredLane && !Policy::RequiredBaselineIdentityReady(
-			GetConfig().requiredRecovery, client.authenticatedIdentity))
+			GetConfig().requiredRecovery, client.resolvedIdentity))
 		{
 			return {BaselineAction::Reject,
-				"an authenticated SteamID64 was unavailable before the required Lua baseline"};
+				"a resolved SteamID64 was unavailable before the required Lua baseline"};
 		}
 		const Policy::BaseAvailability base = BaseAvailabilityForClient(client, true);
 		switch (Policy::SelectBaseline(ClientLane(client), SupportsCanonicalRegistration(), base))
@@ -2073,25 +2117,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		if (!client.ready && !client.fallback && !client.generation.empty())
 			client.deadline = ServerTime() + GetConfig().readyDeadlineSeconds;
 
-		if (client.requiredRecovery && BindAuthenticatedIdentity(slot, client) &&
-			state.requiredRecovery.Complete(client.steamID64, client.connectionSerial))
-		{
-			ClearClientRetryGuard(slot);
-			Msg(PROJECT_NAME " - luapack: client slot %i (%llu) completed its native recovery connection; retry state cleared\n",
-				slot, static_cast<unsigned long long>(client.steamID64));
-		}
-		else if (client.optOut)
-		{
-			if (BindAuthenticatedIdentity(slot, client))
-				state.requiredRecovery.Clear(client.steamID64);
-			ClearClientRetryGuard(slot);
-		}
-		else if (client.requiredLane && client.ready)
-		{
-			if (BindAuthenticatedIdentity(slot, client))
-				state.requiredRecovery.Clear(client.steamID64);
-			ClearClientRetryGuard(slot);
-		}
+		ClearProvenRetryState(slot, client);
 
 		if (IsEnabled() && !client.joinSummaryLogged &&
 			(client.joinNativeFiles > 0 || client.joinOptimisticStubs > 0 ||
@@ -2158,7 +2184,9 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			if (exactFailure && GetConfig().requiredRecovery)
 			{
 				const std::uint64_t expectedSteamID64 = client.steamID64;
-				if (client.authenticatedIdentity && BindAuthenticatedIdentity(slot, client) &&
+				const bool authenticatedNow = BindAuthenticatedIdentity(slot, client);
+				if (Policy::RequiredFailureIdentityReady(true, client.resolvedIdentity,
+					client.authenticatedIdentity) && authenticatedNow &&
 					client.steamID64 == expectedSteamID64)
 				{
 					const double ttl = GetConfig().requiredRecoveryTtlSeconds;
@@ -2258,10 +2286,8 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			}
 			if (client.active)
 			{
-				if (BindAuthenticatedIdentity(slot, client))
-					state.requiredRecovery.Clear(client.steamID64);
 				ReleaseGenerationReference(client);
-				ClearClientRetryGuard(slot);
+				ClearProvenRetryState(slot, client);
 			}
 			Msg(PROJECT_NAME " - luapack: client slot %i acknowledged required map base %s\n", slot, generationId.c_str());
 		}

@@ -43,12 +43,16 @@ int main()
 		assert(SelectBaseline(Lane::NativeRecovery, true, BaseAvailability::Ready) == Action::Native);
 	}
 
-	// Authentication is mandatory before a recoverable required baseline. A reused
-	// slot cannot consume account A's latch for account B, because slots are not keys.
+	// The ticket identity must resolve before a recoverable required baseline, while
+	// full authentication may complete later in signon. Arming still requires both,
+	// and a reused slot cannot consume account A's latch for account B.
 	{
 		assert(!RequiredBaselineIdentityReady(true, false));
 		assert(RequiredBaselineIdentityReady(true, true));
 		assert(RequiredBaselineIdentityReady(false, false));
+		assert(!RequiredFailureIdentityReady(true, true, false));
+		assert(RequiredFailureIdentityReady(true, true, true));
+		assert(!RequiredFailureIdentityReady(true, false, true));
 		RequiredRecoveryTracker recovery;
 		assert(recovery.Arm(0, 200, 0.0, 30.0) == RecoveryArmResult::Invalid);
 		assert(recovery.Arm(accountA, 200, 0.0, 30.0) == RecoveryArmResult::Armed);

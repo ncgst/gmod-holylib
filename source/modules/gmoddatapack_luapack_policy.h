@@ -160,9 +160,15 @@ namespace HolyLib::LuaPack::Policy
 	}
 
 	constexpr bool RequiredBaselineIdentityReady(bool recoveryEnabled,
-		bool authenticatedIdentity)
+		bool resolvedIdentity)
 	{
-		return !recoveryEnabled || authenticatedIdentity;
+		return !recoveryEnabled || resolvedIdentity;
+	}
+
+	constexpr bool RequiredFailureIdentityReady(bool recoveryEnabled,
+		bool resolvedIdentity, bool authenticatedIdentity)
+	{
+		return !recoveryEnabled || (resolvedIdentity && authenticatedIdentity);
 	}
 
 	constexpr bool NeedsPerClientNativeHashes(Lane lane)
