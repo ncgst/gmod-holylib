@@ -2367,17 +2367,17 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			}
 		}
 
-		const bool clearedRecovery = steamID64 != 0 &&
-			state.requiredRecovery.Clear(steamID64);
-		if (clearedRecovery || clearedHandoffs > 0)
+		if (clearedHandoffs > 0)
 		{
-			Msg(PROJECT_NAME " - luapack: physical Steam disconnect for slot %i (%llu) cleared required recovery state (%u handoffs)\n",
+			Msg(PROJECT_NAME " - luapack: physical Steam disconnect for slot %i (%llu) cleared %u required recovery handoff(s)\n",
 				slot, static_cast<unsigned long long>(steamID64), clearedHandoffs);
 		}
 
 		// Unlike late game-layer callbacks around CGameClient::Reconnect, the Steam
-		// disconnect is a hard account boundary. It must also discard any unidentified
-		// per-slot handoff so a reused slot cannot inherit the reconnect gate.
+		// disconnect must discard any unidentified per-slot handoff so a reused slot
+		// cannot inherit the reconnect gate. The account tracker deliberately survives:
+		// an Armed latch remains available to the next physical connection, while a
+		// Consumed tombstone must remain until proven success or server reset.
 		ClientDisconnect(slot, false);
 	}
 

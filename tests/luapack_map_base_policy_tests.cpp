@@ -81,19 +81,15 @@ int main()
 		assert(!ShouldIgnoreLateRecoveryFailure(true,
 			recovery.OwnsConsumed(accountA, 112), false));
 		assert(ShouldIgnoreLateRecoveryFailure(true, false, true));
-		assert(!recovery.Clear(accountB));
-		assert(recovery.Clear(accountA));
-		assert(!recovery.OwnsConsumed(accountA, 111));
-		assert(recovery.Arm(accountA, 112, 2.0, 30.0) == RecoveryArmResult::Armed);
-		assert(recovery.Clear(accountA));
-		assert(recovery.Consume(accountA, 113, 3.0) == RecoveryConsumeResult::None);
-
 		RequiredRecoveryHandoff physicalHandoff;
 		assert(physicalHandoff.Queue(accountA, 112, 2.0, 15.0));
 		assert(!physicalHandoff.ResetIfOwnedBy(accountB));
 		assert(physicalHandoff.Pending());
 		assert(physicalHandoff.ResetIfOwnedBy(accountA));
 		assert(!physicalHandoff.Pending());
+		// Physical disconnect removes only the reconnect handoff. The consumed account
+		// tombstone survives so another failed join cannot schedule a retry loop.
+		assert(recovery.OwnsConsumed(accountA, 111));
 	}
 
 	// A stale success callback from the connection that armed recovery cannot clear
@@ -110,14 +106,15 @@ int main()
 	}
 
 	// A physical connection can supersede an invoked slot handoff without losing the
-	// account latch. Its distinct connection epoch consumes the same one-shot native lane.
+	// Armed account latch. Its distinct connection epoch consumes the one-shot native lane.
 	{
 		RequiredRecoveryTracker recovery;
 		RequiredRecoveryHandoff handoff;
 		assert(recovery.Arm(accountA, 150, 0.0, 30.0) == RecoveryArmResult::Armed);
 		assert(handoff.Queue(accountA, 150, 0.0, 15.0));
 		assert(handoff.TryInvoke(accountA, 150, true, true, 1.0) == RecoveryHandoffResult::Invoke);
-		assert(handoff.BeginBaseline(accountA, true, 2.0) == RecoveryHandoffResult::BeginBaseline);
+		assert(handoff.ResetIfOwnedBy(accountA));
+		assert(!handoff.Pending());
 		assert(recovery.Consume(accountA, 151, 2.0) == RecoveryConsumeResult::Native);
 		assert(recovery.Complete(accountA, 151));
 	}
