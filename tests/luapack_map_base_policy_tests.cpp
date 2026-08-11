@@ -28,15 +28,32 @@ int main()
 		// Queuing and invoking the engine primitive do not consume the latch or change
 		// the failed connection's lane. Consumption happens only at new ServerInfo.
 		assert(recovery.Consume(accountA, 100, 11.0) == RecoveryConsumeResult::SameConnection);
-		assert(handoff.BeginBaseline(accountA, 100, true, 11.0) == RecoveryHandoffResult::Invalid);
+		assert(handoff.BeginBaseline(accountA, true, 11.0) == RecoveryHandoffResult::Invalid);
 		assert(handoff.TryInvoke(accountA, 100, true, true, 11.0) == RecoveryHandoffResult::Invoke);
 		assert(handoff.TryInvoke(accountA, 100, true, true, 11.5) == RecoveryHandoffResult::AlreadyInvoked);
-		assert(handoff.BeginBaseline(accountA, 100, true, 12.0) == RecoveryHandoffResult::BeginBaseline);
+		// Source may clear the old slot or assign a new connection serial before
+		// ServerInfo. Once invoked, neither transition discards or reinvokes the handoff.
+		assert(handoff.TryInvoke(0, 0, false, false, 11.75) == RecoveryHandoffResult::AlreadyInvoked);
+		assert(handoff.TryInvoke(accountB, 999, true, true, 11.8) == RecoveryHandoffResult::AlreadyInvoked);
+		assert(handoff.BeginBaseline(accountA, true, 12.0) == RecoveryHandoffResult::BeginBaseline);
 		assert(!handoff.Pending());
 		assert(recovery.Consume(accountA, 101, 12.0) == RecoveryConsumeResult::Native);
 		assert(SelectBaseline(Lane::NativeRecovery, true, BaseAvailability::Ready) == Action::Native);
 		assert(SelectFile(Lane::NativeRecovery, BaseAvailability::Missing, false, false) == Action::Native);
 		assert(recovery.Consume(accountA, 102, 13.0) == RecoveryConsumeResult::RetryExhausted);
+	}
+
+	// A stale success callback from the connection that armed recovery cannot clear
+	// its own latch. A distinct authenticated success remains a safe clear boundary.
+	{
+		RequiredRecoveryTracker recovery;
+		assert(recovery.Arm(accountA, 125, 0.0, 30.0) == RecoveryArmResult::Armed);
+		assert(recovery.ClearAfterSuccessfulConnection(accountA, 125) ==
+			RecoveryClearResult::SameFailedConnection);
+		assert(recovery.Size() == 1);
+		assert(recovery.ClearAfterSuccessfulConnection(accountA, 126) ==
+			RecoveryClearResult::Cleared);
+		assert(recovery.Size() == 0);
 	}
 
 	// A physical connection can supersede an invoked slot handoff without losing the
@@ -47,7 +64,7 @@ int main()
 		assert(recovery.Arm(accountA, 150, 0.0, 30.0) == RecoveryArmResult::Armed);
 		assert(handoff.Queue(accountA, 150, 0.0, 15.0));
 		assert(handoff.TryInvoke(accountA, 150, true, true, 1.0) == RecoveryHandoffResult::Invoke);
-		handoff.Reset();
+		assert(handoff.BeginBaseline(accountA, true, 2.0) == RecoveryHandoffResult::BeginBaseline);
 		assert(recovery.Consume(accountA, 151, 2.0) == RecoveryConsumeResult::Native);
 		assert(recovery.Complete(accountA, 151));
 	}
@@ -85,8 +102,8 @@ int main()
 		assert(handoff.TryInvoke(accountB, 200, true, true, 1.0) == RecoveryHandoffResult::OwnershipMismatch);
 		assert(handoff.TryInvoke(accountA, 201, true, true, 1.0) == RecoveryHandoffResult::OwnershipMismatch);
 		assert(handoff.TryInvoke(accountA, 200, true, true, 1.0) == RecoveryHandoffResult::Invoke);
-		assert(handoff.BeginBaseline(accountB, 200, true, 2.0) == RecoveryHandoffResult::OwnershipMismatch);
-		assert(handoff.BeginBaseline(accountA, 200, true, 2.0) == RecoveryHandoffResult::BeginBaseline);
+		assert(handoff.BeginBaseline(accountB, true, 2.0) == RecoveryHandoffResult::OwnershipMismatch);
+		assert(handoff.BeginBaseline(accountA, true, 2.0) == RecoveryHandoffResult::BeginBaseline);
 		assert(recovery.Consume(accountB, 201, 1.0) == RecoveryConsumeResult::None);
 		assert(recovery.Consume(accountA, 202, 1.0) == RecoveryConsumeResult::Native);
 	}
@@ -134,7 +151,7 @@ int main()
 		assert(handoff.Queue(accountA, 500, 0.0, 15.0));
 		assert(handoff.TryInvoke(accountA, 500, true, true, 1.0) == RecoveryHandoffResult::Invoke);
 		assert(handoff.TryInvoke(accountA, 500, true, true, 2.0) == RecoveryHandoffResult::AlreadyInvoked);
-		assert(handoff.BeginBaseline(accountA, 500, true, 2.0) == RecoveryHandoffResult::BeginBaseline);
+		assert(handoff.BeginBaseline(accountA, true, 2.0) == RecoveryHandoffResult::BeginBaseline);
 		assert(recovery.Consume(accountA, 501, 1.0) == RecoveryConsumeResult::Native);
 		assert(recovery.Arm(accountA, 502, 2.0, 30.0) == RecoveryArmResult::RetryExhausted);
 		assert(recovery.Consume(accountA, 503, 3.0) == RecoveryConsumeResult::RetryExhausted);

@@ -38,6 +38,13 @@ namespace HolyLib::LuaPack::Policy
 		Expired,
 	};
 
+	enum class RecoveryClearResult
+	{
+		None,
+		Cleared,
+		SameFailedConnection,
+	};
+
 	struct RecoveryEntry
 	{
 		RecoveryPhase phase = RecoveryPhase::Armed;
@@ -104,6 +111,26 @@ namespace HolyLib::LuaPack::Policy
 		bool Clear(std::uint64_t account)
 		{
 			return account != 0 && entries.erase(account) != 0;
+		}
+
+		RecoveryClearResult ClearAfterSuccessfulConnection(std::uint64_t account,
+			std::uint64_t connection)
+		{
+			if (account == 0 || connection == 0)
+				return RecoveryClearResult::None;
+
+			auto entry = entries.find(account);
+			if (entry == entries.end())
+				return RecoveryClearResult::None;
+			// A late READY/active callback from the connection that armed recovery is
+			// not a safe boundary. Only a distinct successful connection can retire an
+			// armed latch without consuming its native baseline.
+			if (entry->second.phase == RecoveryPhase::Armed &&
+				entry->second.failedConnection == connection)
+				return RecoveryClearResult::SameFailedConnection;
+
+			entries.erase(entry);
+			return RecoveryClearResult::Cleared;
 		}
 
 		void Prune(double now)
@@ -182,27 +209,40 @@ namespace HolyLib::LuaPack::Policy
 		{
 			if (phase == RecoveryHandoffPhase::Empty)
 				return RecoveryHandoffResult::None;
-			const RecoveryHandoffResult valid = Validate(currentAccount,
-				currentConnection, authenticated, now);
-			if (valid != RecoveryHandoffResult::None)
-				return valid;
-			if (!channelReady)
-				return RecoveryHandoffResult::Invalid;
+			if (now >= expiresAt)
+			{
+				Reset();
+				return RecoveryHandoffResult::Expired;
+			}
+			// Reconnect may temporarily clear or replace the slot before its next
+			// ServerInfo. Once invoked, ownership is checked at that baseline instead;
+			// this gate must neither invoke twice nor discard the account handoff.
 			if (phase == RecoveryHandoffPhase::Invoked)
 				return RecoveryHandoffResult::AlreadyInvoked;
+			if (currentAccount != account || currentConnection != failedConnection)
+				return RecoveryHandoffResult::OwnershipMismatch;
+			if (!authenticated)
+				return RecoveryHandoffResult::Invalid;
+			if (!channelReady)
+				return RecoveryHandoffResult::Invalid;
 			phase = RecoveryHandoffPhase::Invoked;
 			return RecoveryHandoffResult::Invoke;
 		}
 
 		RecoveryHandoffResult BeginBaseline(std::uint64_t currentAccount,
-			std::uint64_t currentConnection, bool authenticated, double now)
+			bool authenticated, double now)
 		{
 			if (phase == RecoveryHandoffPhase::Empty)
 				return RecoveryHandoffResult::None;
-			const RecoveryHandoffResult valid = Validate(currentAccount,
-				currentConnection, authenticated, now);
-			if (valid != RecoveryHandoffResult::None)
-				return valid;
+			if (now >= expiresAt)
+			{
+				Reset();
+				return RecoveryHandoffResult::Expired;
+			}
+			if (currentAccount != account)
+				return RecoveryHandoffResult::OwnershipMismatch;
+			if (!authenticated)
+				return RecoveryHandoffResult::Invalid;
 			if (phase != RecoveryHandoffPhase::Invoked)
 				return RecoveryHandoffResult::Invalid;
 			Reset();
@@ -238,23 +278,6 @@ namespace HolyLib::LuaPack::Policy
 		}
 
 	private:
-		RecoveryHandoffResult Validate(std::uint64_t currentAccount,
-			std::uint64_t currentConnection, bool authenticated, double now)
-		{
-			if (phase == RecoveryHandoffPhase::Empty)
-				return RecoveryHandoffResult::None;
-			if (now >= expiresAt)
-			{
-				Reset();
-				return RecoveryHandoffResult::Expired;
-			}
-			if (currentAccount != account || currentConnection != failedConnection)
-				return RecoveryHandoffResult::OwnershipMismatch;
-			if (!authenticated)
-				return RecoveryHandoffResult::Invalid;
-			return RecoveryHandoffResult::None;
-		}
-
 		RecoveryHandoffPhase phase = RecoveryHandoffPhase::Empty;
 		std::uint64_t account = 0;
 		std::uint64_t failedConnection = 0;

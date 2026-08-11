@@ -860,7 +860,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		const std::uint64_t expectedAccount = handoff.Account();
 		const std::uint64_t expectedConnection = handoff.FailedConnection();
 		const Policy::RecoveryHandoffResult begin = handoff.BeginBaseline(
-			account, failedConnection, authenticated, ServerTime());
+			account, authenticated, ServerTime());
 		if (begin == Policy::RecoveryHandoffResult::OwnershipMismatch)
 		{
 			handoff.Reset();
@@ -874,9 +874,10 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		if (begin != Policy::RecoveryHandoffResult::BeginBaseline)
 			return "the engine reconnect did not begin an authenticated recovery baseline within its bounded handoff window";
 
-		// This is the first instruction at the engine's new ServerInfo boundary. Until
-		// here the failed ClientPin remained required, so no old-join request could see
-		// native delivery. Advance the epoch now and consume the account latch atomically.
+		// This is the first instruction at the engine's new ServerInfo boundary. The
+		// reconnect can run ClientDisconnect/ClientConnect in either order around this
+		// hook, so begin a fresh epoch here unconditionally and consume the account latch
+		// atomically. No old-join request can observe this new native lane.
 		StartClientEpoch(slot);
 		ClientPin& recovery = state.clients[slot];
 		if (!BindResolvedIdentity(slot, recovery) || recovery.steamID64 != expectedAccount ||
@@ -921,7 +922,20 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 
 		if (client.optOut || (client.requiredLane && client.ready))
 		{
-			state.requiredRecovery.Clear(client.steamID64);
+			const Policy::RecoveryClearResult cleared =
+				state.requiredRecovery.ClearAfterSuccessfulConnection(
+					client.steamID64, client.connectionSerial);
+			if (cleared == Policy::RecoveryClearResult::SameFailedConnection)
+			{
+				Warning(PROJECT_NAME " - luapack: retained required recovery state for slot %i (%llu); the connection that armed it cannot clear its own latch\n",
+					slot, static_cast<unsigned long long>(client.steamID64));
+				return;
+			}
+			if (cleared == Policy::RecoveryClearResult::Cleared)
+			{
+				Msg(PROJECT_NAME " - luapack: client slot %i (%llu) reached a distinct authenticated successful connection; prior recovery state cleared\n",
+					slot, static_cast<unsigned long long>(client.steamID64));
+			}
 			client.recoveryStateCleared = true;
 		}
 	}
@@ -957,8 +971,11 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 				case Policy::RecoveryHandoffResult::AlreadyInvoked:
 					break;
 				case Policy::RecoveryHandoffResult::Expired:
-					DisconnectRequiredClient(slot,
-						"the engine reconnect did not begin its native ServerInfo baseline within the bounded handoff window");
+					if (account == expectedAccount)
+					{
+						DisconnectRequiredClient(slot,
+							"the engine reconnect did not begin its native ServerInfo baseline within the bounded handoff window");
+					}
 					break;
 				case Policy::RecoveryHandoffResult::OwnershipMismatch:
 					handoff.Reset();
@@ -1762,6 +1779,9 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		for (Policy::RequiredRecoveryHandoff& handoff : state.recoveryHandoffs)
 			handoff.Reset();
 		state.nativeLatches.clear();
+		if (state.requiredRecovery.Size() != 0)
+			Msg(PROJECT_NAME " - luapack: clearing %llu required recovery entries at module shutdown\n",
+				static_cast<unsigned long long>(state.requiredRecovery.Size()));
 		state.requiredRecovery.Reset();
 		state.nextConnectionSerial = 0;
 		luapack_manifest.SetValue("");
@@ -1911,6 +1931,9 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			// Disabling the feature forgets speculation-failure history; nothing consults it
 			// while all delivery is native anyway.
 			state.nativeLatches.clear();
+			if (state.requiredRecovery.Size() != 0)
+				Msg(PROJECT_NAME " - luapack: clearing %llu required recovery entries because LuaPack was disabled\n",
+					static_cast<unsigned long long>(state.requiredRecovery.Size()));
 			state.requiredRecovery.Reset();
 			if (luapack_manifest.GetString()[0] != '\0')
 				luapack_manifest.SetValue("");
@@ -2164,9 +2187,11 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		if (!IsValidSlot(slot))
 			return;
 
-		// A real network connection supersedes any per-slot engine handoff request. The
-		// SteamID64 latch remains account-keyed and may be consumed by this new epoch.
-		state.recoveryHandoffs[slot].Reset();
+		// A real network connection supersedes a merely queued request. Once the engine
+		// reconnect was invoked, preserve its gate across Source's disconnect/connect
+		// callback ordering; authenticated ServerInfo ownership decides whether to consume it.
+		if (!state.recoveryHandoffs[slot].Invoked())
+			state.recoveryHandoffs[slot].Reset();
 		StartClientEpoch(slot);
 	}
 
@@ -2217,7 +2242,11 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			return;
 
 		ClientPin& client = state.clients[slot];
-		state.recoveryHandoffs[slot].Reset();
+		// CBaseClient::Reconnect can report a disconnect before the replacement
+		// ServerInfo. Keep an invoked handoff for that exact authenticated boundary, but
+		// discard a queued request that never reached the engine primitive.
+		if (!state.recoveryHandoffs[slot].Invoked())
+			state.recoveryHandoffs[slot].Reset();
 		// A speculated join that never acknowledged its generation is treated as failed even
 		// without the client's explicit recovery command: its channel may have died before
 		// that command flushed. Latching here is what makes every failure path converge —
