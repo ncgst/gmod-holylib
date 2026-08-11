@@ -1201,14 +1201,21 @@ struct ClientLuaBaselineHashOverride
 	CNetworkStringTableItem* item = nullptr;
 	unsigned char* originalData = nullptr;
 	int originalLength = 0;
-	std::array<unsigned char, 32> nativeHash{};
+	std::array<unsigned char, 32> replacementHash{};
 };
 
-class ScopedNativeLuaBaseline
+class ScopedClientLuaBaseline
 {
 public:
-	ScopedNativeLuaBaseline()
+	explicit ScopedClientLuaBaseline(HolyLib::LuaPack::BaselineAction action)
 	{
+		if (action != HolyLib::LuaPack::BaselineAction::CanonicalStub &&
+			action != HolyLib::LuaPack::BaselineAction::NativeSource)
+		{
+			failure = "unsupported Lua baseline action";
+			return;
+		}
+
 		if (!g_pDataPack || !g_pDataPack->m_pClientLuaFiles)
 		{
 			failure = "client_lua_files is unavailable";
@@ -1228,43 +1235,63 @@ public:
 		for (int fileID = 1; fileID < fileCount; ++fileID)
 		{
 			const char* fileName = networkTable->GetString(fileID);
-			if (!fileName || HolyLib::LuaPack::IsInitFile(fileName))
+			if (!fileName)
 				continue;
 
-			std::string source;
-			bool hasSource = false;
-			LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID);
-			if (entry)
+			std::string baselineSource;
+			if (action == HolyLib::LuaPack::BaselineAction::CanonicalStub &&
+				!HolyLib::LuaPack::IsInitFile(fileName))
 			{
-				std::shared_lock<std::shared_mutex> lock(entry->mutex);
-				if (entry->hasSourceContent)
+				// Required delivery uses one generation-independent placeholder for every
+				// non-init entry. It does not depend on the ordinary per-file compression
+				// worker having reached this file yet.
+				baselineSource = HolyLib::LuaPack::PrepareVanillaFile(fileName, "");
+			}
+			else
+			{
+				std::string source;
+				bool hasSource = false;
+				LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID);
+				if (entry)
 				{
-					source = entry->sourceContent;
-					hasSource = true;
+					std::shared_lock<std::shared_mutex> lock(entry->mutex);
+					if (entry->hasSourceContent)
+					{
+						source = entry->sourceContent;
+						hasSource = true;
+					}
 				}
-			}
 
-			if (!hasSource)
-			{
-				GarrysMod::Lua::LuaFile* luaFile = Lua::GetShared()->GetCache(fileName);
-				if (luaFile)
+				if (!hasSource)
 				{
-					source = luaFile->contents;
-					hasSource = true;
+					GarrysMod::Lua::LuaFile* luaFile = Lua::GetShared()
+						? Lua::GetShared()->GetCache(fileName)
+						: nullptr;
+					if (luaFile)
+					{
+						source = luaFile->contents;
+						hasSource = true;
+					}
 				}
+
+				if (!hasSource)
+				{
+					failure = std::string("source is unavailable for ") + fileName;
+					Restore();
+					return;
+				}
+
+				// includes/init.lua remains real in both lanes because it installs the
+				// resolver. Native non-init entries use their unmodified source bytes.
+				baselineSource = HolyLib::LuaPack::IsInitFile(fileName)
+					? HolyLib::LuaPack::PrepareVanillaFile(fileName, source)
+					: source;
 			}
 
-			if (!hasSource)
-			{
-				failure = std::string("native source is unavailable for ") + fileName;
-				Restore();
-				return;
-			}
-
-			std::vector<unsigned char> hash = HashString(source.c_str(), source.length() + 1);
+			std::vector<unsigned char> hash = HashString(baselineSource.c_str(), baselineSource.length() + 1);
 			if (hash.size() != 32)
 			{
-				failure = std::string("native SHA256 could not be built for ") + fileName;
+				failure = std::string("SHA256 could not be built for ") + fileName;
 				Restore();
 				return;
 			}
@@ -1275,15 +1302,15 @@ public:
 			replacement.item = &item;
 			replacement.originalData = item.m_pUserData;
 			replacement.originalLength = item.m_nUserDataLength;
-			std::copy(hash.begin(), hash.end(), replacement.nativeHash.begin());
-			item.m_pUserData = replacement.nativeHash.data();
-			item.m_nUserDataLength = static_cast<int>(replacement.nativeHash.size());
+			std::copy(hash.begin(), hash.end(), replacement.replacementHash.begin());
+			item.m_pUserData = replacement.replacementHash.data();
+			item.m_nUserDataLength = static_cast<int>(replacement.replacementHash.size());
 		}
 
 		valid = true;
 	}
 
-	~ScopedNativeLuaBaseline()
+	~ScopedClientLuaBaseline()
 	{
 		Restore();
 	}
@@ -1310,53 +1337,6 @@ private:
 	bool valid = false;
 };
 
-static bool ValidateCanonicalLuaBaseline(std::string& failure)
-{
-	if (!g_pDataPack || !g_pDataPack->m_pClientLuaFiles)
-	{
-		failure = "client_lua_files is unavailable";
-		return false;
-	}
-
-	INetworkStringTable* table = g_pDataPack->m_pClientLuaFiles;
-	for (int fileID = 1; fileID < table->GetNumStrings(); ++fileID)
-	{
-		const char* fileName = table->GetString(fileID);
-		if (!fileName || HolyLib::LuaPack::IsInitFile(fileName))
-			continue;
-
-		LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID);
-		if (!entry)
-		{
-			failure = std::string("canonical cache entry is unavailable for ") + fileName;
-			return false;
-		}
-
-		std::vector<unsigned char> expectedHash;
-		{
-			std::shared_lock<std::shared_mutex> lock(entry->mutex);
-			if (!entry->hasSourceContent || !entry->IsReady() ||
-				entry->content != HolyLib::LuaPack::PrepareVanillaFile(fileName, entry->sourceContent))
-			{
-				failure = std::string("canonical placeholder is not ready for ") + fileName;
-				return false;
-			}
-			expectedHash = HashString(entry->content.c_str(), entry->content.length() + 1);
-		}
-
-		int actualLength = 0;
-		const void* actualHash = table->GetStringUserData(fileID, &actualLength);
-		if (!actualHash || actualLength != static_cast<int>(expectedHash.size()) ||
-			memcmp(actualHash, expectedHash.data(), expectedHash.size()) != 0)
-		{
-			failure = std::string("client_lua_files still has a noncanonical hash for ") + fileName;
-			return false;
-		}
-	}
-
-	return true;
-}
-
 static Detouring::Hook detour_CBaseClient_SendServerInfo;
 static bool hook_CBaseClient_SendServerInfo(CBaseClient* client)
 {
@@ -1369,27 +1349,16 @@ static bool hook_CBaseClient_SendServerInfo(CBaseClient* client)
 		return false;
 	}
 
-	if (baseline.action == HolyLib::LuaPack::BaselineAction::CanonicalStub)
-	{
-		std::string validationFailure;
-		if (!ValidateCanonicalLuaBaseline(validationFailure))
-		{
-			if (client)
-				client->Disconnect("Required LuaPack baseline is not ready: %s", validationFailure.c_str());
-			return false;
-		}
-	}
-
-	if (baseline.action != HolyLib::LuaPack::BaselineAction::NativeSource)
+	if (baseline.action == HolyLib::LuaPack::BaselineAction::Unchanged)
 	{
 		return detour_CBaseClient_SendServerInfo.GetTrampoline<Symbols::CBaseClient_SendServerInfo>()(client);
 	}
 
-	ScopedNativeLuaBaseline nativeBaseline;
-	if (!nativeBaseline.IsValid())
+	ScopedClientLuaBaseline clientBaseline(baseline.action);
+	if (!clientBaseline.IsValid())
 	{
 		if (client)
-			client->Disconnect("Native Lua rescue could not prepare a consistent file baseline: %s", nativeBaseline.Failure());
+			client->Disconnect("Lua delivery could not prepare a consistent file baseline: %s", clientBaseline.Failure());
 		return false;
 	}
 

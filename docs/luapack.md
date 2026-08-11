@@ -53,9 +53,9 @@ The ingest worker is asynchronous and non-fatal. Requests carry the object path,
 
 ## Required join mode and native opt-out
 
-`holylib_gmoddatapack_luapack_required 1` makes LuaPack canonical for new connections. The server still sends the real `includes/init.lua` so the resolver exists, then responds to each remaining requested file ID with a tiny reliable placeholder equivalent to `return __holypack("<generation>", true)()`. The second argument marks the payload fail-closed: if the immutable object is absent, corrupt, unparsable, MD5-invalid, or missing that file, the bootstrap reports failure without scheduling `retry`; the server kicks with opt-out instructions.
+`holylib_gmoddatapack_luapack_required 1` makes LuaPack canonical for new connections. The server still sends the real `includes/init.lua` so the resolver exists, while every remaining file uses the generation-independent placeholder `return __holypack()()`. Before Source serializes `client_lua_files` for one connection, required clients temporarily receive that placeholder's SHA256 baseline and native opt-out clients receive the real source hashes. Each file response repeats its exact hash as a targeted reliable string-table update before the body. The replicated manifest selects the pinned generation, and the replicated required policy makes an absent, corrupt, unparsable, MD5-invalid, or incomplete pack report failure without scheduling `retry`; the server then kicks with opt-out instructions.
 
-The lane is fixed on the first Lua request. A player who needs native Lua must set this Garry's Mod launch option and restart before joining:
+The lane is fixed while the per-client server-info baseline is serialized, before Requesting Lua begins. A player who needs native Lua must set this Garry's Mod launch option and restart before joining:
 
 ```text
 +tv_nochat no_gluapack
