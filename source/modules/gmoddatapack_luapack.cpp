@@ -36,6 +36,7 @@
 #include <mutex>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // memdbgon must be the last include file in a .cpp file!!!
@@ -317,6 +318,7 @@ do
 				local length = a * 16777216 + b * 65536 + c * 256 + d
 				if length < 0 or cursor + length - 1 > #contents then return nil, "truncated entry payload" end
 				local source = string.sub(contents, cursor, cursor + length - 1); cursor = cursor + length
+				if pack.vfs[sourceKey] ~= nil then return nil, "duplicate exact source key" end
 				pack.vfs[sourceKey] = source
 				pack.vfsLCL[localKeyOne] = source
 				pack.vfsLCL[localKeyTwo] = source
@@ -699,11 +701,15 @@ end)
 
 		size_t offset = 1;
 		size_t fileIndex = 0;
+		std::unordered_set<std::string> sourceKeys;
 		while (offset < dataLength)
 		{
 			if (dataLength - offset < (16 * 3) + 4 || fileIndex >= task->files.size())
 				return false;
 
+			const std::string sourceKey(reinterpret_cast<const char*>(data + offset), 16);
+			if (!sourceKeys.insert(sourceKey).second)
+				return false;
 			offset += 16 * 3;
 			const unsigned int contentLength =
 				(static_cast<unsigned int>(data[offset]) << 24) |
@@ -1905,7 +1911,10 @@ end)
 		{
 			std::lock_guard<std::mutex> lock(state.registryMutex);
 			FileRecord& record = state.files[virtualPath];
-			const std::string sourcePath = NormalizePath(file->source.empty() ? file->name : file->source);
+			// LuaFile::source is registration provenance (often the AddCSLuaFile caller),
+			// so hundreds of unrelated entries can share it. The client executes the
+			// registered string-table path; use that unique virtual path for exact lookup.
+			const std::string sourcePath = virtualPath;
 			if (record.contents == file->contents && record.sourcePath == sourcePath)
 				return;
 
