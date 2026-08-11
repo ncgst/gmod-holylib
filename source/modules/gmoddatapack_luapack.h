@@ -73,6 +73,7 @@ namespace HolyLib::LuaPack
 	std::string PrepareVanillaFile(const std::string& virtualPath, const std::string& contents);
 	bool ConsumeBootstrapRefresh();
 	DeliveryDecision DecideDeliveryForClient(int slot, const std::string& virtualPath, size_t nativeSourceBytes);
+	bool IsRequiredDeliveryClient(int slot);
 	void DisconnectRequiredClient(int slot, const char* failure);
 	void ClientConnect(int slot);
 	void ClientActive(int slot);

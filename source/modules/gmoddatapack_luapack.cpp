@@ -2023,6 +2023,11 @@ end)
 		return {DeliveryAction::Stub, generation->second.compressedStub.get(), nullptr};
 	}
 
+	bool IsRequiredDeliveryClient(int slot)
+	{
+		return IsEnabled() && IsValidSlot(slot) && state.clients[slot].requiredLane;
+	}
+
 	void DisconnectRequiredClient(int slot, const char* failure)
 	{
 		if (!IsValidSlot(slot))
