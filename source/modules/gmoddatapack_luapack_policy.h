@@ -367,9 +367,48 @@ namespace HolyLib::LuaPack::Policy
 		return !recoveryEnabled || (resolvedIdentity && authenticatedIdentity);
 	}
 
+	constexpr bool RejectUnavailableRequiredAdmission(bool enabled, bool required,
+		bool canonicalRegistration)
+	{
+		return enabled && required && !canonicalRegistration;
+	}
+
+	constexpr bool UsesCanonicalRegistration(bool enabled, bool canonicalRegistration)
+	{
+		return enabled && canonicalRegistration;
+	}
+
+	constexpr bool UsesPassthroughProcessing(bool enabled)
+	{
+		return enabled;
+	}
+
+	constexpr bool RegistrationModeMatches(bool cachedCanonical, bool cachedPassthrough,
+		bool enabled, bool canonicalRegistration)
+	{
+		return cachedCanonical == UsesCanonicalRegistration(enabled, canonicalRegistration) &&
+			cachedPassthrough == UsesPassthroughProcessing(enabled);
+	}
+
+	constexpr bool RegistrationNeedsHashPublication(bool cachedCanonical, bool cachedPassthrough,
+		bool hasSource, bool contentReady, bool hashPublished,
+		bool enabled, bool canonicalRegistration)
+	{
+		return !hasSource || !contentReady || !hashPublished ||
+			!RegistrationModeMatches(cachedCanonical, cachedPassthrough,
+				enabled, canonicalRegistration);
+	}
+
+	constexpr bool NeedsOrderedCanonicalHash(bool clientActive, bool nativeHashKnown,
+		bool publishedHashMatchesCanonical)
+	{
+		return clientActive || nativeHashKnown || publishedHashMatchesCanonical;
+	}
+
 	constexpr bool NeedsPerClientNativeHashes(Lane lane)
 	{
-		return lane == Lane::Required || lane == Lane::NativeRecovery;
+		return lane == Lane::Required || lane == Lane::NativeRecovery ||
+			lane == Lane::NativeOptOut || lane == Lane::NativeRescue;
 	}
 
 	constexpr bool ShouldPreserveRecoveryLifecycle(bool gameLayerCallback,
@@ -410,11 +449,11 @@ namespace HolyLib::LuaPack::Policy
 			(!canonicalRegistration || base != BaseAvailability::Ready ? Action::Reject : Action::CanonicalStub);
 	}
 
-	constexpr Action SelectFile(Lane lane, BaseAvailability base, bool bootstrap,
-		bool nativeDelta)
+	constexpr Action SelectFile(Lane lane, bool canonicalRegistration,
+		BaseAvailability base, bool bootstrap, bool nativeDelta)
 	{
 		return lane != Lane::Required ? Action::Native :
-			(base != BaseAvailability::Ready ? Action::Reject :
+			(!canonicalRegistration || base != BaseAvailability::Ready ? Action::Reject :
 				(bootstrap || nativeDelta ? Action::Native : Action::CanonicalStub));
 	}
 
@@ -465,16 +504,58 @@ namespace HolyLib::LuaPack::Policy
 		"the explicit opt-out lane must remain wholly native");
 	static_assert(SelectBaseline(Lane::NativeRecovery, true, BaseAvailability::Ready) == Action::Native,
 		"a consumed recovery latch must be wholly native from its baseline");
+	static_assert(RejectUnavailableRequiredAdmission(true, true, false),
+		"required mode must reject before a cached client can bypass an unavailable baseline hook");
+	static_assert(!RejectUnavailableRequiredAdmission(true, true, true),
+		"required admission is available when every canonical delivery hook is active");
+	static_assert(!RejectUnavailableRequiredAdmission(true, false, false),
+		"native rescue remains available when required mode is disabled");
+	static_assert(UsesCanonicalRegistration(true, true),
+		"enabled supported registration must use canonical LuaPack contents");
+	static_assert(!UsesCanonicalRegistration(false, true),
+		"the kill switch must restore native registration");
+	static_assert(!UsesCanonicalRegistration(true, false),
+		"unsupported registration must remain native");
+	static_assert(UsesPassthroughProcessing(true),
+		"LuaPack processing must preserve the same raw bytes captured for native and packed bodies");
+	static_assert(!UsesPassthroughProcessing(false),
+		"stock gmoddatapack token processing must resume when LuaPack is disabled");
+	static_assert(!RegistrationModeMatches(true, true, false, true),
+		"disabling LuaPack must invalidate a cached canonical body");
+	static_assert(!RegistrationModeMatches(false, false, true, true),
+		"enabling supported LuaPack must invalidate a cached native body");
+	static_assert(!RegistrationModeMatches(false, false, true, false),
+		"enabling native rescue must invalidate a token-processed native registration");
+	static_assert(RegistrationNeedsHashPublication(true, true, true, true, true, false, true),
+		"a stale canonical body must publish native identity before the kill switch can send it");
+	static_assert(RegistrationNeedsHashPublication(true, true, true, false, false, true, true),
+		"a matching mode is not observable until its replacement hash is published");
+	static_assert(RegistrationNeedsHashPublication(true, true, true, true, false, true, true),
+		"worker processing is not publication until the main thread updates the string table");
+	static_assert(RegistrationNeedsHashPublication(false, false, false, true, true, false, true),
+		"an uninitialized native cache entry must capture source before publishing or sending");
+	static_assert(!RegistrationNeedsHashPublication(true, true, true, true, true, true, true),
+		"a ready canonical body with a matching mode needs no transition repair");
+	static_assert(NeedsOrderedCanonicalHash(true, false, false),
+		"an active client must receive canonical identity before its restored stub body");
+	static_assert(!NeedsOrderedCanonicalHash(false, false, false),
+		"a joining client already received canonical identity in its ServerInfo baseline");
 	static_assert(NeedsPerClientNativeHashes(Lane::NativeRecovery),
 		"required recovery still needs per-client native hash identity");
-	static_assert(SelectFile(Lane::Required, BaseAvailability::Ready, false, false) == Action::CanonicalStub,
+	static_assert(NeedsPerClientNativeHashes(Lane::NativeOptOut),
+		"native opt-out hot refreshes need per-client native hash identity");
+	static_assert(NeedsPerClientNativeHashes(Lane::NativeRescue),
+		"native rescue hot refreshes need per-client native hash identity");
+	static_assert(SelectFile(Lane::Required, true, BaseAvailability::Ready, false, false) == Action::CanonicalStub,
 		"an unchanged base file must use the canonical stub");
-	static_assert(SelectFile(Lane::Required, BaseAvailability::Ready, false, true) == Action::Native,
+	static_assert(SelectFile(Lane::Required, true, BaseAvailability::Ready, false, true) == Action::Native,
 		"a file changed from the base must use native delivery");
-	static_assert(SelectFile(Lane::Required, BaseAvailability::Ready, true, false) == Action::Native,
+	static_assert(SelectFile(Lane::Required, true, BaseAvailability::Ready, true, false) == Action::Native,
 		"the bootstrap must always use native delivery");
-	static_assert(SelectFile(Lane::Required, BaseAvailability::Missing, false, true) == Action::Reject,
+	static_assert(SelectFile(Lane::Required, true, BaseAvailability::Missing, false, true) == Action::Reject,
 		"a native delta must never turn a missing required base into whole-join fallback");
+	static_assert(SelectFile(Lane::Required, false, BaseAvailability::Ready, true, false) == Action::Reject,
+		"required delivery must fail closed without the per-client baseline hook");
 	static_assert(ShouldBuildMapBase(false, true), "the initial map base must be buildable");
 	static_assert(!ShouldBuildMapBase(true, true), "hotfixes must not rotate the immutable map base");
 }

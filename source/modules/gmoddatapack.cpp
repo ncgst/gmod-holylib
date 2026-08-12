@@ -47,6 +47,9 @@ public:
 	const char* Name() override { return "gmoddatapack"; };
 	int Compatibility() override { return LINUX32 | LINUX64 | WINDOWS32 | WINDOWS64; };
 	bool IsEnabledByDefault() override { return false; }; // ToDo: Figure out what inside of here is behaving very randomly
+	// client_lua_files may contain LuaPack canonical identities. Runtime removal would
+	// detach the body-selection hooks without an atomic native baseline replacement.
+	bool CanDisableAtRuntime() override { return false; };
 };
 
 static ConVar gmoddatapack_removeserverif("holylib_gmoddatapack_removeserverif", "0", 0, "If enabled, \"if SERVER then\" code blocks are removed from client files");
@@ -56,23 +59,36 @@ static ConVar gmoddatapack_fastnetworking("holylib_gmoddatapack_fastnetworking",
 static CGModDataPackModule g_pGModDataPackModule;
 IModule* pGModDataPackModule = &g_pGModDataPackModule;
 
-// Required-lane connections begin with canonical hashes for unchanged map-base
-// files and native hashes for current deltas. Remember the exact per-client
-// native identities so the initial delta request does not redundantly rewrite
-// its already-installed baseline hash, while later hotfixes still can.
+// Linux connections begin from globally canonical hashes. Remember the exact
+// per-client native identities for every lane so initial native baselines do not
+// receive duplicate updates while later hot refreshes can repair their identity.
 using ClientLuaHash = std::array<unsigned char, 32>;
-static std::array<std::unordered_map<int, ClientLuaHash>, ABSOLUTE_PLAYER_LIMIT> g_requiredNativeLuaHashes;
+static std::array<std::unordered_map<int, ClientLuaHash>, ABSOLUTE_PLAYER_LIMIT> g_clientNativeLuaHashes;
+static std::array<std::unordered_map<int, ClientLuaHash>, ABSOLUTE_PLAYER_LIMIT> g_clientHashUpdatesPending;
 
-static void ClearRequiredNativeLuaHashes(int slot)
+static void ClearClientNativeLuaHashes(int slot)
 {
 	if (slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT)
-		g_requiredNativeLuaHashes[slot].clear();
+	{
+		g_clientNativeLuaHashes[slot].clear();
+		g_clientHashUpdatesPending[slot].clear();
+	}
 }
 
-static void ClearRequiredNativeLuaHashForAllClients(int fileID)
+static void ClearClientNativeLuaHashForAllClients(int fileID, const ClientLuaHash* publishedHash = nullptr)
 {
-	for (auto& nativeHashes : g_requiredNativeLuaHashes)
-		nativeHashes.erase(fileID);
+	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
+	{
+		auto& pendingHashes = g_clientHashUpdatesPending[slot];
+		const bool nativeMarkerErased = g_clientNativeLuaHashes[slot].erase(fileID) > 0;
+		if (nativeMarkerErased || pendingHashes.find(fileID) != pendingHashes.end())
+		{
+			if (publishedHash)
+				pendingHashes[fileID] = *publishedHash;
+			else
+				pendingHashes.erase(fileID);
+		}
+	}
 }
 
 static int ClientSlotFromEdict(edict_t* pClient)
@@ -839,9 +855,11 @@ public:
 			content = "";
 			compressed.Clear();
 			processed = false;
+			hashPublished = false;
 			removeServerCode = false;
 			removeComments = false;
-			luapackBootstrap = false;
+			luapackCanonical = false;
+			luapackPassthrough = false;
 		}
 
 		std::string sourceContent = "";
@@ -850,13 +868,43 @@ public:
 		std::shared_mutex mutex; // Per entry instead of a global mutex to avoid blocking the main thread for other entries while compressing
 		bool hasSourceContent = false;
 		bool processed = false;
+		bool hashPublished = false;
 		bool removeServerCode = false;
 		bool removeComments = false;
-		bool luapackBootstrap = false;
+		bool luapackCanonical = false;
+		bool luapackPassthrough = false;
 	};
 
 	void Initialize();
 	void Shutdown();
+	bool PublishRegistrationHash(int fileID)
+	{
+		if (!g_pDataPack || !g_pDataPack->m_pClientLuaFiles)
+			return false;
+		LuaPackEntry* entry = GetPackEntry(fileID);
+		if (!entry)
+			return false;
+
+		std::lock_guard<std::shared_mutex> lock(entry->mutex);
+		if (!entry->IsContentReady())
+		{
+			// Publish the replacement identity on the main thread before the new mode can
+			// serve a body. The worker may still compress it asynchronously afterwards.
+			ProcessContent(entry, fileID);
+		}
+		if (entry->IsContentReady() && !entry->hashPublished)
+		{
+			std::vector<unsigned char> hash = HashString(entry->content.c_str(), entry->content.length() + 1);
+			ClientLuaHash publishedHash{};
+			if (hash.size() != publishedHash.size())
+				return false;
+			std::copy(hash.begin(), hash.end(), publishedHash.begin());
+			ClearClientNativeLuaHashForAllClients(fileID, &publishedHash);
+			g_pDataPack->m_pClientLuaFiles->SetStringUserData(fileID, hash.size(), hash.data());
+			entry->hashPublished = true;
+		}
+		return entry->IsContentReady() && entry->hashPublished;
+	}
 
 	void AddFileContents(std::string fileName, std::string content)
 	{
@@ -877,8 +925,11 @@ public:
 		std::lock_guard<std::shared_mutex> lock(pEntry.mutex);
 		bool bRemoveServerCode = gmoddatapack_removeserverif.GetBool();
 		bool bRemoveComments = gmoddatapack_removecomments.GetBool();
-		bool bLuaPackBootstrap = HolyLib::LuaPack::IsEnabled();
-		if (bLuaPackBootstrap && (bRemoveServerCode || bRemoveComments))
+		const bool bLuaPackEnabled = HolyLib::LuaPack::IsEnabled();
+		const bool bCanonicalRegistration = HolyLib::LuaPack::SupportsCanonicalRegistration();
+		const bool bLuaPackCanonical = HolyLib::LuaPack::Policy::UsesCanonicalRegistration(
+			bLuaPackEnabled, bCanonicalRegistration);
+		if (bLuaPackEnabled && (bRemoveServerCode || bRemoveComments))
 		{
 			// Luapack requires one canonical byte stream: the stringtable hash comes from this
 			// processed content, but pack capture and the engine-native send path both carry the
@@ -895,12 +946,19 @@ public:
 		}
 		bool bSameSource = pEntry.hasSourceContent && pEntry.sourceContent == content;
 		bool bSameProcessConfig = pEntry.removeServerCode == bRemoveServerCode && pEntry.removeComments == bRemoveComments &&
-			pEntry.luapackBootstrap == bLuaPackBootstrap;
+			HolyLib::LuaPack::Policy::RegistrationModeMatches(pEntry.luapackCanonical,
+				pEntry.luapackPassthrough,
+				bLuaPackEnabled, bCanonicalRegistration);
 		if (bSameSource && pEntry.IsContentReady() && bSameProcessConfig) // Nothing changed
 		{
 			std::vector<unsigned char> pHash = HashString(pEntry.content.c_str(), pEntry.content.length() + 1);
-			ClearRequiredNativeLuaHashForAllClients(fileID);
+			ClientLuaHash publishedHash{};
+			if (pHash.size() == publishedHash.size())
+				std::copy(pHash.begin(), pHash.end(), publishedHash.begin());
+			ClearClientNativeLuaHashForAllClients(fileID,
+				pHash.size() == publishedHash.size() ? &publishedHash : nullptr);
 			g_pDataPack->m_pClientLuaFiles->SetStringUserData(fileID, pHash.size(), pHash.data());
+			pEntry.hashPublished = true;
 
 			return;
 		}
@@ -911,8 +969,10 @@ public:
 		pEntry.content = HolyLib::LuaPack::PrepareVanillaFile(fileName, content);
 		pEntry.removeServerCode = bRemoveServerCode;
 		pEntry.removeComments = bRemoveComments;
-		pEntry.luapackBootstrap = bLuaPackBootstrap;
+		pEntry.luapackCanonical = bLuaPackCanonical;
+		pEntry.luapackPassthrough = HolyLib::LuaPack::Policy::UsesPassthroughProcessing(bLuaPackEnabled);
 		pEntry.processed = false;
+		pEntry.hashPublished = false;
 
 		if (g_pGModDataPackModule.InDebug())
 			Msg(PROJECT_NAME " - gmoddatapack: Added fileID %i into compression queue!\n", fileID);
@@ -959,21 +1019,35 @@ public:
 
 	void ProcessContent(LuaPackEntry* pEntry, int fileID)
 	{
-		bool bError;
-		std::string strippedContent = StripContent(pEntry->content, &bError, fileID, pEntry->removeServerCode, pEntry->removeComments);
-		if (bError)
+		if (!pEntry->luapackPassthrough)
 		{
-			Warning(PROJECT_NAME " - gmoddatapack: Failed to strip fileID \"%i\" due to lua errors! (%s)", fileID, strippedContent.c_str());
-		} else {
-			pEntry->content = strippedContent;
+			bool bError;
+			std::string strippedContent = StripContent(pEntry->content, &bError, fileID,
+				pEntry->removeServerCode, pEntry->removeComments);
+			if (bError)
+			{
+				Warning(PROJECT_NAME " - gmoddatapack: Failed to strip fileID \"%i\" due to lua errors! (%s)", fileID, strippedContent.c_str());
+			} else {
+				pEntry->content = strippedContent;
+			}
 		}
+		// LuaPack passthrough deliberately skips tokenization and Lua hook access. This
+		// keeps the raw registered bytes identical to pack capture/native delivery and
+		// lets transition publication remain independent of the worker's Lua-state lock.
 		pEntry->processed = true;
 
 		if (ThreadInMainThread()) // SetStringUserData is NOT thread safe!
 		{
 			std::vector<unsigned char> pHash = HashString(pEntry->content.c_str(), pEntry->content.length() + 1);
+			ClientLuaHash publishedHash{};
+			if (pHash.size() == publishedHash.size())
+				std::copy(pHash.begin(), pHash.end(), publishedHash.begin());
+			ClearClientNativeLuaHashForAllClients(fileID,
+				pHash.size() == publishedHash.size() ? &publishedHash : nullptr);
 			g_pDataPack->m_pClientLuaFiles->SetStringUserData(fileID, pHash.size(), pHash.data());
+			pEntry->hashPublished = true;
 		} else {
+			pEntry->hashPublished = false;
 			std::lock_guard<std::mutex> lock(m_pStringTableUpdateQueueMutex);
 			m_pStringTableUpdateQueue.push_back(fileID);
 		}
@@ -1182,12 +1256,9 @@ void LuaDataPack::Initialize()
 			if (!luaFile)
 				continue;
 
-			HolyLib::LuaPack::CaptureFile(luaFile);
-
-			LuaPackEntry* pEntry = GetPackEntry(fileID);
-			if (!pEntry || pEntry->IsReady())
-				continue;
-
+			HolyLib::LuaPack::CaptureFileContents(fileName, luaFile->contents);
+			// Re-feed ready entries too. AddFileContents reuses an exact source/mode match,
+			// but invalidates stale native/canonical bodies after a module reload or hook change.
 			AddFileContents(fileName, luaFile->contents);
 		}
 	}
@@ -1250,7 +1321,7 @@ public:
 					HolyLib::LuaPack::NeedsNativeHashUpdate(slot)));
 		if (trackNativeBaseline)
 		{
-			g_requiredNativeLuaHashes[slot].clear();
+			g_clientNativeLuaHashes[slot].clear();
 		}
 
 		INetworkStringTable* networkTable = g_pDataPack->m_pClientLuaFiles;
@@ -1360,7 +1431,7 @@ public:
 
 		if (trackNativeBaseline)
 		{
-			auto& nativeHashes = g_requiredNativeLuaHashes[slot];
+			auto& nativeHashes = g_clientNativeLuaHashes[slot];
 			nativeHashes.insert(nativeBaselineHashes.begin(), nativeBaselineHashes.end());
 		}
 		valid = true;
@@ -1424,6 +1495,26 @@ static bool hook_CBaseClient_SendServerInfo(CBaseClient* client)
 #endif
 
 static Detouring::Hook detour_GModDataPack_AddOrUpdateFile;
+static Detouring::Hook detour_GModDataPack_SendFileToClient;
+
+bool HolyLib::LuaPack::SupportsCanonicalRegistration()
+{
+	// Required delivery needs all three hooks: global canonical registration, the
+	// per-connection baseline override, and canonical/native body selection. Platform
+	// support alone is not enough; any disabled, unresolved, or failed detour must keep
+	// required admission closed.
+#if defined(SYSTEM_LINUX)
+	return DETOUR_ISVALID(detour_CBaseClient_SendServerInfo) &&
+		DETOUR_ISENABLED(detour_CBaseClient_SendServerInfo) &&
+		DETOUR_ISVALID(detour_GModDataPack_AddOrUpdateFile) &&
+		DETOUR_ISENABLED(detour_GModDataPack_AddOrUpdateFile) &&
+		DETOUR_ISVALID(detour_GModDataPack_SendFileToClient) &&
+		DETOUR_ISENABLED(detour_GModDataPack_SendFileToClient);
+#else
+	return false;
+#endif
+}
+
 static void hook_GModDataPack_AddOrUpdateFile(GModDataPack* pDataPack, GarrysMod::Lua::LuaFile* file, bool bReCompress)
 {
 	g_pDataPack = pDataPack;
@@ -1498,7 +1589,6 @@ static void SendLuaFile(int clientIdx, int fileID, LuaDataPack::LuaPackEntry* pE
 	SendCompressedLuaFile(clientIdx, fileID, pEntry->compressed);
 }
 
-static Detouring::Hook detour_GModDataPack_SendFileToClient;
 static void SendOriginalLuaFile(GModDataPack* pDataPack, int clientIdx, int fileID)
 {
 	detour_GModDataPack_SendFileToClient.GetTrampoline<Symbols::GModDataPack_SendFileToClient>()(pDataPack, clientIdx, fileID);
@@ -1590,9 +1680,62 @@ static void DisconnectLuaHashFailure(int clientIdx, const char* fileName, const 
 		client->Disconnect("Lua delivery identity failed for %s", fileName ? fileName : "an unknown file");
 }
 
+static bool RefreshRegistrationModeForRequest(int fileID, const std::string& fileName,
+	GarrysMod::Lua::LuaFile* luaFile)
+{
+	LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID);
+	if (!entry)
+		return true;
+
+	const bool enabled = HolyLib::LuaPack::IsEnabled();
+	const bool canonicalRegistration = HolyLib::LuaPack::SupportsCanonicalRegistration();
+	std::string source;
+	bool hasSource = false;
+	bool modeMatches = false;
+	bool cachedHasSource = false;
+	{
+		std::shared_lock<std::shared_mutex> lock(entry->mutex);
+		cachedHasSource = entry->hasSourceContent;
+		modeMatches = HolyLib::LuaPack::Policy::RegistrationModeMatches(
+			entry->luapackCanonical, entry->luapackPassthrough,
+			enabled, canonicalRegistration);
+		if (!HolyLib::LuaPack::Policy::RegistrationNeedsHashPublication(
+			entry->luapackCanonical, entry->luapackPassthrough,
+			entry->hasSourceContent, entry->IsContentReady(), entry->hashPublished,
+			enabled, canonicalRegistration))
+			return true;
+		if ((!modeMatches || !cachedHasSource) && entry->hasSourceContent)
+		{
+			source = entry->sourceContent;
+			hasSource = true;
+		}
+	}
+
+	// A cvar or hook transition can occur after the previous Think. Repair this exact
+	// request before consulting IsReady so the stale mode never sends one body/hash pair.
+	if ((!modeMatches || !cachedHasSource) && luaFile)
+	{
+		source = luaFile->contents;
+		hasSource = true;
+	}
+	if (!modeMatches || !cachedHasSource)
+	{
+		if (!hasSource)
+			return false;
+		if (enabled)
+			HolyLib::LuaPack::CaptureFileContents(fileName, source);
+		g_pLuaDataPack.AddFileContents(fileName, source);
+	}
+	// A matching mode can be pending publication without needing the source again.
+	// Mode changes, however, must never reuse the old transformed body as source.
+	return g_pLuaDataPack.PublishRegistrationHash(fileID);
+}
+
 static bool SendNativeLuaFile(GModDataPack* pDataPack, int clientIdx, int fileID,
 	const std::string& fileName, GarrysMod::Lua::LuaFile* luaFile)
 {
+	if (clientIdx >= 0 && clientIdx < ABSOLUTE_PLAYER_LIMIT)
+		g_clientHashUpdatesPending[clientIdx].erase(fileID);
 	if (HolyLib::LuaPack::NeedsNativeHashUpdate(clientIdx) && !HolyLib::LuaPack::IsInitFile(fileName))
 	{
 		std::array<unsigned char, 32> nativeHash{};
@@ -1602,7 +1745,7 @@ static bool SendNativeLuaFile(GModDataPack* pDataPack, int clientIdx, int fileID
 			return false;
 		}
 
-		auto& nativeHashes = g_requiredNativeLuaHashes[clientIdx];
+		auto& nativeHashes = g_clientNativeLuaHashes[clientIdx];
 		if (!HolyLib::LuaPack::Policy::NativeHashMatches(nativeHashes, fileID, nativeHash))
 		{
 			if (!SendClientLuaHashUpdate(clientIdx, fileID, nativeHash.data(), nativeHash.size()))
@@ -1625,6 +1768,7 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 		Warning(PROJECT_NAME " - gmoddatapack: Invalid datapack or missing client_lua_files stringtable?\n");
 		return;
 	}
+	g_pDataPack = pDataPack;
 
 	INetworkStringTable* clientFiles = pDataPack->m_pClientLuaFiles;
 	if (fileID <= 0 || fileID >= clientFiles->GetNumStrings()) // NOTE: GMod only checks < 0 BUT the index 0 is used for paths... too lazy to report it rn
@@ -1638,6 +1782,12 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 
 	std::string fileName = clientFiles->GetString(fileID);
 	GarrysMod::Lua::LuaFile* luaFile = Lua::GetShared()->GetCache(fileName);
+	if (!RefreshRegistrationModeForRequest(fileID, fileName, luaFile))
+	{
+		DisconnectLuaHashFailure(clientIdx, fileName.c_str(),
+			"the cached Lua registration mode changed but its native source is unavailable");
+		return;
+	}
 	const HolyLib::LuaPack::DeliveryDecision delivery = HolyLib::LuaPack::DecideDeliveryForClient(
 		clientIdx, fileName, luaFile ? luaFile->contents.length() : 0);
 	if (delivery.action == HolyLib::LuaPack::DeliveryAction::Stub && delivery.compressed)
@@ -1654,9 +1804,17 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 
 		if (clientIdx >= 0 && clientIdx < ABSOLUTE_PLAYER_LIMIT)
 		{
-			auto& nativeHashes = g_requiredNativeLuaHashes[clientIdx];
+			auto& nativeHashes = g_clientNativeLuaHashes[clientIdx];
 			auto nativeHash = nativeHashes.find(fileID);
-			if (nativeHash != nativeHashes.end())
+			CBaseClient* client = Util::server ? Util::GetClientByIndex(clientIdx) : nullptr;
+			const bool clientActive = client && client->IsActive();
+			auto& pendingHashes = g_clientHashUpdatesPending[clientIdx];
+			auto pendingHash = pendingHashes.find(fileID);
+			const bool publishedHashMatchesCanonical = pendingHash != pendingHashes.end() &&
+				std::equal(pendingHash->second.begin(), pendingHash->second.end(),
+					static_cast<const unsigned char*>(delivery.compressed->GetBase()));
+			if (HolyLib::LuaPack::Policy::NeedsOrderedCanonicalHash(clientActive,
+				nativeHash != nativeHashes.end(), publishedHashMatchesCanonical))
 			{
 				if (!SendClientLuaHashUpdate(clientIdx, fileID,
 					static_cast<const unsigned char*>(delivery.compressed->GetBase()), 32))
@@ -1666,6 +1824,8 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 				}
 				HolyLib::LuaPack::Policy::RestoreCanonicalHash(nativeHashes, fileID);
 			}
+			if (pendingHash != pendingHashes.end())
+				pendingHashes.erase(pendingHash);
 		}
 		SendCompressedLuaFile(clientIdx, fileID, *delivery.compressed);
 		return;
@@ -1918,7 +2078,7 @@ void CGModDataPackModule::OnClientDisconnect(CBaseClient* pClient)
 		? pClient->m_SteamID.ConvertToUint64() : 0;
 
 	g_pLuaDataPack.m_pPlayerQueue[slot].Clear();
-	ClearRequiredNativeLuaHashes(slot);
+	ClearClientNativeLuaHashes(slot);
 	HolyLib::LuaPack::PhysicalClientDisconnect(slot, steamID64);
 }
 
@@ -1926,46 +2086,94 @@ static double g_nLastSend = 0;
 void CGModDataPackModule::Think(bool bSimulating)
 {
 	HolyLib::LuaPack::Think();
-	if (HolyLib::LuaPack::ConsumeBootstrapRefresh() && Lua::GetShared())
+	// Do not consume the one-shot refresh until both the engine datapack and shared Lua
+	// cache can supply every registered path. Either detour can bind g_pDataPack later.
+	if (g_pDataPack && g_pDataPack->m_pClientLuaFiles && Lua::GetShared() &&
+		HolyLib::LuaPack::ConsumeBootstrapRefresh())
 	{
-		// Capture was intentionally dormant while the master flag was off. Re-snapshot the
-		// existing string table when it is toggled on so disabled servers keep stock memory use.
-		if (HolyLib::LuaPack::IsEnabled() && g_pDataPack && g_pDataPack->m_pClientLuaFiles)
-		{
-			for (int fileID = 0; fileID < g_pDataPack->m_pClientLuaFiles->GetNumStrings(); ++fileID)
-			{
-				const char* fileName = g_pDataPack->m_pClientLuaFiles->GetString(fileID);
-				GarrysMod::Lua::LuaFile* file = Lua::GetShared()->GetCache(fileName);
-				if (file)
-					HolyLib::LuaPack::CaptureFile(file);
-			}
-		}
-
-		// The registered init entry may carry an addon path (e.g. addons/dash/lua/includes/init.lua),
-		// so resolve its actual stringtable name before consulting the shared-Lua cache.
-		const char* registeredInitName = nullptr;
+		// A feature or hook-capability transition changes the registered byte identity.
+		// Re-feed every path in both directions: AddFileContents keeps exact source/mode
+		// matches ready, but invalidates stale native/canonical compressed bodies. A request
+		// that arrives before the worker catches up takes the existing synchronous path.
+		const bool captureForMapBase = HolyLib::LuaPack::IsEnabled();
+		std::string registeredInitName;
+		bool initRefreshed = false;
+		unsigned int missingSources = 0;
 		if (g_pDataPack && g_pDataPack->m_pClientLuaFiles)
 		{
 			for (int fileID = 0; fileID < g_pDataPack->m_pClientLuaFiles->GetNumStrings(); ++fileID)
 			{
 				const char* fileName = g_pDataPack->m_pClientLuaFiles->GetString(fileID);
-				if (fileName && HolyLib::LuaPack::IsInitFile(fileName))
-				{
+				if (!fileName || fileName[0] == '\0')
+					continue;
+				const bool initFile = HolyLib::LuaPack::IsInitFile(fileName);
+				if (initFile)
 					registeredInitName = fileName;
-					break;
+
+				GarrysMod::Lua::LuaFile* file = Lua::GetShared()->GetCache(fileName);
+				std::string source;
+				bool hasSource = false;
+				if (file)
+				{
+					source = file->contents;
+					hasSource = true;
 				}
+				else if (LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID))
+				{
+					std::shared_lock<std::shared_mutex> lock(entry->mutex);
+					if (entry->hasSourceContent)
+					{
+						source = entry->sourceContent;
+						hasSource = true;
+					}
+				}
+
+				if (!hasSource)
+				{
+					++missingSources;
+					continue;
+				}
+				if (captureForMapBase)
+					HolyLib::LuaPack::CaptureFileContents(fileName, source);
+				g_pLuaDataPack.AddFileContents(fileName, source);
+				if (!g_pLuaDataPack.PublishRegistrationHash(fileID))
+				{
+					++missingSources;
+					continue;
+				}
+				if (initFile)
+					initRefreshed = true;
 			}
 		}
 
-		GarrysMod::Lua::LuaFile* initFile = registeredInitName ? Lua::GetShared()->GetCache(registeredInitName) : nullptr;
-		if (!initFile)
-			initFile = Lua::GetShared()->GetCache("includes/init.lua");
-		if (!initFile)
-			initFile = Lua::GetShared()->GetCache("lua/includes/init.lua");
-		if (initFile)
-			g_pLuaDataPack.AddFileContents(initFile->GetName(), initFile->GetContents());
-		else
-			Warning(PROJECT_NAME " - luapack: the init file is not cached; bootstrap refresh will wait for AddOrUpdateFile\n");
+		if (!initRefreshed)
+		{
+			// The registered init entry may carry an addon path while the shared cache exposes
+			// only the canonical alias. Preserve the string-table path when using that fallback.
+			GarrysMod::Lua::LuaFile* initFile = Lua::GetShared()->GetCache("includes/init.lua");
+			if (!initFile)
+				initFile = Lua::GetShared()->GetCache("lua/includes/init.lua");
+			if (initFile)
+			{
+				const std::string initPath = registeredInitName.empty()
+					? initFile->GetName() : registeredInitName;
+				if (captureForMapBase)
+					HolyLib::LuaPack::CaptureFileContents(initPath, initFile->contents);
+				g_pLuaDataPack.AddFileContents(initPath, initFile->contents);
+				const int initID = g_pDataPack && g_pDataPack->m_pClientLuaFiles
+					? g_pDataPack->m_pClientLuaFiles->FindStringIndex(initPath.c_str())
+					: INVALID_STRING_INDEX;
+				initRefreshed = initID != INVALID_STRING_INDEX &&
+					g_pLuaDataPack.PublishRegistrationHash(initID);
+				if (initRefreshed && !registeredInitName.empty() && missingSources > 0)
+					--missingSources;
+			}
+		}
+		if (!initRefreshed)
+			Warning(PROJECT_NAME " - luapack: the init file is not cached; registration refresh will wait for AddOrUpdateFile\n");
+		if (missingSources > 0)
+			Warning(PROJECT_NAME " - luapack: registration refresh could not recover %u source file(s); their next AddOrUpdateFile will repair them\n",
+				missingSources);
 	}
 
 	{
@@ -1977,10 +2185,15 @@ void CGModDataPackModule::Think(bool bSimulating)
 			std::lock_guard<std::shared_mutex> entryLock(pEntry->mutex);
 
 			std::vector<unsigned char> pHash = HashString(pEntry->content.c_str(), pEntry->content.length() + 1);
+			ClientLuaHash publishedHash{};
+			if (pHash.size() == publishedHash.size())
+				std::copy(pHash.begin(), pHash.end(), publishedHash.begin());
 			// SetStringUserData broadcasts the canonical hash to every active client.
 			// Forget any per-client native identity before a later body decision.
-			ClearRequiredNativeLuaHashForAllClients(fileID);
+			ClearClientNativeLuaHashForAllClients(fileID,
+				pHash.size() == publishedHash.size() ? &publishedHash : nullptr);
 			g_pDataPack->m_pClientLuaFiles->SetStringUserData(fileID, pHash.size(), pHash.data());
+			pEntry->hashPublished = true;
 		}
 		g_pLuaDataPack.m_pStringTableUpdateQueue.clear();
 	}
@@ -2091,15 +2304,26 @@ void CGModDataPackModule::Init(CreateInterfaceFn* appfn, CreateInterfaceFn* game
 
 MODULE_RESULT CGModDataPackModule::ClientConnect(bool* bAllowConnect, edict_t* pClient, const char* pszName, const char* pszAddress, char* reject, int maxrejectlen)
 {
-	(void)bAllowConnect;
 	(void)pszName;
 	(void)pszAddress;
-	(void)reject;
-	(void)maxrejectlen;
 
 	const int slot = ClientSlotFromEdict(pClient);
 	if (!HolyLib::LuaPack::ClientConnect(slot))
-		ClearRequiredNativeLuaHashes(slot);
+		ClearClientNativeLuaHashes(slot);
+
+	const HolyLib::LuaPack::Config& config = HolyLib::LuaPack::GetConfig();
+	if (HolyLib::LuaPack::Policy::RejectUnavailableRequiredAdmission(
+		HolyLib::LuaPack::IsEnabled(), config.requiredStubbing,
+		HolyLib::LuaPack::SupportsCanonicalRegistration()))
+	{
+		static const char* failure = "Required LuaPack is unavailable because its Linux delivery hooks are not active. The server operator must restore the hooks or disable required mode.";
+		if (bAllowConnect)
+			*bAllowConnect = false;
+		if (reject && maxrejectlen > 0)
+			V_strncpy(reject, failure, maxrejectlen);
+		Warning(PROJECT_NAME " - luapack: rejecting client slot %i before admission because required delivery hooks are unavailable\n", slot);
+		return MODULE_RESULT::STOP;
+	}
 	return MODULE_RESULT::CONTINUE;
 }
 
@@ -2112,7 +2336,7 @@ void CGModDataPackModule::ClientDisconnect(edict_t* pClient)
 {
 	const int slot = ClientSlotFromEdict(pClient);
 	if (!HolyLib::LuaPack::ClientDisconnect(slot, true))
-		ClearRequiredNativeLuaHashes(slot);
+		ClearClientNativeLuaHashes(slot);
 }
 
 MODULE_RESULT CGModDataPackModule::ClientCommand(edict_t* pClient, const CCommand* args)

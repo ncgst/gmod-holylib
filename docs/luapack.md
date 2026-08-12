@@ -13,7 +13,7 @@ The feature is experimental and defaults off. The `gmoddatapack` module itself m
 - Restoring a file byte-for-byte to its base identity returns it to the canonical placeholder. This also restores that file's per-client canonical hash after an active-client native delta.
 - `includes/init.lua` is always real because it installs the resolver. It is never read from the pack.
 
-The full base intentionally contains every captured `client_lua_files` registration except init. A native cold join may request fewer paths, but one request trace is not authoritative proof that the other registered paths can never execute. Realm-looking filenames are hints, not eligibility rules.
+The full base intentionally contains every captured `client_lua_files` registration except init. While LuaPack is enabled, `gmoddatapack` server-branch/comment stripping and `HolyLib:OnTokenizeContent` rewriting are bypassed so registered hashes, native bodies, and captured pack sources retain one byte identity. A native cold join may request fewer paths, but one request trace is not authoritative proof that the other registered paths can never execute. Realm-looking filenames are hints, not eligibility rules.
 
 ## Safety model
 
@@ -21,7 +21,7 @@ The full base intentionally contains every captured `client_lua_files` registrat
 - The client mounts, parses, and validates the downloaded base before sending `READY(base, md5)`.
 - Duplicate exact source keys invalidate a pack during both server build validation and client parsing. Divergent local-alias collisions are marked ambiguous instead of silently selecting the last parsed payload; exact registered paths remain authoritative.
 - With `required=1`, Source serializes a mixed per-client baseline: unchanged base files have the canonical placeholder SHA-256, while current deltas and init have native SHA-256 values. Lua bodies then follow the same per-file decision.
-- A missing pin, missing local object, non-downloadable base, corrupt compression, invalid MD5, invalid pack, or initial READY timeout disconnects a required client. A delta is not permission to fall back the rest of a required join to native delivery.
+- A missing pin, missing server object, non-downloadable base, unavailable per-client baseline hook, or initial READY timeout fails the required path. Pre-baseline faults and timeout disconnect; an exact post-admission client failure may use the separately bounded native-recovery path below. Recovery never changes the failed join's lane in progress.
 - A client can explicitly choose native delivery for its whole connection by presenting the exact pre-Lua userinfo value `tv_nochat=no_gluapack`, when `allow_optout=1`.
 - Every stub is an ordinary reliable `LuaFileDownload` for the requested file ID, so the Requesting Lua barrier advances normally.
 - Publishing writes the immutable object before atomically replacing the replicated manifest.
@@ -43,6 +43,8 @@ The full base intentionally contains every captured `client_lua_files` registrat
 | `holylib_gmoddatapack_luapack_ready_deadline` | `180` | Seconds a silent spawned required slot may remain unacknowledged. The clock starts at client activation, not connect. |
 | `holylib_gmoddatapack_luapack_required` | `0` | Fail-closed map-base admission for non-opt-out clients. |
 | `holylib_gmoddatapack_luapack_allow_optout` | `1` | Honor exact `tv_nochat=no_gluapack` as a per-connection native opt-out. |
+| `holylib_gmoddatapack_luapack_required_recovery` | `1` | Permit one authenticated server-driven engine reconnect whose next initial Lua baseline is wholly native after an exact required-generation failure. It never switches the failed join in progress. |
+| `holylib_gmoddatapack_luapack_required_recovery_ttl` | `120` | Seconds the account-owned one-shot recovery latch remains eligible to be claimed. |
 | `holylib_gmoddatapack_luapack_manifest` | empty | Internal atomic replicated base snapshot; do not set manually. |
 
 The legacy optimistic-prefix cvars remain accepted for configuration compatibility. Required map-base delivery does not use speculative whole-join fallback.
@@ -63,7 +65,11 @@ The ingest worker is asynchronous and non-fatal. Requests carry the object path,
 
 Before Source serializes `client_lua_files`, a required connection receives canonical hashes only for paths whose current SHA-256 still equals the base. Init, hotfixes, and late registrations receive real source hashes. A native body advances that file to its current per-client hash; a later exact restoration sends the canonical hash and placeholder again.
 
-The replicated required policy makes an absent, corrupt, unparsable, MD5-invalid, or incomplete base report failure without scheduling `retry`. The server then kicks with opt-out instructions. Required delivery never responds to a base failure by rotating the whole connection to native files.
+Canonical registration, the per-client `SendServerInfo` baseline hook, and body-selection hook are currently supported as a required-delivery set only on Linux. If any required hook is disabled, unresolved, or fails to install, `required=1` rejects every connection at `ClientConnect` before a cached native baseline can bypass policy. Restore the hooks or set `required=0`; the exact opt-out exception is deliberately not evaluated while this server capability gate is closed. With the hooks active, exact opt-out and `required=0` remain wholly native. Windows x64 checks prove build compatibility, not required-mode runtime support.
+
+An absent, corrupt, unparsable, MD5-invalid, or incomplete client base reports an exact required-generation failure without scheduling client `retry`. With required recovery enabled, the server revalidates authenticated SteamID64 ownership, arms one account-owned latch, and queues one engine `Reconnect()`. The replacement connection claims that latch before its first `SendServerInfo` and receives a wholly native initial baseline. The failed connection never changes lanes and cannot consume its own latch.
+
+The latch expires if it is not claimed within its TTL. Once consumed, its tombstone prevents another automatic recovery until the native connection proves success or the level/module/server lifecycle resets. Physical disconnect and slot reuse clear only per-slot reconnect handoffs; they do not erase the account-owned armed latch or consumed tombstone. Disabled recovery, stale or malformed failure reports, authentication mismatch, unavailable handoff, and exhausted recovery disconnect with the manual opt-out instructions.
 
 A player who needs native Lua must set this Garry's Mod launch option and restart before joining:
 
@@ -91,15 +97,15 @@ Mirror `garrysmod/data/<packdir>/` into the same relative path below the configu
 
 1. Deploy to one staging server with both module and feature flags off. Verify ordinary native joins first.
 2. Configure reachable `sv_downloadurl`/mirroring and use `downloadurl_policy=require` during validation.
-3. Enable `holylib_enable_gmoddatapack 1`, keep LuaPack off, and verify the existing native path.
+3. Set `holylib_enable_gmoddatapack 1`, keep LuaPack off, and verify the existing native path. A restart is recommended for staging parity; runtime enable defers its all-registration sweep until the engine datapack is bound. The module cannot be removed during a live level because it owns the registered Lua hash/body hooks.
 4. Enable LuaPack off-peak. Confirm one immutable map base, one engine `downloadables` entry, a reachable CDN object, and a non-empty manifest.
 5. With `required=0`, record a clean native cold join and reconnect baseline.
 6. Enable `required=1`. Purge only the isolated test client's relevant cache, then confirm cold entry, Requesting Lua completion, READY, and reconnect.
 7. Apply two successive hotfixes without changing the map. Confirm no new pack object/manifest generation appears, then confirm a new required JIP receives both current files natively and all unchanged base files canonically.
 8. For an active required client, change one base path and confirm its native hash/body executes. Restore the exact base bytes and confirm the canonical hash/stub executes base content again.
-9. Corrupt and separately remove only the isolated test client's base cache. Each case must kick without `retry` or whole-join native fallback.
-10. Restart the isolated client with `+tv_nochat no_gluapack`. Confirm native Lua for the whole connection and that a forged/late READY cannot change lanes.
-11. Exercise the master kill switch and confirm subsequent requests use ordinary native delivery.
+9. With recovery enabled, block, corrupt, and separately remove only the isolated test client's base after Source admission. Each case must produce exactly one server-driven reconnect and one wholly native next baseline in the same client process, with no client `retry`, mid-join lane switch, second recovery, or cross-slot consumption. Then set recovery to `0` and confirm the same failure kicks fail-closed.
+10. Restart the isolated client with `+tv_nochat no_gluapack`. Confirm native Lua for the whole connection, that a forged/late READY cannot change lanes, and that an active hot refresh sends a matching native hash/body rather than the canonical placeholder hash.
+11. Exercise the master kill switch. Confirm an immediate request repairs its stale registration before send, the next server frame reprocesses every remaining registered path from canonical to native identity, and subsequent requests use matching ordinary native hashes and bodies.
 12. Restore server configuration, binary, Lua files, CDN test object state, and client launch/cache state; verify no test players or test artifacts remain.
 
 ## Kill switch
@@ -110,7 +116,7 @@ Run this from server console/RCON, or as a superadmin player:
 holylib_gmoddatapack_luapack_kill
 ```
 
-The command sets the master switch to `0`. Stub decisions stop immediately and the next frame clears the manifest. Existing and new requests use normal Lua networking without a restart.
+The command sets the master switch to `0`. Stub decisions stop immediately and the next frame clears the manifest. Existing and new requests use normal Lua networking without a restart. Disable the feature with this command; the `gmoddatapack` module itself cannot be removed during a live level because it owns the registered Lua hash/body hooks.
 
 ## Risks and non-goals
 

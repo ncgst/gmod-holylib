@@ -53,7 +53,8 @@ int main()
 		assert(recovery.OwnsConsumed(accountA, 101));
 		assert(!recovery.OwnsConsumed(accountA, 100));
 		assert(SelectBaseline(Lane::NativeRecovery, true, BaseAvailability::Ready) == Action::Native);
-		assert(SelectFile(Lane::NativeRecovery, BaseAvailability::Missing, false, false) == Action::Native);
+		assert(SelectFile(Lane::NativeRecovery, true, BaseAvailability::Missing, false, false) == Action::Native);
+		assert(SelectFile(Lane::NativeRecovery, false, BaseAvailability::Missing, false, false) == Action::Native);
 		assert(recovery.Consume(accountA, 102, 13.0) == RecoveryConsumeResult::RetryExhausted);
 	}
 
@@ -143,6 +144,32 @@ int main()
 		assert(!RequiredFailureIdentityReady(true, true, false));
 		assert(RequiredFailureIdentityReady(true, true, true));
 		assert(!RequiredFailureIdentityReady(true, false, true));
+		assert(RejectUnavailableRequiredAdmission(true, true, false));
+		assert(!RejectUnavailableRequiredAdmission(true, true, true));
+		assert(!RejectUnavailableRequiredAdmission(true, false, false));
+		assert(!RejectUnavailableRequiredAdmission(false, true, false));
+		assert(UsesCanonicalRegistration(true, true));
+		assert(!UsesCanonicalRegistration(false, true));
+		assert(!UsesCanonicalRegistration(true, false));
+		assert(UsesPassthroughProcessing(true));
+		assert(!UsesPassthroughProcessing(false));
+		assert(RegistrationModeMatches(true, true, true, true));
+		assert(RegistrationModeMatches(false, false, false, true));
+		assert(RegistrationModeMatches(false, true, true, false));
+		assert(!RegistrationModeMatches(true, true, false, true));
+		assert(!RegistrationModeMatches(false, false, true, true));
+		assert(!RegistrationModeMatches(false, false, true, false));
+		assert(RegistrationNeedsHashPublication(true, true, true, true, true, false, true));
+		assert(RegistrationNeedsHashPublication(false, false, true, true, true, true, true));
+		assert(RegistrationNeedsHashPublication(true, true, true, false, false, true, true));
+		assert(RegistrationNeedsHashPublication(true, true, true, true, false, true, true));
+		assert(RegistrationNeedsHashPublication(false, false, false, true, true, false, true));
+		assert(!RegistrationNeedsHashPublication(true, true, true, true, true, true, true));
+		assert(!RegistrationNeedsHashPublication(false, false, true, true, true, false, true));
+		assert(NeedsOrderedCanonicalHash(true, false, false));
+		assert(NeedsOrderedCanonicalHash(false, true, false));
+		assert(NeedsOrderedCanonicalHash(false, false, true));
+		assert(!NeedsOrderedCanonicalHash(false, false, false));
 		RequiredRecoveryTracker recovery;
 		RequiredRecoveryHandoff handoff;
 		assert(recovery.Arm(0, 200, 0.0, 30.0) == RecoveryArmResult::Invalid);
@@ -231,9 +258,10 @@ int main()
 
 	// Required base-plus-delta: unchanged files are canonical, current deltas are native.
 	assert(SelectBaseline(Lane::Required, true, BaseAvailability::Ready) == Action::CanonicalStub);
-	assert(SelectFile(Lane::Required, BaseAvailability::Ready, false, false) == Action::CanonicalStub);
-	assert(SelectFile(Lane::Required, BaseAvailability::Ready, false, true) == Action::Native);
-	assert(SelectFile(Lane::Required, BaseAvailability::Ready, true, false) == Action::Native);
+	assert(SelectFile(Lane::Required, true, BaseAvailability::Ready, false, false) == Action::CanonicalStub);
+	assert(SelectFile(Lane::Required, true, BaseAvailability::Ready, false, true) == Action::Native);
+	assert(SelectFile(Lane::Required, true, BaseAvailability::Ready, true, false) == Action::Native);
+	assert(SelectFile(Lane::Required, false, BaseAvailability::Ready, true, false) == Action::Reject);
 	assert(ShouldBuildMapBase(false, true));
 	assert(!ShouldBuildMapBase(true, true));
 	assert(!ShouldBuildMapBase(true, false));
@@ -260,6 +288,21 @@ int main()
 	RememberNativeHash(clientNativeHashes, 42, hotfixTwo);
 	assert(NativeHashMatches(clientNativeHashes, 42, hotfixTwo));
 
+	// Linux globally broadcasts the canonical registration hash before every active
+	// hot refresh. All four lanes can subsequently select a native body, so each must
+	// restore that body's native identity rather than pair it with the canonical hash.
+	assert(NeedsPerClientNativeHashes(Lane::Required));
+	assert(NeedsPerClientNativeHashes(Lane::NativeRecovery));
+	assert(NeedsPerClientNativeHashes(Lane::NativeOptOut));
+	assert(NeedsPerClientNativeHashes(Lane::NativeRescue));
+	std::unordered_map<int, TestHash> nativeLaneHashes;
+	RememberNativeHash(nativeLaneHashes, 84, hotfixOne);
+	assert(NativeHashMatches(nativeLaneHashes, 84, hotfixOne));
+	assert(RestoreCanonicalHash(nativeLaneHashes, 84));
+	assert(!NativeHashMatches(nativeLaneHashes, 84, hotfixTwo));
+	RememberNativeHash(nativeLaneHashes, 84, hotfixTwo);
+	assert(NativeHashMatches(nativeLaneHashes, 84, hotfixTwo));
+
 	// Exact-key duplicates are rejected by the same registry used by pack validation.
 	std::unordered_set<std::string> exactKeys;
 	assert(RegisterExactKey(exactKeys, "0123456789abcdef"));
@@ -272,13 +315,18 @@ int main()
 	assert(ResolveLane(true, true, "no_gluapack ") == Lane::Required);
 	assert(ResolveLane(true, false, "no_gluapack") == Lane::Required);
 	assert(SelectBaseline(Lane::NativeOptOut, false, BaseAvailability::Missing) == Action::Native);
-	assert(SelectFile(Lane::NativeOptOut, BaseAvailability::Missing, false, true) == Action::Native);
+	assert(SelectFile(Lane::NativeOptOut, true, BaseAvailability::Missing, false, true) == Action::Native);
+	assert(SelectFile(Lane::NativeOptOut, false, BaseAvailability::Missing, false, true) == Action::Native);
+	assert(ResolveLane(false, false, nullptr) == Lane::NativeRescue);
+	assert(SelectBaseline(Lane::NativeRescue, false, BaseAvailability::Missing) == Action::Native);
+	assert(SelectFile(Lane::NativeRescue, true, BaseAvailability::Missing, false, true) == Action::Native);
+	assert(SelectFile(Lane::NativeRescue, false, BaseAvailability::Missing, false, true) == Action::Native);
 
 	// Required mode fails closed when the base is absent, invalid, or cannot be canonicalized.
 	assert(SelectBaseline(Lane::Required, true, BaseAvailability::Missing) == Action::Reject);
 	assert(SelectBaseline(Lane::Required, true, BaseAvailability::Unusable) == Action::Reject);
 	assert(SelectBaseline(Lane::Required, false, BaseAvailability::Ready) == Action::Reject);
-	assert(SelectFile(Lane::Required, BaseAvailability::Missing, false, true) == Action::Reject);
+	assert(SelectFile(Lane::Required, true, BaseAvailability::Missing, false, true) == Action::Reject);
 
 	std::cout << "luapack map-base policy tests passed\n";
 	return 0;

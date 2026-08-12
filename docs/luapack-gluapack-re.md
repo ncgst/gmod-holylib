@@ -101,7 +101,7 @@ Implementation decision: compose through HolyLib's existing `AddOrUpdateFile` ow
 
 The recovered `failed(message, disconnect, openHelp)` installs a no-op resolver when `disconnect` is truthy. Missing-pack and MD5-mismatch sites pass a disconnect reason. At label `::failed::`, however, `RunConsoleCommand("disconnect")` executes only when `cl_downloadfilter ~= "none"`; the code then requires three base modules and returns. Thus the exact downloads-disabled branch does not disconnect and cannot install the real packed Lua state: it is a genuine limbo path.
 
-Implementation decision: HolyLib retains that behavior in its default fail-open lane. Its separately configured required join lane marks placeholders explicitly, reports an unresolvable required stub to the server without scheduling an automatic retry, and disconnects with the documented `+tv_nochat no_gluapack` opt-out. The server also rejects a required join before sending placeholders when its pinned object is not in the engine download queue. After a first successful READY, ordinary live-autorefresh gaps keep their existing native handoff so a source edit does not mass-kick active players.
+Implementation decision: HolyLib retains that behavior in its default fail-open lane. Its separately configured required join lane marks placeholders explicitly and reports an unresolvable required stub to the server without scheduling client `retry`. By default, one exact failure with revalidated authenticated SteamID64 ownership queues a server-driven engine reconnect whose next initial baseline is wholly native; disabled, unavailable, or exhausted recovery disconnects with the documented `+tv_nochat no_gluapack` opt-out. The failed join never changes lanes in progress. The server also rejects a required join before sending placeholders when its pinned object is not in the engine download queue or the complete Linux required-delivery hook set is unavailable. After a first successful READY, ordinary live-autorefresh gaps keep their existing native handoff so a source edit does not mass-kick active players.
 
 ### 12. Sigscan validity — CONFIRMED for HolyLib symbols; incumbent comparison OPEN
 
@@ -122,7 +122,7 @@ What would settle it: provide both stripped plugin architectures plus the exact 
 | No encryption or secret | Finding 5; clean-room/no-DRM requirement |
 | Atomic retained-generation manifest | Findings 8 and 9 |
 | Init-file bootstrap excluded from stubbing | Finding 10 |
-| Missing/corrupt pack means native recovery by default, or a kick in required mode | Finding 11 |
+| Missing/corrupt required pack permits one authenticated native next-connection recovery by default; disabled or exhausted recovery kicks | Finding 11 |
 | `tv_nochat=no_gluapack` selects a per-slot native lane before Lua | Follow-up native artifact |
 | Only HTTP carries the pack body | Findings 1, 7, and 9 |
 

@@ -160,6 +160,7 @@ namespace HolyLib::LuaPack
 		Policy::RequiredRecoveryHandoff recoveryHandoffs[ABSOLUTE_PLAYER_LIMIT];
 		std::uint64_t nextConnectionSerial = 0;
 		bool featureEnabledLastFrame = false;
+		bool canonicalRegistrationAvailableLastFrame = false;
 		bool bootstrapRefresh = false;
 		double lastCaptureAt = 0.0; // guarded by registryMutex
 		double nextBuildAllowed = 0.0;
@@ -1658,7 +1659,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		true, 1.0f, true, 3600.0f);
 	static ConVar luapack_required(
 		"holylib_gmoddatapack_luapack_required", "0", FCVAR_ARCHIVE | FCVAR_REPLICATED,
-		"Require connecting clients to use the pinned engine-downloaded Lua pack; failures disconnect instead of falling back to native Lua");
+		"Require connecting clients to use the pinned engine-downloaded Lua pack; failures fail closed or use the bounded authenticated recovery path instead of switching the current join to native Lua");
 	static ConVar luapack_allow_optout(
 		"holylib_gmoddatapack_luapack_allow_optout", "1", FCVAR_ARCHIVE | FCVAR_REPLICATED,
 		"Allow a client whose tv_nochat userinfo is exactly no_gluapack to use native Lua for its entire connection");
@@ -1786,18 +1787,6 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		return luapack_enable.GetBool();
 	}
 
-	bool SupportsCanonicalRegistration()
-	{
-		// The per-client baseline detour is currently verified against GMod's Linux
-		// engine. Other platforms retain native registration instead of advertising a
-		// required mode whose placeholder identity cannot be made valid.
-#if defined(SYSTEM_LINUX)
-		return true;
-#else
-		return false;
-#endif
-	}
-
 	void Init(CreateInterfaceFn* appfn)
 	{
 		if (appfn && appfn[0])
@@ -1812,6 +1801,9 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			Warning(PROJECT_NAME " - luapack: INetworkStringTableContainer is unavailable; FastDL publishing cannot start\n");
 		RefreshConfig();
 		state.featureEnabledLastFrame = IsEnabled();
+		// InitDetour runs after Init. The first Think observes the installed hook set and
+		// reprocesses cached registrations if canonical delivery became available.
+		state.canonicalRegistrationAvailableLastFrame = false;
 	}
 
 	void Shutdown()
@@ -1842,6 +1834,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		state.lockedDownloadUrl.clear();
 		state.downloadUrlLocked = false;
 		state.featureEnabledLastFrame = false;
+		state.canonicalRegistrationAvailableLastFrame = false;
 		state.bootstrapRefresh = false;
 		state.lastCaptureAt = 0.0;
 		state.nextBuildAllowed = 0.0;
@@ -1866,6 +1859,8 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 	void Think()
 	{
 		const bool enabled = IsEnabled();
+		const bool canonicalRegistrationAvailable =
+			Policy::UsesCanonicalRegistration(enabled, SupportsCanonicalRegistration());
 		if (enabled != state.featureEnabledLastFrame)
 		{
 			state.featureEnabledLastFrame = enabled;
@@ -1881,6 +1876,13 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 				state.files.clear();
 				state.buildRequested = false;
 			}
+		}
+		if (canonicalRegistrationAvailable != state.canonicalRegistrationAvailableLastFrame)
+		{
+			state.canonicalRegistrationAvailableLastFrame = canonicalRegistrationAvailable;
+			// A hook-set change alters the byte identity stored in every non-init entry,
+			// just like the master switch. The module refresh loop re-feeds all registrations.
+			state.bootstrapRefresh = true;
 		}
 
 		for (auto upload = state.uploads.begin(); upload != state.uploads.end();)
@@ -2074,13 +2076,20 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 
 	void CaptureFile(const GarrysMod::Lua::LuaFile* file)
 	{
-		if (!IsEnabled() || !file)
+		if (!file)
+			return;
+		CaptureFileContents(file->name, file->contents);
+	}
+
+	void CaptureFileContents(const std::string& inputPath, const std::string& contents)
+	{
+		if (!IsEnabled())
 			return;
 
-		const std::string virtualPath = NormalizePath(file->name);
+		const std::string virtualPath = NormalizePath(inputPath);
 		if (virtualPath.empty())
 			return;
-		const std::string identity = ContentIdentity(file->contents);
+		const std::string identity = ContentIdentity(contents);
 		const bool needsMapBase = state.currentGeneration.empty();
 
 		{
@@ -2090,12 +2099,12 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			// so hundreds of unrelated entries can share it. The client executes the
 			// registered string-table path; use that unique virtual path for exact lookup.
 			const std::string sourcePath = virtualPath;
-			if (record.contents == file->contents && record.sourcePath == sourcePath)
+			if (record.contents == contents && record.sourcePath == sourcePath)
 				return;
 
 			record.virtualPath = virtualPath;
 			record.sourcePath = sourcePath;
-			record.contents = file->contents;
+			record.contents = contents;
 			record.identity = identity;
 			record.revision = ++state.revision;
 			if (needsMapBase)
@@ -2176,7 +2185,8 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 				nativeDelta = IsNativeDelta(generation->second, virtualPath);
 		}
 
-		switch (Policy::SelectFile(ClientLane(client), base, IsInitFile(virtualPath), nativeDelta))
+		switch (Policy::SelectFile(ClientLane(client), SupportsCanonicalRegistration(),
+			base, IsInitFile(virtualPath), nativeDelta))
 		{
 			case Policy::Action::Native:
 				return {BaselineAction::NativeSource, nullptr};
@@ -2194,12 +2204,18 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 	{
 		if (!IsEnabled() || !IsValidSlot(slot))
 			return false;
+		// If the hook set disappeared since the previous Think, registrations are still
+		// canonical until the queued all-file refresh runs. Keep repairing native bodies
+		// during that bounded transition; a fresh unsupported start has neither flag.
+		if (!SupportsCanonicalRegistration() &&
+			!state.canonicalRegistrationAvailableLastFrame)
+			return false;
 
 		ClientPin& client = state.clients[slot];
 		ResolveDeliveryLane(slot, client);
-		// Global registration remains canonical while LuaPack is enabled. Every native
-		// body on a required connection therefore receives its current per-client hash,
-		// both for JIP deltas and for active-client hot refreshes.
+		// Global registration is canonical when the per-client baseline hook is active.
+		// Every native body therefore receives its current per-client hash, both for JIP
+		// deltas and for active-client hot refreshes on wholly native lanes.
 		return Policy::NeedsPerClientNativeHashes(ClientLane(client));
 	}
 
@@ -2366,7 +2382,6 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 					++clearedHandoffs;
 			}
 		}
-
 		if (clearedHandoffs > 0)
 		{
 			Msg(PROJECT_NAME " - luapack: physical Steam disconnect for slot %i (%llu) cleared %u required recovery handoff(s)\n",
