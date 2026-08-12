@@ -12,6 +12,7 @@ The feature is experimental and defaults off. The `gmoddatapack` module itself m
 - A second or later hotfix changes only the current native delta. It does not create G2/G3 pack objects, rotate the manifest, or consume another `downloadables` entry.
 - Restoring a file byte-for-byte to its base identity returns it to the canonical placeholder. This also restores that file's per-client canonical hash after an active-client native delta.
 - `includes/init.lua` is always real because it installs the resolver. It is never read from the pack.
+- Packed files keep their full logical source path, so their later `include` calls retain the engine's caller-relative behavior. Nested `include` and `CompileFile` calls stay on the engine's current registered path: native deltas remain native, while canonical placeholders re-enter the immutable base.
 
 The full base intentionally contains every captured `client_lua_files` registration except init. While LuaPack is enabled, `gmoddatapack` server-branch/comment stripping and `HolyLib:OnTokenizeContent` rewriting are bypassed so registered hashes, native bodies, and captured pack sources retain one byte identity. A native cold join may request fewer paths, but one request trace is not authoritative proof that the other registered paths can never execute. Realm-looking filenames are hints, not eligibility rules.
 

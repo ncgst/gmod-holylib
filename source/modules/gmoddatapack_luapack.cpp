@@ -364,7 +364,7 @@ do
 		end
 
 		local selectedGeneration
-		local activate -- defined after the overrides below
+		local activate -- defined after the resolver below
 
 		local function normalizedForms(path)
 			path = string.gsub(path or "", "^@", "")
@@ -382,31 +382,41 @@ do
 	// MSVC caps a single string literal at 16380 characters (C2026), which the bootstrap
 	// outgrew; adjacent raw literals concatenate at compile time (total cap 65535).
 	R"HOLYLUAPACK(
-		local function findSource(pack, path)
+		local function findSource(pack, path, allowAliases)
 			local sourcePath, first, second = normalizedForms(path)
 			local salted = function(value) return string.lower(util.MD5(pack.salt .. value)) end
-			return pack.vfs[salted(sourcePath)] or pack.vfsLCL[salted(first)] or pack.vfsLCL[salted(second)]
+			local source = pack.vfs[salted(sourcePath)]
+			if source ~= nil then return source, sourcePath end
+			if not allowAliases then return nil end
+
+			local firstSource = pack.vfsLCL[salted(first)]
+			if firstSource == false then return nil end
+			if firstSource ~= nil then return firstSource, sourcePath end
+			if second == first then return nil end
+			local secondSource = pack.vfsLCL[salted(second)]
+			if secondSource == false then return nil end
+			if secondSource ~= nil then return secondSource, sourcePath end
+			return nil
 		end
 
-		local function compilePacked(pack, path)
-			local source = findSource(pack, path)
-			if not source then return nil end
-			local compiled = CompileString(source, path, false)
+		local function compilePacked(pack, path, allowAliases, showError)
+			local source, resolvedPath = findSource(pack, path, allowAliases)
+			if not source then return nil, false end
+			local chunkName = "@" .. resolvedPath
+			local compiled = CompileString(source, chunkName, showError ~= false)
 			if type(compiled) ~= "function" then
-				warn("failed to compile packed file " .. tostring(path) .. ": " .. tostring(compiled))
-				return nil
+				warn("failed to compile packed file " .. tostring(resolvedPath) .. ": " .. tostring(compiled))
+				return nil, true
 			end
-			return compiled
+			return compiled, true
 		end
 
-		local overridesInstalled = false
-		local function installOverrides()
-			if overridesInstalled then return end
-			overridesInstalled = true
+		local resolverInstalled = false
+		local function installResolver()
+			if resolverInstalled then return end
+			resolverInstalled = true
 			_G.__holypack_bootstrapped = true
 			_G.__holypack_packs = packs
-
-			local originalCompileFile, originalInclude = CompileFile, include
 
 			function _G.__holypack(generation, required)
 				-- Canonical placeholders are deliberately generation-independent so their
@@ -430,7 +440,7 @@ do
 				selectedGeneration = generation
 				local info = debug.getinfo(2, "S")
 				local sourcePath = info and info.source or ""
-				local compiled = compilePacked(pack, string.gsub(sourcePath, "^@", ""))
+				local compiled = compilePacked(pack, string.gsub(sourcePath, "^@", ""), true, false)
 				if not compiled then
 					-- Mounted pack but no usable entry (or the entry failed to compile): the
 					-- file cannot be produced in place either way, so recover like an
@@ -441,21 +451,10 @@ do
 				return compiled
 			end
 
-			function _G.CompileFile(path)
-				local pack = selectedGeneration and packs[selectedGeneration]
-				return (pack and compilePacked(pack, path)) or originalCompileFile(path)
-			end
-
-			function _G.include(path)
-				local pack = selectedGeneration and packs[selectedGeneration]
-				local compiled = pack and compilePacked(pack, path)
-				if compiled then return compiled() end
-				return originalInclude(path)
-			end
 		end
 
 		activate = function()
-			installOverrides()
+			installResolver()
 		end
 
 		-- Boot mount pass. Acknowledge whatever is already on disk; stub delivery is gated
@@ -479,7 +478,7 @@ do
 			end
 		end
 
-		-- The overrides install even when nothing mounted: the server may speculate with
+		-- The resolver installs even when nothing mounted: the server may speculate with
 		-- stubs before this client has acknowledged anything, and __holypack must then
 		-- lazily mount a download that completed after the pass above — or recover —
 		-- instead of hitting a nil global.
