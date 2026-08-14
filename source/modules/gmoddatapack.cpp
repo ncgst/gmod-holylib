@@ -2052,6 +2052,14 @@ static void DrainCanonicalLuaStubQueues()
 			const std::size_t compressedBytes = item.compressed->GetWritten();
 			const std::size_t stagedBytes = ReliableStubStagingBytes(
 				compressedBytes, orderedCanonicalHash);
+			if (MustDeferReliableStubForGlobalBudget(globalBudget, stagedBytes))
+			{
+				// Resume at the first globally deferred client next tick. Continuing the
+				// scan would wrap to startSlot and repeatedly favor the same low slots.
+				g_nextCanonicalLuaStubSlot = slot;
+				globalBudget = 0;
+				break;
+			}
 			if (!CanStageReliableStub(channel->m_StreamReliable.IsOverflowed(),
 				channel->m_StreamReliable.GetNumBytesLeft(), clientBudget,
 				globalBudget, compressedBytes, orderedCanonicalHash))

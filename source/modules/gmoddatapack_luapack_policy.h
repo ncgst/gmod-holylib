@@ -459,6 +459,12 @@ namespace HolyLib::LuaPack::Policy
 			stagedBytes <= streamBytesLeft - ReliableStubStreamReserveBytes;
 	}
 
+	constexpr bool MustDeferReliableStubForGlobalBudget(
+		std::size_t globalBudgetBytes, std::size_t stagedBytes)
+	{
+		return stagedBytes > globalBudgetBytes;
+	}
+
 	constexpr bool CommitReliableStubBatch(bool wroteBatch,
 		bool streamOverflowed, bool streamDrained)
 	{

@@ -379,6 +379,10 @@ int main()
 		assert(!CanStageReliableStub(false, 262144,
 			ReliableStubClientBudgetBytes, normalStagingBytes - 1,
 			compressedStubBytes, false));
+		assert(!MustDeferReliableStubForGlobalBudget(normalStagingBytes,
+			normalStagingBytes));
+		assert(MustDeferReliableStubForGlobalBudget(normalStagingBytes - 1,
+			normalStagingBytes));
 		assert(ReliableStubStagingBytes((std::numeric_limits<std::size_t>::max)(), true) ==
 			(std::numeric_limits<std::size_t>::max)());
 
@@ -406,6 +410,51 @@ int main()
 			++ticks;
 		}
 		assert(ticks > 1 && ticks < 100);
+
+		// More clients than fit in one global tick must rotate at the first deferred
+		// slot instead of wrapping to slot zero and starving the tail of the flood.
+		std::array<std::size_t, 16> clientRequests{};
+		clientRequests.fill(100);
+		std::array<std::size_t, 16> firstServedTick{};
+		firstServedTick.fill((std::numeric_limits<std::size_t>::max)());
+		std::size_t nextSlot = 0;
+		std::size_t totalRemaining = clientRequests.size() * clientRequests[0];
+		for (std::size_t tick = 0; totalRemaining != 0; ++tick)
+		{
+			assert(tick < 32);
+			std::size_t globalBudget = ReliableStubGlobalBudgetBytes;
+			const std::size_t startSlot = nextSlot;
+			for (std::size_t offset = 0;
+				offset < clientRequests.size() && globalBudget != 0; ++offset)
+			{
+				const std::size_t slot = (startSlot + offset) % clientRequests.size();
+				nextSlot = (slot + 1) % clientRequests.size();
+				std::size_t clientBudget = ReliableStubClientBudgetBytes;
+				while (clientRequests[slot] != 0)
+				{
+					if (MustDeferReliableStubForGlobalBudget(globalBudget,
+						normalStagingBytes))
+					{
+						nextSlot = slot;
+						globalBudget = 0;
+						break;
+					}
+					if (normalStagingBytes > clientBudget)
+						break;
+					if (firstServedTick[slot] ==
+						(std::numeric_limits<std::size_t>::max)())
+					{
+						firstServedTick[slot] = tick;
+					}
+					clientBudget -= normalStagingBytes;
+					globalBudget -= normalStagingBytes;
+					--clientRequests[slot];
+					--totalRemaining;
+				}
+			}
+		}
+		for (std::size_t firstTick : firstServedTick)
+			assert(firstTick < 3);
 		assert(!CommitReliableStubBatch(false, false, true));
 		assert(!CommitReliableStubBatch(true, true, false));
 		assert(!CommitReliableStubBatch(true, false, false));
