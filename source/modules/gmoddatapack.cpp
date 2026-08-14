@@ -128,14 +128,22 @@ struct ClientCanonicalLuaStubQueue
 	{
 		items.clear();
 		fileIDs.clear();
+		fragmentsPending = false;
+	}
+
+	std::size_t PendingWork() const
+	{
+		return items.size() + (fragmentsPending ? 1u : 0u);
 	}
 
 	std::deque<QueuedCanonicalLuaStub> items;
 	std::unordered_set<int> fileIDs;
+	bool fragmentsPending = false;
 };
 
 static std::array<ClientCanonicalLuaStubQueue, ABSOLUTE_PLAYER_LIMIT> g_clientCanonicalLuaStubQueues;
 static int g_nextCanonicalLuaStubSlot = 0;
+static int g_nextCanonicalLuaStubPumpSlot = 0;
 
 static void ClearClientCanonicalLuaStubs(int slot)
 {
@@ -148,6 +156,7 @@ static void ClearAllClientCanonicalLuaStubs()
 	for (ClientCanonicalLuaStubQueue& queue : g_clientCanonicalLuaStubQueues)
 		queue.Clear();
 	g_nextCanonicalLuaStubSlot = 0;
+	g_nextCanonicalLuaStubPumpSlot = 0;
 }
 
 static void CancelClientCanonicalLuaStub(int slot, int fileID)
@@ -2021,7 +2030,8 @@ static void DrainCanonicalLuaStubQueues()
 		CNetChan* channel = client && client->IsConnected() && client->GetNetChannel()
 			? (CNetChan*)client->GetNetChannel() : nullptr;
 		if (!CanBeginReliableStubBatch(channel != nullptr,
-			channel && channel->m_StreamReliable.IsOverflowed()))
+			channel && channel->m_StreamReliable.IsOverflowed(),
+			queue.fragmentsPending))
 			continue;
 
 		std::size_t clientBudget = ReliableStubClientBudgetBytes;
@@ -2116,7 +2126,10 @@ static void DrainCanonicalLuaStubQueues()
 			fragmentsOwned = channel->CreateFragmentsFromBuffer(
 				&channel->m_StreamReliable, FRAG_NORMAL_STREAM);
 			if (fragmentsOwned)
+			{
 				channel->m_StreamReliable.Reset();
+				queue.fragmentsPending = true;
+			}
 		}
 		if (!CommitReliableStubBatch(batchCount != 0,
 			channel->m_StreamReliable.IsOverflowed(), fragmentsOwned))
@@ -2131,6 +2144,48 @@ static void DrainCanonicalLuaStubQueues()
 				RestoreCanonicalHash(g_clientNativeLuaHashes[slot], fileID);
 			g_clientHashUpdatesPending[slot].erase(fileID);
 			queue.PopFront();
+		}
+	}
+}
+
+static void PumpCanonicalLuaStubFragments()
+{
+	using namespace HolyLib::LuaPack::Policy;
+	std::size_t packetBudget = ReliableStubGlobalPacketBudget;
+	const int startSlot = g_nextCanonicalLuaStubPumpSlot;
+	for (int offset = 0; offset < ABSOLUTE_PLAYER_LIMIT && packetBudget != 0;
+		++offset)
+	{
+		const int slot = (startSlot + offset) % ABSOLUTE_PLAYER_LIMIT;
+		g_nextCanonicalLuaStubPumpSlot = (slot + 1) % ABSOLUTE_PLAYER_LIMIT;
+		ClientCanonicalLuaStubQueue& queue = g_clientCanonicalLuaStubQueues[slot];
+		if (!queue.fragmentsPending)
+			continue;
+
+		CBaseClient* client = GetClientForLuaDelivery(slot);
+		CNetChan* channel = client && client->IsConnected() && client->GetNetChannel()
+			? (CNetChan*)client->GetNetChannel() : nullptr;
+		if (!channel)
+			continue;
+
+		if (channel->m_WaitingList[FRAG_NORMAL_STREAM].Count() == 0)
+		{
+			queue.fragmentsPending = false;
+			continue;
+		}
+
+		const bool rateWindowOpen = channel->m_fClearTime < channel->GetTime();
+		if (CanPumpReliableStubFragments(true,
+			channel->m_StreamReliable.IsOverflowed(), true, rateWindowOpen,
+			packetBudget))
+		{
+			// One packet at most per 50 ms module cadence. Transmit advances
+			// m_fClearTime from the actual encoded packet size, so the client's
+			// configured rate remains authoritative. Count the attempt against a
+			// server-wide cap so a full connection flood cannot create one frame's
+			// worth of unbounded synchronous sends.
+			--packetBudget;
+			channel->Transmit(false);
 		}
 	}
 }
@@ -2438,6 +2493,7 @@ void CGModDataPackModule::Think(bool bSimulating)
 	{
 		g_nLastCanonicalStubSend = currentTime;
 		DrainCanonicalLuaStubQueues();
+		PumpCanonicalLuaStubFragments();
 	}
 	if (currentTime < (g_nLastSend + 0.05))
 		return;
@@ -2528,7 +2584,7 @@ bool GMODDataPack_SetSignOnState(CBaseClient* cl, int state)
 
 	return HolyLib::LuaPack::Policy::HoldPreSpawnForLuaDelivery(
 		!g_pLuaDataPack.m_pPlayerQueue[slot].pQueue.empty(),
-		g_clientCanonicalLuaStubQueues[slot].items.size());
+		g_clientCanonicalLuaStubQueues[slot].PendingWork());
 }
 
 #if SYSTEM_WINDOWS

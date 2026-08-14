@@ -364,9 +364,16 @@ int main()
 			ReliableStubStagingBytes(compressedStubBytes, true);
 		static_assert(orderedStagingBytes > normalStagingBytes,
 			"ordered canonical identity must consume part of the pacing budget");
-		assert(!CanBeginReliableStubBatch(false, false));
-		assert(!CanBeginReliableStubBatch(true, true));
-		assert(CanBeginReliableStubBatch(true, false));
+		assert(!CanBeginReliableStubBatch(false, false, false));
+		assert(!CanBeginReliableStubBatch(true, true, false));
+		assert(!CanBeginReliableStubBatch(true, false, true));
+		assert(CanBeginReliableStubBatch(true, false, false));
+		assert(!CanPumpReliableStubFragments(false, false, true, true, 1));
+		assert(!CanPumpReliableStubFragments(true, true, true, true, 1));
+		assert(!CanPumpReliableStubFragments(true, false, false, true, 1));
+		assert(!CanPumpReliableStubFragments(true, false, true, false, 1));
+		assert(!CanPumpReliableStubFragments(true, false, true, true, 0));
+		assert(CanPumpReliableStubFragments(true, false, true, true, 1));
 		assert(!CanStageReliableStub(true, 262144,
 			ReliableStubClientBudgetBytes, ReliableStubGlobalBudgetBytes,
 			compressedStubBytes, false));
@@ -472,7 +479,7 @@ int main()
 		for (std::size_t tick = 0; backpressuredRemaining != 0; ++tick)
 		{
 			assert(tick < 8);
-			if (!CanBeginReliableStubBatch(true, false))
+			if (!CanBeginReliableStubBatch(true, false, false))
 				continue;
 			const bool sendAccepted = tick != 0;
 			const std::size_t batchCount = sendAccepted ? 1u : 0u;
@@ -483,6 +490,56 @@ int main()
 			acceptedBodies += batchCount;
 		}
 		assert(acceptedBodies == 3);
+
+		// A PRESPAWN client whose ordinary engine cadence is one packet per
+		// second must still make bounded progress. At most one packet is pumped
+		// per 50 ms tick, and closed rate windows do not transmit.
+		std::size_t reliablePackets = 100;
+		std::size_t pumpedPackets = 0;
+		for (std::size_t tick = 0; reliablePackets != 0; ++tick)
+		{
+			assert(tick < 220);
+			const bool rateWindowOpen = (tick % 2) == 1;
+			if (!CanPumpReliableStubFragments(true, false, true,
+				rateWindowOpen, ReliableStubGlobalPacketBudget))
+			{
+				continue;
+			}
+			--reliablePackets;
+			++pumpedPackets;
+		}
+		assert(pumpedPackets == 100);
+
+		std::array<bool, 80> floodPacketPending{};
+		floodPacketPending.fill(true);
+		std::array<std::size_t, 80> firstPumpTick{};
+		firstPumpTick.fill((std::numeric_limits<std::size_t>::max)());
+		std::size_t nextPumpSlot = 0;
+		std::size_t floodRemaining = floodPacketPending.size();
+		for (std::size_t tick = 0; floodRemaining != 0; ++tick)
+		{
+			assert(tick < 4);
+			std::size_t packetBudget = ReliableStubGlobalPacketBudget;
+			const std::size_t startSlot = nextPumpSlot;
+			for (std::size_t offset = 0;
+				offset < floodPacketPending.size() && packetBudget != 0; ++offset)
+			{
+				const std::size_t slot = (startSlot + offset) % floodPacketPending.size();
+				nextPumpSlot = (slot + 1) % floodPacketPending.size();
+				if (!floodPacketPending[slot] ||
+					!CanPumpReliableStubFragments(true, false, true, true,
+						packetBudget))
+				{
+					continue;
+				}
+				firstPumpTick[slot] = tick;
+				floodPacketPending[slot] = false;
+				--floodRemaining;
+				--packetBudget;
+			}
+		}
+		for (std::size_t firstTick : firstPumpTick)
+			assert(firstTick < 3);
 		assert(!HoldPreSpawnForLuaDelivery(false, 0));
 		assert(HoldPreSpawnForLuaDelivery(true, 0));
 		assert(HoldPreSpawnForLuaDelivery(false, 3922));
