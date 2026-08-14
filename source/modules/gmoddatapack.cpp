@@ -102,6 +102,7 @@ struct ClientCanonicalLuaStubQueue
 
 		items.push_back({fileID, compressed});
 		fileIDs.insert(fileID);
+		++enqueued;
 		return true;
 	}
 
@@ -122,6 +123,7 @@ struct ClientCanonicalLuaStubQueue
 			return;
 		fileIDs.erase(items.front().fileID);
 		items.pop_front();
+		++committed;
 	}
 
 	void Clear()
@@ -129,6 +131,11 @@ struct ClientCanonicalLuaStubQueue
 		items.clear();
 		fileIDs.clear();
 		fragmentsPending = false;
+		enqueued = 0;
+		committed = 0;
+		batches = 0;
+		pumpAttempts = 0;
+		summaryLogged = false;
 	}
 
 	std::size_t PendingWork() const
@@ -139,6 +146,11 @@ struct ClientCanonicalLuaStubQueue
 	std::deque<QueuedCanonicalLuaStub> items;
 	std::unordered_set<int> fileIDs;
 	bool fragmentsPending = false;
+	std::size_t enqueued = 0;
+	std::size_t committed = 0;
+	std::size_t batches = 0;
+	std::size_t pumpAttempts = 0;
+	bool summaryLogged = false;
 };
 
 static std::array<ClientCanonicalLuaStubQueue, ABSOLUTE_PLAYER_LIMIT> g_clientCanonicalLuaStubQueues;
@@ -1929,12 +1941,24 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 			return;
 		}
 
-		if (clientIdx < 0 || clientIdx >= ABSOLUTE_PLAYER_LIMIT ||
-			!g_clientCanonicalLuaStubQueues[clientIdx].Enqueue(fileID, delivery.compressed))
+		if (clientIdx < 0 || clientIdx >= ABSOLUTE_PLAYER_LIMIT)
 		{
 			DisconnectLuaHashFailure(clientIdx, fileName.c_str(),
 				"the canonical placeholder queue could not retain this request");
+			return;
 		}
+
+		ClientCanonicalLuaStubQueue& queue = g_clientCanonicalLuaStubQueues[clientIdx];
+		const std::size_t enqueuedBefore = queue.enqueued;
+		if (!queue.Enqueue(fileID, delivery.compressed))
+		{
+			DisconnectLuaHashFailure(clientIdx, fileName.c_str(),
+				"the canonical placeholder queue could not retain this request");
+			return;
+		}
+		if (enqueuedBefore == 0 && queue.enqueued == 1)
+			Msg(PROJECT_NAME " - luapack: client slot %i began paced canonical placeholder delivery\n",
+				clientIdx);
 		return;
 	}
 	if (delivery.action == HolyLib::LuaPack::DeliveryAction::Reject)
@@ -2129,6 +2153,7 @@ static void DrainCanonicalLuaStubQueues()
 			{
 				channel->m_StreamReliable.Reset();
 				queue.fragmentsPending = true;
+				++queue.batches;
 			}
 		}
 		if (!CommitReliableStubBatch(batchCount != 0,
@@ -2171,20 +2196,27 @@ static void PumpCanonicalLuaStubFragments()
 		if (channel->m_WaitingList[FRAG_NORMAL_STREAM].Count() == 0)
 		{
 			queue.fragmentsPending = false;
+			if (queue.items.empty() && queue.enqueued != 0 && !queue.summaryLogged)
+			{
+				queue.summaryLogged = true;
+				Msg(PROJECT_NAME " - luapack: client slot %i completed paced canonical placeholder delivery: enqueued=%u committed=%u batches=%u pump_attempts=%u\n",
+					slot, static_cast<unsigned int>(queue.enqueued),
+					static_cast<unsigned int>(queue.committed),
+					static_cast<unsigned int>(queue.batches),
+					static_cast<unsigned int>(queue.pumpAttempts));
+			}
 			continue;
 		}
 
-		const bool rateWindowOpen = channel->m_fClearTime < channel->GetTime();
 		if (CanPumpReliableStubFragments(true,
-			channel->m_StreamReliable.IsOverflowed(), true, rateWindowOpen,
-			packetBudget))
+			channel->m_StreamReliable.IsOverflowed(), true, packetBudget))
 		{
 			// One packet at most per 50 ms module cadence. Transmit advances
-			// m_fClearTime from the actual encoded packet size, so the client's
-			// configured rate remains authoritative. Count the attempt against a
-			// server-wide cap so a full connection flood cannot create one frame's
-			// worth of unbounded synchronous sends.
+			// CNetChan's reliable subchannel state and retransmission bookkeeping.
+			// Count the attempt against a server-wide cap so a full connection flood
+			// cannot create one frame's worth of unbounded synchronous sends.
 			--packetBudget;
+			++queue.pumpAttempts;
 			channel->Transmit(false);
 		}
 	}

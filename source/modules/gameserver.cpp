@@ -194,13 +194,17 @@ public:
 bool Gameserver_StageGModMessage(CBaseClient* client, const void* data, int dataBits)
 {
 	if (!client || !data || dataBits <= 0 || client->IsFakeClient() ||
-		!client->IsConnected() || !client->m_NetChannel)
+		dataBits >= (1 << 20) || !client->IsConnected() || !client->m_NetChannel)
 	{
 		return false;
 	}
 
 	SVC_CustomMessage msg;
-	msg.m_DataOut.StartWriting(const_cast<void*>(data), 0, 0, dataBits);
+	// bf_write requires a real, dword-padded backing size even when the exact bit
+	// length is supplied separately. Passing zero violates its nBits <= nBytes * 8
+	// contract and leaves the view internally inconsistent in non-assert builds.
+	const int dataBytes = PAD_NUMBER((dataBits + 7) >> 3, 4);
+	msg.m_DataOut.StartWriting(const_cast<void*>(data), dataBytes, 0, dataBits);
 	msg.m_iLength = dataBits;
 	msg.m_iLengthBits = 20;
 	msg.m_iType = svc_GMod_ServerToClient;

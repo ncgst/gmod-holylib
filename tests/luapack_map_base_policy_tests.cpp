@@ -354,7 +354,7 @@ int main()
 
 	// A 3,922-file required baseline can request every canonical placeholder in one
 	// frame. The scheduler must retain reliable-stream headroom, respect both budgets,
-	// and commit queue/hash state only after Transmit moved the complete batch into
+	// and commit queue/hash state only after the complete batch moved into
 	// owned fragments. Overflow/reset leaves every request retryable.
 	{
 		constexpr std::size_t compressedStubBytes = 320;
@@ -368,12 +368,11 @@ int main()
 		assert(!CanBeginReliableStubBatch(true, true, false));
 		assert(!CanBeginReliableStubBatch(true, false, true));
 		assert(CanBeginReliableStubBatch(true, false, false));
-		assert(!CanPumpReliableStubFragments(false, false, true, true, 1));
-		assert(!CanPumpReliableStubFragments(true, true, true, true, 1));
-		assert(!CanPumpReliableStubFragments(true, false, false, true, 1));
-		assert(!CanPumpReliableStubFragments(true, false, true, false, 1));
-		assert(!CanPumpReliableStubFragments(true, false, true, true, 0));
-		assert(CanPumpReliableStubFragments(true, false, true, true, 1));
+		assert(!CanPumpReliableStubFragments(false, false, true, 1));
+		assert(!CanPumpReliableStubFragments(true, true, true, 1));
+		assert(!CanPumpReliableStubFragments(true, false, false, 1));
+		assert(!CanPumpReliableStubFragments(true, false, true, 0));
+		assert(CanPumpReliableStubFragments(true, false, true, 1));
 		assert(!CanStageReliableStub(true, 262144,
 			ReliableStubClientBudgetBytes, ReliableStubGlobalBudgetBytes,
 			compressedStubBytes, false));
@@ -492,16 +491,16 @@ int main()
 		assert(acceptedBodies == 3);
 
 		// A PRESPAWN client whose ordinary engine cadence is one packet per
-		// second must still make bounded progress. At most one packet is pumped
-		// per 50 ms tick, and closed rate windows do not transmit.
+		// second must still make bounded progress. The dedicated pump sends at
+		// most one packet per client per 50 ms tick, independently of the clear
+		// time that ordinary signon traffic can continually move forward.
 		std::size_t reliablePackets = 100;
 		std::size_t pumpedPackets = 0;
 		for (std::size_t tick = 0; reliablePackets != 0; ++tick)
 		{
-			assert(tick < 220);
-			const bool rateWindowOpen = (tick % 2) == 1;
+			assert(tick < 110);
 			if (!CanPumpReliableStubFragments(true, false, true,
-				rateWindowOpen, ReliableStubGlobalPacketBudget))
+				ReliableStubGlobalPacketBudget))
 			{
 				continue;
 			}
@@ -527,7 +526,7 @@ int main()
 				const std::size_t slot = (startSlot + offset) % floodPacketPending.size();
 				nextPumpSlot = (slot + 1) % floodPacketPending.size();
 				if (!floodPacketPending[slot] ||
-					!CanPumpReliableStubFragments(true, false, true, true,
+					!CanPumpReliableStubFragments(true, false, true,
 						packetBudget))
 				{
 					continue;

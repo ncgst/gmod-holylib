@@ -439,7 +439,7 @@ namespace HolyLib::LuaPack::Policy
 
 	// Packet availability is intentionally not a staging precondition. The batch is
 	// moved into CNetChan's owned reliable-fragment list without transmitting it;
-	// the engine then sends those fragments under its normal bandwidth pacing.
+	// the bounded dedicated pump below then advances those owned fragments.
 	// CanPacket may be false every time a module Think callback runs when the
 	// engine or an async transport consumes each send opportunity later in-frame.
 	constexpr bool CanBeginReliableStubBatch(bool channelUsable,
@@ -449,16 +449,15 @@ namespace HolyLib::LuaPack::Policy
 	}
 
 	// Source can limit a PRESPAWN client with pending reliable fragments to one
-	// packet per second. Pump at the module's 50 ms cadence only when CNetChan's
-	// own clear time permits another packet. Transport-queue occupancy is omitted
-	// deliberately: it can remain set across every module callback even though the
-	// rate window has opened and the queued packet is progressing asynchronously.
+	// packet per second. Pump at the module's fixed 50 ms cadence instead of using
+	// CNetChan's clear time: the ordinary PRESPAWN packet sent elsewhere in the frame
+	// can continually move that window forward and starve this queue. The one-packet
+	// per-client rule and global cap provide the independent transport bound.
 	constexpr bool CanPumpReliableStubFragments(bool channelUsable,
-		bool streamOverflowed, bool fragmentsPending, bool rateWindowOpen,
-		std::size_t globalPacketBudget)
+		bool streamOverflowed, bool fragmentsPending, std::size_t globalPacketBudget)
 	{
 		return channelUsable && !streamOverflowed && fragmentsPending &&
-			rateWindowOpen && globalPacketBudget != 0;
+			globalPacketBudget != 0;
 	}
 
 	constexpr std::size_t ReliableStubStagingBytes(std::size_t compressedBytes,
