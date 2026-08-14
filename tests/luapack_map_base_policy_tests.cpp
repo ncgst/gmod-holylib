@@ -364,6 +364,10 @@ int main()
 			ReliableStubStagingBytes(compressedStubBytes, true);
 		static_assert(orderedStagingBytes > normalStagingBytes,
 			"ordered canonical identity must consume part of the pacing budget");
+		assert(!CanBeginReliableStubBatch(false, true, false));
+		assert(!CanBeginReliableStubBatch(true, false, false));
+		assert(!CanBeginReliableStubBatch(true, true, true));
+		assert(CanBeginReliableStubBatch(true, true, false));
 		assert(!CanStageReliableStub(true, 262144,
 			ReliableStubClientBudgetBytes, ReliableStubGlobalBudgetBytes,
 			compressedStubBytes, false));
@@ -459,6 +463,26 @@ int main()
 		assert(!CommitReliableStubBatch(true, true, false));
 		assert(!CommitReliableStubBatch(true, false, false));
 		assert(CommitReliableStubBatch(true, false, true));
+
+		// Channel choke and a transient SendNetMsg rejection defer the same front
+		// item. Only an accepted batch transferred into owned fragments advances
+		// the queue, so neither condition creates a disconnect or a duplicate body.
+		std::size_t backpressuredRemaining = 3;
+		std::size_t acceptedBodies = 0;
+		for (std::size_t tick = 0; backpressuredRemaining != 0; ++tick)
+		{
+			assert(tick < 8);
+			const bool canPacket = tick >= 2;
+			if (!CanBeginReliableStubBatch(true, canPacket, false))
+				continue;
+			const bool sendAccepted = tick != 2;
+			const std::size_t batchCount = sendAccepted ? 1u : 0u;
+			if (!CommitReliableStubBatch(batchCount != 0, false, true))
+				continue;
+			backpressuredRemaining -= batchCount;
+			acceptedBodies += batchCount;
+		}
+		assert(acceptedBodies == 3);
 		assert(!HoldPreSpawnForLuaDelivery(false, 0));
 		assert(HoldPreSpawnForLuaDelivery(true, 0));
 		assert(HoldPreSpawnForLuaDelivery(false, 3922));

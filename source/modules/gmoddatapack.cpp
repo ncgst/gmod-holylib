@@ -64,6 +64,7 @@ IModule* pGModDataPackModule = &g_pGModDataPackModule;
 
 #if MODULE_EXISTS_GAMESERVER
 extern CBaseClient* Gameserver_GetClientBySlot(int slot);
+extern bool Gameserver_StageGModMessage(CBaseClient* client, const void* data, int dataBits);
 #endif
 
 static CBaseClient* GetClientForLuaDelivery(int slot)
@@ -1663,15 +1664,21 @@ static bool SendCompressedLuaFile(int clientIdx, int fileID, const Bootil::AutoB
 	if (msg.IsOverflowed())
 		return false;
 
-	CBaseClient* client = knownClient ? knownClient : GetClientForLuaDelivery(clientIdx);
-	CNetChan* channel = client && client->GetNetChannel()
-		? (CNetChan*)client->GetNetChannel() : nullptr;
-	const int reliableBitsBefore = channel
-		? channel->m_StreamReliable.GetNumBitsWritten() : -1;
-
-	Util::engineserver->GMOD_SendToClient(clientIdx, msg.GetData(), msg.GetNumBitsWritten());
-	const bool queued = channel && !channel->m_StreamReliable.IsOverflowed() &&
-		channel->m_StreamReliable.GetNumBitsWritten() > reliableBitsBefore;
+	bool queued = true;
+#if MODULE_EXISTS_GAMESERVER
+	if (knownClient)
+	{
+		// The paced path must know whether CNetChan accepted the message. The
+		// engine wrapper is void and may also move data out of its scratch buffer,
+		// so scratch-bit growth is not a valid acceptance signal.
+		queued = Gameserver_StageGModMessage(knownClient, msg.GetData(),
+			msg.GetNumBitsWritten());
+	}
+	else
+#endif
+	{
+		Util::engineserver->GMOD_SendToClient(clientIdx, msg.GetData(), msg.GetNumBitsWritten());
+	}
 
 	if (queued && g_pGModDataPackModule.InDebug())
 		Msg(PROJECT_NAME " - gmoddatapack: Sent FileID %i though reliable stream!\n", fileID);
@@ -2013,7 +2020,9 @@ static void DrainCanonicalLuaStubQueues()
 		CBaseClient* client = GetClientForLuaDelivery(slot);
 		CNetChan* channel = client && client->IsConnected() && client->GetNetChannel()
 			? (CNetChan*)client->GetNetChannel() : nullptr;
-		if (!channel || channel->m_StreamReliable.IsOverflowed())
+		if (!CanBeginReliableStubBatch(channel != nullptr,
+			channel && channel->CanPacket(),
+			channel && channel->m_StreamReliable.IsOverflowed()))
 			continue;
 
 		std::size_t clientBudget = ReliableStubClientBudgetBytes;
@@ -2082,14 +2091,9 @@ static void DrainCanonicalLuaStubQueues()
 			}
 			if (!SendCompressedLuaFile(slot, item.fileID, *item.compressed, client))
 			{
-				const char* registeredPath = g_pDataPack && g_pDataPack->m_pClientLuaFiles &&
-					item.fileID > 0 && item.fileID < g_pDataPack->m_pClientLuaFiles->GetNumStrings()
-					? g_pDataPack->m_pClientLuaFiles->GetString(item.fileID) : nullptr;
-				const std::string failedPath = registeredPath ? registeredPath : "an unknown file";
-				queue.Clear();
-				queueInvalid = true;
-				DisconnectLuaHashFailure(slot, failedPath.c_str(),
-					"the canonical placeholder could not be staged safely");
+				// A full/choked reliable stream is transient. Leave this item at the
+				// front and retry after CNetChan has packet capacity; disconnecting here
+				// turns ordinary backpressure into a required-lane identity failure.
 				break;
 			}
 

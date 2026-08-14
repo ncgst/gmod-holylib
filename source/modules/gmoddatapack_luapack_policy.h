@@ -436,6 +436,12 @@ namespace HolyLib::LuaPack::Policy
 	constexpr std::size_t ReliableStubEnvelopeBytes = 32u;
 	constexpr std::size_t ReliableStubOrderedHashBytes = 96u;
 
+	constexpr bool CanBeginReliableStubBatch(bool channelUsable,
+		bool canPacket, bool streamOverflowed)
+	{
+		return channelUsable && canPacket && !streamOverflowed;
+	}
+
 	constexpr std::size_t ReliableStubStagingBytes(std::size_t compressedBytes,
 		bool orderedCanonicalHash)
 	{

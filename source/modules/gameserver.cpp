@@ -186,6 +186,27 @@ public:
 	int m_iLengthBits = -1;
 };
 
+// GMOD_SendToClient has a void engine ABI, so callers cannot distinguish a
+// message accepted by the reliable stream from one rejected by bf_write. Lua
+// baseline pacing needs that ownership boundary before it removes a queued
+// request. Keep the wire format identical to the engine detour while exposing
+// the CNetChan boolean for that narrow native caller.
+bool Gameserver_StageGModMessage(CBaseClient* client, const void* data, int dataBits)
+{
+	if (!client || !data || dataBits <= 0 || client->IsFakeClient() ||
+		!client->IsConnected() || !client->m_NetChannel)
+	{
+		return false;
+	}
+
+	SVC_CustomMessage msg;
+	msg.m_DataOut.StartWriting(const_cast<void*>(data), 0, 0, dataBits);
+	msg.m_iLength = dataBits;
+	msg.m_iLengthBits = 20;
+	msg.m_iType = svc_GMod_ServerToClient;
+	return client->m_NetChannel->SendNetMsg(msg, true, false);
+}
+
 PushReferenced_LuaClass(CBaseClient)
 SpecialGet_LuaClass(CBaseClient, CHLTVClient, "CBaseClient", IsCBaseClientAccessibleFromLua(pVar))
 
@@ -3172,15 +3193,8 @@ static void hook_CVEngineServer_GMOD_SendToClient(void* _this, int client, void 
 		return;
 	}
 
-	// Not 1:1 to GMod but should be good enouth
-
-	SVC_CustomMessage msg;
-	msg.m_DataOut.StartWriting(data, 0, 0, dataSize);
-	msg.m_iLength = dataSize;
-	msg.m_iLengthBits = 20;
-	msg.m_iType = svc_GMod_ServerToClient;
-	
-	pClient->m_NetChannel->SendNetMsg(msg, true, false);
+	// Not 1:1 to GMod but should be good enough.
+	(void)Gameserver_StageGModMessage(pClient, data, dataSize);
 }
 
 #if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
