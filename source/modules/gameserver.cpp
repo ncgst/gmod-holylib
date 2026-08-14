@@ -74,6 +74,32 @@ IModule* pGameServerModule = &g_pGameServerModule;
 static std::vector<CGameClient*> g_pQueueClients;
 extern CGlobalVars* gpGlobals;
 
+// Lua download requests can originate from both ordinary server slots and the
+// parked pre-game queue. Util::GetClientByIndex only sees CBaseServer::m_Clients,
+// so datapack pacing needs this slot-owned lookup to inspect the actual channel
+// before staging reliable data. The server runs all client-list mutation and Lua
+// delivery on the main thread.
+CBaseClient* Gameserver_GetClientBySlot(int slot)
+{
+	if (slot < 0)
+		return nullptr;
+
+	if (Util::server && slot < Util::server->GetClientCount())
+	{
+		CBaseClient* client = (CBaseClient*)Util::server->GetClient(slot);
+		if (client && client->m_nClientSlot == slot)
+			return client;
+	}
+
+	for (CGameClient* queueClient : g_pQueueClients)
+	{
+		if (queueClient && queueClient->m_nClientSlot == slot)
+			return (CBaseClient*)queueClient;
+	}
+
+	return nullptr;
+}
+
 /*
  * Queue CGameClients use slots at/above gpGlobals->maxClients, but the engine's
  * CGameClient::Connect still derives an edict from slot + 1. Those edicts are

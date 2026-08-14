@@ -2253,7 +2253,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 				Msg(PROJECT_NAME " - luapack: client slot %i is using required map base %s with per-path native deltas; stubbing unchanged files without waiting for READY\n",
 					slot, client.generation.c_str());
 		}
-		return {DeliveryAction::Stub, generation->second.compressedRequiredStub.get(), nullptr};
+		return {DeliveryAction::Stub, generation->second.compressedRequiredStub, nullptr};
 	}
 
 	void DisconnectRequiredClient(int slot, const char* failure)

@@ -3,6 +3,7 @@
 #include <cassert>
 #include <array>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -350,6 +351,69 @@ int main()
 	assert(SelectBaseline(Lane::Required, true, BaseAvailability::Unusable) == Action::Reject);
 	assert(SelectBaseline(Lane::Required, false, BaseAvailability::Ready) == Action::Reject);
 	assert(SelectFile(Lane::Required, true, BaseAvailability::Missing, false, true) == Action::Reject);
+
+	// A 3,922-file required baseline can request every canonical placeholder in one
+	// frame. The scheduler must retain reliable-stream headroom, respect both budgets,
+	// and commit queue/hash state only after Transmit moved the complete batch into
+	// owned fragments. Overflow/reset leaves every request retryable.
+	{
+		constexpr std::size_t compressedStubBytes = 320;
+		constexpr std::size_t normalStagingBytes =
+			ReliableStubStagingBytes(compressedStubBytes, false);
+		constexpr std::size_t orderedStagingBytes =
+			ReliableStubStagingBytes(compressedStubBytes, true);
+		static_assert(orderedStagingBytes > normalStagingBytes,
+			"ordered canonical identity must consume part of the pacing budget");
+		assert(!CanStageReliableStub(true, 262144,
+			ReliableStubClientBudgetBytes, ReliableStubGlobalBudgetBytes,
+			compressedStubBytes, false));
+		assert(CanStageReliableStub(false,
+			ReliableStubStreamReserveBytes + normalStagingBytes,
+			normalStagingBytes, normalStagingBytes, compressedStubBytes, false));
+		assert(!CanStageReliableStub(false,
+			ReliableStubStreamReserveBytes + normalStagingBytes - 1,
+			normalStagingBytes, normalStagingBytes, compressedStubBytes, false));
+		assert(!CanStageReliableStub(false, 262144,
+			normalStagingBytes - 1, ReliableStubGlobalBudgetBytes,
+			compressedStubBytes, false));
+		assert(!CanStageReliableStub(false, 262144,
+			ReliableStubClientBudgetBytes, normalStagingBytes - 1,
+			compressedStubBytes, false));
+		assert(ReliableStubStagingBytes((std::numeric_limits<std::size_t>::max)(), true) ==
+			(std::numeric_limits<std::size_t>::max)());
+
+		std::size_t remaining = 3922;
+		std::size_t ticks = 0;
+		while (remaining != 0)
+		{
+			std::size_t streamLeft = 262144;
+			std::size_t clientBudget = ReliableStubClientBudgetBytes;
+			std::size_t globalBudget = ReliableStubGlobalBudgetBytes;
+			std::size_t stagedThisTick = 0;
+			while (remaining != 0 && CanStageReliableStub(false, streamLeft,
+				clientBudget, globalBudget, compressedStubBytes, false))
+			{
+				streamLeft -= normalStagingBytes;
+				clientBudget -= normalStagingBytes;
+				globalBudget -= normalStagingBytes;
+				stagedThisTick += normalStagingBytes;
+				--remaining;
+			}
+			assert(stagedThisTick != 0);
+			assert(stagedThisTick <= ReliableStubClientBudgetBytes);
+			assert(stagedThisTick <= ReliableStubGlobalBudgetBytes);
+			assert(streamLeft >= ReliableStubStreamReserveBytes);
+			++ticks;
+		}
+		assert(ticks > 1 && ticks < 100);
+		assert(!CommitReliableStubBatch(false, false, true));
+		assert(!CommitReliableStubBatch(true, true, false));
+		assert(!CommitReliableStubBatch(true, false, false));
+		assert(CommitReliableStubBatch(true, false, true));
+		assert(!HoldPreSpawnForLuaDelivery(false, 0));
+		assert(HoldPreSpawnForLuaDelivery(true, 0));
+		assert(HoldPreSpawnForLuaDelivery(false, 3922));
+	}
 
 	std::cout << "luapack map-base policy tests passed\n";
 	return 0;

@@ -4,6 +4,7 @@
 #include "public/imodule.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 class CBaseClient;
@@ -73,11 +74,11 @@ namespace HolyLib::LuaPack
 	struct DeliveryDecision
 	{
 		DeliveryDecision(DeliveryAction deliveryAction = DeliveryAction::Native,
-			const Bootil::AutoBuffer* payload = nullptr, const char* rejectionFailure = nullptr)
+			std::shared_ptr<const Bootil::AutoBuffer> payload = {}, const char* rejectionFailure = nullptr)
 			: action(deliveryAction), compressed(payload), failure(rejectionFailure) {}
 
 		DeliveryAction action;
-		const Bootil::AutoBuffer* compressed;
+		std::shared_ptr<const Bootil::AutoBuffer> compressed;
 		const char* failure;
 	};
 

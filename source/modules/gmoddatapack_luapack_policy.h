@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -421,6 +423,52 @@ namespace HolyLib::LuaPack::Policy
 		bool publishedHashMatchesCanonical)
 	{
 		return clientActive || nativeHashKnown || publishedHashMatchesCanonical;
+	}
+
+	// Canonical LuaPack placeholders are small, but thousands can be requested in one
+	// frame. Keep a large part of the engine's reliable stream available to unrelated
+	// signon traffic and pace both each client and the server as a whole. The envelope
+	// allowance covers the GMod custom-message frame and an optional one-entry string-
+	// table update; it is deliberately larger than their encoded wire size.
+	constexpr std::size_t ReliableStubStreamReserveBytes = 64u * 1024u;
+	constexpr std::size_t ReliableStubClientBudgetBytes = 16u * 1024u;
+	constexpr std::size_t ReliableStubGlobalBudgetBytes = 128u * 1024u;
+	constexpr std::size_t ReliableStubEnvelopeBytes = 32u;
+	constexpr std::size_t ReliableStubOrderedHashBytes = 96u;
+
+	constexpr std::size_t ReliableStubStagingBytes(std::size_t compressedBytes,
+		bool orderedCanonicalHash)
+	{
+		const std::size_t overhead = ReliableStubEnvelopeBytes +
+			(orderedCanonicalHash ? ReliableStubOrderedHashBytes : 0u);
+		return compressedBytes > (std::numeric_limits<std::size_t>::max)() - overhead
+			? (std::numeric_limits<std::size_t>::max)()
+			: compressedBytes + overhead;
+	}
+
+	constexpr bool CanStageReliableStub(bool streamOverflowed,
+		std::size_t streamBytesLeft, std::size_t clientBudgetBytes,
+		std::size_t globalBudgetBytes, std::size_t compressedBytes,
+		bool orderedCanonicalHash)
+	{
+		if (streamOverflowed || streamBytesLeft < ReliableStubStreamReserveBytes)
+			return false;
+		const std::size_t stagedBytes = ReliableStubStagingBytes(
+			compressedBytes, orderedCanonicalHash);
+		return stagedBytes <= clientBudgetBytes && stagedBytes <= globalBudgetBytes &&
+			stagedBytes <= streamBytesLeft - ReliableStubStreamReserveBytes;
+	}
+
+	constexpr bool CommitReliableStubBatch(bool wroteBatch,
+		bool streamOverflowed, bool streamDrained)
+	{
+		return wroteBatch && !streamOverflowed && streamDrained;
+	}
+
+	constexpr bool HoldPreSpawnForLuaDelivery(bool legacyQueuePending,
+		std::size_t canonicalStubQueueSize)
+	{
+		return legacyQueuePending || canonicalStubQueueSize != 0;
 	}
 
 	constexpr bool NeedsPerClientNativeHashes(Lane lane)
