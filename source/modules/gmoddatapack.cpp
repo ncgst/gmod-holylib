@@ -2021,7 +2021,6 @@ static void DrainCanonicalLuaStubQueues()
 		CNetChan* channel = client && client->IsConnected() && client->GetNetChannel()
 			? (CNetChan*)client->GetNetChannel() : nullptr;
 		if (!CanBeginReliableStubBatch(channel != nullptr,
-			channel && channel->CanPacket(),
 			channel && channel->m_StreamReliable.IsOverflowed()))
 			continue;
 
@@ -2030,8 +2029,6 @@ static void DrainCanonicalLuaStubQueues()
 		bool queueInvalid = false;
 		std::vector<bool> orderedCanonicalHashes;
 		orderedCanonicalHashes.reserve(queue.items.size());
-		const int reliableBitsBefore = channel->m_StreamReliable.GetNumBitsWritten();
-
 		while (batchCount < queue.items.size())
 		{
 			const QueuedCanonicalLuaStub& item = queue.items[batchCount];
@@ -2108,15 +2105,21 @@ static void DrainCanonicalLuaStubQueues()
 		if (channel->m_StreamReliable.IsOverflowed())
 			continue;
 
-		// Transmit first converts the reliable stream into owned fragments and resets
-		// the scratch buffer. Only that boundary makes it safe to forget a request:
-		// the live overflow hook can reset the scratch stream but not those fragments.
-		const bool wroteAnyBits = channel->m_StreamReliable.GetNumBitsWritten() > reliableBitsBefore;
-		if (wroteAnyBits)
-			channel->Transmit(false);
-		const bool streamDrained = channel->m_StreamReliable.GetNumBitsWritten() == 0;
+		// Transfer an accepted batch directly into CNetChan-owned reliable fragments.
+		// Do not force a packet here: CanPacket can be unavailable at every module
+		// callback while the engine still consumes the next opportunity later in the
+		// frame. Fragment ownership makes the batch immune to a later scratch-buffer
+		// reset while preserving the engine's normal rate and retransmission policy.
+		bool fragmentsOwned = false;
+		if (batchCount != 0 && !channel->m_StreamReliable.IsOverflowed())
+		{
+			fragmentsOwned = channel->CreateFragmentsFromBuffer(
+				&channel->m_StreamReliable, FRAG_NORMAL_STREAM);
+			if (fragmentsOwned)
+				channel->m_StreamReliable.Reset();
+		}
 		if (!CommitReliableStubBatch(batchCount != 0,
-			channel->m_StreamReliable.IsOverflowed(), streamDrained))
+			channel->m_StreamReliable.IsOverflowed(), fragmentsOwned))
 		{
 			continue;
 		}

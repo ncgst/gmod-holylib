@@ -436,10 +436,15 @@ namespace HolyLib::LuaPack::Policy
 	constexpr std::size_t ReliableStubEnvelopeBytes = 32u;
 	constexpr std::size_t ReliableStubOrderedHashBytes = 96u;
 
+	// Packet availability is intentionally not a staging precondition. The batch is
+	// moved into CNetChan's owned reliable-fragment list without transmitting it;
+	// the engine then sends those fragments under its normal bandwidth pacing.
+	// CanPacket may be false every time a module Think callback runs when the
+	// engine or an async transport consumes each send opportunity later in-frame.
 	constexpr bool CanBeginReliableStubBatch(bool channelUsable,
-		bool canPacket, bool streamOverflowed)
+		bool streamOverflowed)
 	{
-		return channelUsable && canPacket && !streamOverflowed;
+		return channelUsable && !streamOverflowed;
 	}
 
 	constexpr std::size_t ReliableStubStagingBytes(std::size_t compressedBytes,
@@ -472,9 +477,9 @@ namespace HolyLib::LuaPack::Policy
 	}
 
 	constexpr bool CommitReliableStubBatch(bool wroteBatch,
-		bool streamOverflowed, bool streamDrained)
+		bool streamOverflowed, bool fragmentsOwned)
 	{
-		return wroteBatch && !streamOverflowed && streamDrained;
+		return wroteBatch && !streamOverflowed && fragmentsOwned;
 	}
 
 	constexpr bool HoldPreSpawnForLuaDelivery(bool legacyQueuePending,

@@ -364,10 +364,9 @@ int main()
 			ReliableStubStagingBytes(compressedStubBytes, true);
 		static_assert(orderedStagingBytes > normalStagingBytes,
 			"ordered canonical identity must consume part of the pacing budget");
-		assert(!CanBeginReliableStubBatch(false, true, false));
-		assert(!CanBeginReliableStubBatch(true, false, false));
-		assert(!CanBeginReliableStubBatch(true, true, true));
-		assert(CanBeginReliableStubBatch(true, true, false));
+		assert(!CanBeginReliableStubBatch(false, false));
+		assert(!CanBeginReliableStubBatch(true, true));
+		assert(CanBeginReliableStubBatch(true, false));
 		assert(!CanStageReliableStub(true, 262144,
 			ReliableStubClientBudgetBytes, ReliableStubGlobalBudgetBytes,
 			compressedStubBytes, false));
@@ -464,20 +463,21 @@ int main()
 		assert(!CommitReliableStubBatch(true, false, false));
 		assert(CommitReliableStubBatch(true, false, true));
 
-		// Channel choke and a transient SendNetMsg rejection defer the same front
-		// item. Only an accepted batch transferred into owned fragments advances
-		// the queue, so neither condition creates a disconnect or a duplicate body.
+		// Packet availability is deliberately absent from the staging predicate: a
+		// module callback can miss every send opportunity while the engine sends later
+		// in-frame. A transient SendNetMsg rejection still defers the same front item,
+		// and only transfer into owned fragments advances the queue.
 		std::size_t backpressuredRemaining = 3;
 		std::size_t acceptedBodies = 0;
 		for (std::size_t tick = 0; backpressuredRemaining != 0; ++tick)
 		{
 			assert(tick < 8);
-			const bool canPacket = tick >= 2;
-			if (!CanBeginReliableStubBatch(true, canPacket, false))
+			if (!CanBeginReliableStubBatch(true, false))
 				continue;
-			const bool sendAccepted = tick != 2;
+			const bool sendAccepted = tick != 0;
 			const std::size_t batchCount = sendAccepted ? 1u : 0u;
-			if (!CommitReliableStubBatch(batchCount != 0, false, true))
+			const bool fragmentsOwned = batchCount != 0;
+			if (!CommitReliableStubBatch(batchCount != 0, false, fragmentsOwned))
 				continue;
 			backpressuredRemaining -= batchCount;
 			acceptedBodies += batchCount;
