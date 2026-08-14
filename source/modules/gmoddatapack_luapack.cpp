@@ -769,6 +769,25 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		client = ClientPin();
 	}
 
+	static bool PinCurrentGeneration(ClientPin& client)
+	{
+		if (!client.generation.empty())
+			return true;
+		if (state.currentGeneration.empty())
+			return false;
+
+		auto generation = state.generations.find(state.currentGeneration);
+		if (generation == state.generations.end())
+			return false;
+
+		client.generation = generation->first;
+		client.deadline = ServerTime() + GetConfig().readyDeadlineSeconds;
+		client.fallback = false;
+		client.holdsPin = true;
+		++generation->second.pins;
+		return true;
+	}
+
 	static void MarkFallback(ClientPin& client)
 	{
 		ReleaseGenerationReference(client);
@@ -832,17 +851,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			V_stricmp(networkID, "BOT") != 0 && V_stricmp(networkID, "UNKNOWN") != 0)
 			client.networkID = networkID;
 
-		if (state.currentGeneration.empty())
-			return;
-		auto generation = state.generations.find(state.currentGeneration);
-		if (generation == state.generations.end())
-			return;
-
-		client.generation = generation->first;
-		client.deadline = ServerTime() + GetConfig().readyDeadlineSeconds;
-		client.fallback = false;
-		client.holdsPin = true;
-		++generation->second.pins;
+		PinCurrentGeneration(client);
 	}
 
 	static const char* BeginPendingRecoveryBaseline(int slot)
@@ -1098,19 +1107,14 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			return;
 		}
 
-		if (currentConfig.requiredRecovery)
+		const bool resolvedIdentity = BindResolvedIdentity(slot, client);
+		if (Policy::CanConsumeRequiredRecovery(currentConfig.requiredRecovery,
+			resolvedIdentity))
 		{
 			// The ticket-provided SteamID is resolved before ServerInfo, while Source's
 			// fully-authenticated flag normally arrives later in signon. Resolution is
 			// sufficient to select an account-keyed baseline; arming and successful clear
 			// still require the later authenticated identity to match exactly.
-			if (!BindResolvedIdentity(slot, client))
-			{
-				Warning(PROJECT_NAME " - luapack: client slot %i has no resolved SteamID64 before its required Lua baseline; failing closed\n",
-					slot);
-				return;
-			}
-
 			const Policy::RecoveryConsumeResult recovery = state.requiredRecovery.Consume(
 				client.steamID64, client.connectionSerial, ServerTime());
 			if (recovery == Policy::RecoveryConsumeResult::Native)
@@ -1124,6 +1128,10 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 				return;
 			}
 		}
+		// Queue clients can reach ServerInfo before Source exposes their ticket identity.
+		// That makes account-owned recovery unavailable at this boundary, but it must not
+		// reject an otherwise valid required base. A later authenticated failure may bind
+		// ownership and arm recovery for the next connection.
 
 		// The old optimistic-recovery latch only belongs to the fail-open lane. Required
 		// connections must either resolve their pack or be kicked, regardless of prior history.
@@ -2142,14 +2150,14 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		if (const char* recoveryFailure = BeginPendingRecoveryBaseline(slot))
 			return {BaselineAction::Reject, recoveryFailure};
 
+		if (Policy::NeedsConnectionEpochAtBaseline(
+			state.clients[slot].connectionSerial))
+			StartClientEpoch(slot);
 		ClientPin& client = state.clients[slot];
 		ResolveDeliveryLane(slot, client);
-		if (client.requiredLane && !Policy::RequiredBaselineIdentityReady(
-			GetConfig().requiredRecovery, client.resolvedIdentity))
-		{
-			return {BaselineAction::Reject,
-				"a resolved SteamID64 was unavailable before the required Lua baseline"};
-		}
+		if (Policy::ShouldPinCurrentBaseForBaseline(ClientLane(client),
+			!client.generation.empty(), !state.currentGeneration.empty()))
+			PinCurrentGeneration(client);
 		const Policy::BaseAvailability base = BaseAvailabilityForClient(client, true);
 		switch (Policy::SelectBaseline(ClientLane(client), SupportsCanonicalRegistration(), base))
 		{
@@ -2426,11 +2434,16 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			bool handoffQueued = false;
 			if (exactFailure && GetConfig().requiredRecovery)
 			{
+				// Some queue clients had no ticket identity at their initial ServerInfo. First
+				// authenticated binding is safe for this connection epoch; an identity that was
+				// already bound must still match exactly to prevent slot-reuse ownership leaks.
+				const bool previouslyResolved = client.resolvedIdentity;
 				const std::uint64_t expectedSteamID64 = client.steamID64;
 				const bool authenticatedNow = BindAuthenticatedIdentity(slot, client);
 				if (Policy::RequiredFailureIdentityReady(true, client.resolvedIdentity,
 					client.authenticatedIdentity) && authenticatedNow &&
-					client.steamID64 == expectedSteamID64)
+					Policy::RequiredFailureIdentityMatches(previouslyResolved,
+						expectedSteamID64, client.steamID64))
 				{
 					const double ttl = GetConfig().requiredRecoveryTtlSeconds;
 					const Policy::RecoveryArmResult armed = state.requiredRecovery.Arm(

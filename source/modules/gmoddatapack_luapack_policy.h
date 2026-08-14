@@ -355,16 +355,34 @@ namespace HolyLib::LuaPack::Policy
 		return optedOut ? Lane::NativeOptOut : (required ? Lane::Required : Lane::NativeRescue);
 	}
 
-	constexpr bool RequiredBaselineIdentityReady(bool recoveryEnabled,
+	constexpr bool CanConsumeRequiredRecovery(bool recoveryEnabled,
 		bool resolvedIdentity)
 	{
-		return !recoveryEnabled || resolvedIdentity;
+		return recoveryEnabled && resolvedIdentity;
+	}
+
+	constexpr bool NeedsConnectionEpochAtBaseline(std::uint64_t connectionSerial)
+	{
+		return connectionSerial == 0;
+	}
+
+	constexpr bool ShouldPinCurrentBaseForBaseline(Lane lane,
+		bool hasPinnedBase, bool currentBaseAvailable)
+	{
+		return lane == Lane::Required && !hasPinnedBase && currentBaseAvailable;
 	}
 
 	constexpr bool RequiredFailureIdentityReady(bool recoveryEnabled,
 		bool resolvedIdentity, bool authenticatedIdentity)
 	{
 		return !recoveryEnabled || (resolvedIdentity && authenticatedIdentity);
+	}
+
+	constexpr bool RequiredFailureIdentityMatches(bool previouslyResolved,
+		std::uint64_t expectedAccount, std::uint64_t authenticatedAccount)
+	{
+		return authenticatedAccount != 0 &&
+			(!previouslyResolved || expectedAccount == authenticatedAccount);
 	}
 
 	constexpr bool RejectUnavailableRequiredAdmission(bool enabled, bool required,

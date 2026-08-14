@@ -134,16 +134,39 @@ int main()
 		assert(SelectBaseline(Lane::NativeRecovery, true, BaseAvailability::Ready) == Action::Native);
 	}
 
-	// The ticket identity must resolve before a recoverable required baseline, while
-	// full authentication may complete later in signon. Arming still requires both,
-	// and a reused slot cannot consume account A's latch for account B.
+	// Queue clients may reach ServerInfo before Source exposes their SteamID64 or before
+	// a map base existed at their earlier connect callback. They still receive the
+	// current required base at their first baseline, but cannot consume an account-owned
+	// recovery latch until identity resolves. Later authenticated failure ownership may
+	// bind for the first time, while a previously-bound account must remain unchanged.
 	{
-		assert(!RequiredBaselineIdentityReady(true, false));
-		assert(RequiredBaselineIdentityReady(true, true));
-		assert(RequiredBaselineIdentityReady(false, false));
+		const Lane queuedRequiredLane = ResolveLane(true, true, nullptr);
+		assert(queuedRequiredLane == Lane::Required);
+		assert(!CanConsumeRequiredRecovery(true, false));
+		assert(CanConsumeRequiredRecovery(true, true));
+		assert(!CanConsumeRequiredRecovery(false, true));
+		assert(NeedsConnectionEpochAtBaseline(0));
+		assert(!NeedsConnectionEpochAtBaseline(1));
+		assert(ShouldPinCurrentBaseForBaseline(Lane::Required, false, true));
+		assert(!ShouldPinCurrentBaseForBaseline(Lane::Required, true, true));
+		assert(!ShouldPinCurrentBaseForBaseline(Lane::Required, false, false));
+		assert(!ShouldPinCurrentBaseForBaseline(Lane::NativeRecovery, false, true));
+		assert(!ShouldPinCurrentBaseForBaseline(Lane::NativeOptOut, false, true));
+		assert(!ShouldPinCurrentBaseForBaseline(Lane::NativeRescue, false, true));
+		bool queueClientHasPinnedBase = false;
+		if (ShouldPinCurrentBaseForBaseline(queuedRequiredLane,
+			queueClientHasPinnedBase, true))
+			queueClientHasPinnedBase = true;
+		assert(queueClientHasPinnedBase);
+		assert(SelectBaseline(queuedRequiredLane, true, BaseAvailability::Ready) ==
+			Action::CanonicalStub);
 		assert(!RequiredFailureIdentityReady(true, true, false));
 		assert(RequiredFailureIdentityReady(true, true, true));
 		assert(!RequiredFailureIdentityReady(true, false, true));
+		assert(RequiredFailureIdentityMatches(false, 0, accountA));
+		assert(RequiredFailureIdentityMatches(true, accountA, accountA));
+		assert(!RequiredFailureIdentityMatches(true, accountA, accountB));
+		assert(!RequiredFailureIdentityMatches(false, 0, 0));
 		assert(RejectUnavailableRequiredAdmission(true, true, false));
 		assert(!RejectUnavailableRequiredAdmission(true, true, true));
 		assert(!RejectUnavailableRequiredAdmission(true, false, false));

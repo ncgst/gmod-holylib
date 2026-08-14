@@ -70,6 +70,8 @@ Canonical registration, the per-client `SendServerInfo` baseline hook, and body-
 
 An absent, corrupt, unparsable, MD5-invalid, or incomplete client base reports an exact required-generation failure without scheduling client `retry`. With required recovery enabled, the server revalidates authenticated SteamID64 ownership, arms one account-owned latch, and queues one engine `Reconnect()`. The replacement connection claims that latch before its first `SendServerInfo` and receives a wholly native initial baseline. The failed connection never changes lanes and cannot consume its own latch.
 
+A queued connection may reach its first `SendServerInfo` before Source exposes its SteamID64, or may have connected before the immutable map base finished publishing. The first baseline pins the current base when one is now available and proceeds in the required lane without consuming recovery state. Missing identity never rejects an otherwise usable required base; recovery remains unavailable until authenticated ownership can be established.
+
 The latch expires if it is not claimed within its TTL. Once consumed, its tombstone prevents another automatic recovery until the native connection proves success or the level/module/server lifecycle resets. Physical disconnect and slot reuse clear only per-slot reconnect handoffs; they do not erase the account-owned armed latch or consumed tombstone. Disabled recovery, stale or malformed failure reports, authentication mismatch, unavailable handoff, and exhausted recovery disconnect with the manual opt-out instructions.
 
 A player who needs native Lua must set this Garry's Mod launch option and restart before joining:
