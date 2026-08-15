@@ -433,15 +433,15 @@ namespace HolyLib::LuaPack::Policy
 	constexpr std::size_t ReliableStubStreamReserveBytes = 64u * 1024u;
 	constexpr std::size_t ReliableStubClientBudgetBytes = 16u * 1024u;
 	constexpr std::size_t ReliableStubGlobalBudgetBytes = 128u * 1024u;
-	constexpr std::size_t ReliableStubGlobalPacketBudget = 32u;
+	constexpr std::size_t ReliableStubGlobalBatchBudget = 32u;
 	constexpr std::size_t ReliableStubEnvelopeBytes = 32u;
 	constexpr std::size_t ReliableStubOrderedHashBytes = 96u;
 	constexpr double ReliableStubTransferTimeoutSeconds = 60.0;
 
-	// The engine must own and finish one LuaPack batch before another batch uses the
-	// same connection. Earlier engine-owned reliable/file work is not a precondition:
-	// the virtual transmit boundary appends this batch behind it and the bounded pump
-	// advances both in wire order. Requiring all engine work to be empty here can
+	// The engine must first move one LuaPack batch out of its reliable scratch stream
+	// before another batch uses the same connection. Earlier engine-owned fragment/file
+	// work is not a precondition: the exact GMod sender appends this batch behind the
+	// current scratch bytes. Requiring every engine fragment to be acknowledged here can
 	// deadlock PRESPAWN on an otherwise idle file-stream entry.
 	constexpr bool CanBeginReliableStubBatch(bool channelUsable,
 		bool streamOverflowed, bool transferPending)
@@ -449,21 +449,13 @@ namespace HolyLib::LuaPack::Policy
 		return channelUsable && !streamOverflowed && !transferPending;
 	}
 
-	// HasPendingReliableData is virtual and therefore reports the engine's actual
-	// scratch/fragment ownership. Once it clears, the previously committed batch is
-	// acknowledged and the next bounded batch may be staged.
+	// Once the observed reliable scratch stream clears, the engine has moved the
+	// previously committed batch into its own network path and the next bounded batch
+	// may be staged. This intentionally does not call the mirrored INetChannel vtable.
 	constexpr bool ReliableStubEngineTransferComplete(bool transferPending,
-		bool engineReliablePending)
+		bool scratchHasBits)
 	{
-		return transferPending && !engineReliablePending;
-	}
-
-	constexpr bool CanPumpReliableStubEngineTransfer(bool channelUsable,
-		bool streamOverflowed, bool transferPending, bool engineReliablePending,
-		std::size_t globalPacketBudget)
-	{
-		return channelUsable && !streamOverflowed && transferPending &&
-			engineReliablePending && globalPacketBudget != 0;
+		return transferPending && !scratchHasBits;
 	}
 
 	constexpr bool ReliableStubEngineTransferTimedOut(bool transferPending,

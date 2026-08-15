@@ -186,11 +186,11 @@ public:
 	int m_iLengthBits = -1;
 };
 
-// GMOD_SendToClient has a void engine ABI, so callers cannot distinguish a
-// message accepted by the reliable stream from one rejected by bf_write. Lua
-// baseline pacing needs that ownership boundary before it removes a queued
-// request. Frame the exact svc_GMod_ServerToClient payload and submit it through
-// virtual SendData instead of depending on the mirrored custom-message ABI.
+// Queue clients are outside CVEngineServer::GMOD_SendToClient's physical array,
+// so its detour must reproduce the engine's custom message through the owning
+// CBaseClient. Do not call SendNetMsg/SendData through the locally mirrored
+// INetChannel vtable: current Linux x64 can report success there without
+// appending reliable bytes during early sign-on.
 bool Gameserver_StageGModMessage(CBaseClient* client, const void* data, int dataBits)
 {
 	// GetNetChannel() is authoritative during early sign-on. The mirrored
@@ -204,16 +204,17 @@ bool Gameserver_StageGModMessage(CBaseClient* client, const void* data, int data
 		return false;
 	}
 
-	// The payload is bounded below 2^20 bits by the GMod message format. Leave
-	// enough room for its type/length envelope and keep the bit buffer dword aligned.
-	alignas(4) unsigned char framedData[(1 << 17) + 8] = {};
-	bf_write framed(framedData, sizeof(framedData));
-	framed.WriteUBitLong(svc_GMod_ServerToClient, NETMSG_TYPE_BITS);
-	framed.WriteUBitLong(dataBits, 20);
-	if (!framed.WriteBits(data, dataBits) || framed.IsOverflowed())
-		return false;
+	SVC_CustomMessage msg;
+	const int dataBytes = PAD_NUMBER((dataBits + 7) >> 3, 4);
+	msg.m_DataOut.StartWriting(const_cast<void*>(data), dataBytes, 0, dataBits);
+	msg.m_iLength = dataBits;
+	msg.m_iLengthBits = 20;
+	msg.m_iType = svc_GMod_ServerToClient;
 
-	return channel->SendData(framed, true);
+	CNetChan* concreteChannel = static_cast<CNetChan*>(channel);
+	const int reliableBitsBefore = concreteChannel->m_StreamReliable.GetNumBitsWritten();
+	return client->SendNetMsg(msg, true) && !concreteChannel->m_StreamReliable.IsOverflowed() &&
+		concreteChannel->m_StreamReliable.GetNumBitsWritten() > reliableBitsBefore;
 }
 
 PushReferenced_LuaClass(CBaseClient)

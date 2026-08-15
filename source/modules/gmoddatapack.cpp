@@ -64,7 +64,6 @@ IModule* pGModDataPackModule = &g_pGModDataPackModule;
 
 #if MODULE_EXISTS_GAMESERVER
 extern CBaseClient* Gameserver_GetClientBySlot(int slot);
-extern bool Gameserver_StageGModMessage(CBaseClient* client, const void* data, int dataBits);
 #endif
 
 static CBaseClient* GetClientForLuaDelivery(int slot)
@@ -130,34 +129,34 @@ struct ClientCanonicalLuaStubQueue
 	{
 		items.clear();
 		fileIDs.clear();
-		engineTransferPending = false;
-		engineTransferStartedAt = -1.0;
+		engineScratchPending = false;
+		engineScratchStartedAt = -1.0;
 		enqueued = 0;
 		committed = 0;
 		batches = 0;
-		transmitAttempts = 0;
+		stagingAttempts = 0;
 		summaryLogged = false;
 	}
 
 	std::size_t PendingWork() const
 	{
-		return items.size() + (engineTransferPending ? 1u : 0u);
+		return items.size() + (engineScratchPending ? 1u : 0u);
 	}
 
 	std::deque<QueuedCanonicalLuaStub> items;
 	std::unordered_set<int> fileIDs;
-	bool engineTransferPending = false;
-	double engineTransferStartedAt = -1.0;
+	bool engineScratchPending = false;
+	double engineScratchStartedAt = -1.0;
 	std::size_t enqueued = 0;
 	std::size_t committed = 0;
 	std::size_t batches = 0;
-	std::size_t transmitAttempts = 0;
+	std::size_t stagingAttempts = 0;
 	bool summaryLogged = false;
 };
 
 static std::array<ClientCanonicalLuaStubQueue, ABSOLUTE_PLAYER_LIMIT> g_clientCanonicalLuaStubQueues;
 static int g_nextCanonicalLuaStubSlot = 0;
-static int g_nextCanonicalLuaStubPumpSlot = 0;
+static int g_nextCanonicalLuaStubScratchSlot = 0;
 
 static void ClearClientCanonicalLuaStubs(int slot)
 {
@@ -170,7 +169,7 @@ static void ClearAllClientCanonicalLuaStubs()
 	for (ClientCanonicalLuaStubQueue& queue : g_clientCanonicalLuaStubQueues)
 		queue.Clear();
 	g_nextCanonicalLuaStubSlot = 0;
-	g_nextCanonicalLuaStubPumpSlot = 0;
+	g_nextCanonicalLuaStubScratchSlot = 0;
 }
 
 static void CancelClientCanonicalLuaStub(int slot, int fileID)
@@ -1691,11 +1690,26 @@ static bool SendCompressedLuaFile(int clientIdx, int fileID, const Bootil::AutoB
 #if MODULE_EXISTS_GAMESERVER
 	if (knownClient)
 	{
-		// The paced path must know whether CNetChan accepted the message. The
-		// engine wrapper is void and may also move data out of its scratch buffer,
-		// so scratch-bit growth is not a valid acceptance signal.
-		queued = Gameserver_StageGModMessage(knownClient, msg.GetData(),
-			msg.GetNumBitsWritten());
+		// Use the same engine-owned path as ordinary GMod Lua delivery. Calls through
+		// the locally mirrored INetChannel vtable are not ABI-stable during early
+		// sign-on on current Linux x64 and can report success without appending any
+		// reliable bits. The exact engine entry point is proven by native delivery;
+		// the bounded queue still preflights capacity and verifies the append before
+		// committing its request.
+		INetChannel* engineChannel = knownClient->GetNetChannel();
+		CNetChan* channel = static_cast<CNetChan*>(engineChannel);
+		if (!engineChannel || !channel)
+		{
+			queued = false;
+		}
+		else
+		{
+			const int reliableBitsBefore = channel->m_StreamReliable.GetNumBitsWritten();
+			Util::engineserver->GMOD_SendToClient(clientIdx, msg.GetData(),
+				msg.GetNumBitsWritten());
+			queued = !channel->m_StreamReliable.IsOverflowed() &&
+				channel->m_StreamReliable.GetNumBitsWritten() > reliableBitsBefore;
+		}
 	}
 	else
 #endif
@@ -1735,7 +1749,9 @@ static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned ch
 		return false;
 
 	CBaseClient* client = GetClientForLuaDelivery(clientIdx);
-	if (!client || !client->GetNetChannel())
+	INetChannel* engineChannel = client ? client->GetNetChannel() : nullptr;
+	CNetChan* channel = static_cast<CNetChan*>(engineChannel);
+	if (!client || !engineChannel || !channel)
 		return false;
 
 	INetworkStringTable* table = g_pDataPack->m_pClientLuaFiles;
@@ -1771,7 +1787,11 @@ static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned ch
 		update.m_DataOut.WriteBits(hash, static_cast<int>(hashLength * 8));
 	}
 
-	return !update.m_DataOut.IsOverflowed() && client->SendNetMsg(update, true);
+	if (update.m_DataOut.IsOverflowed())
+		return false;
+	const int reliableBitsBefore = channel->m_StreamReliable.GetNumBitsWritten();
+	return client->SendNetMsg(update, true) && !channel->m_StreamReliable.IsOverflowed() &&
+		channel->m_StreamReliable.GetNumBitsWritten() > reliableBitsBefore;
 }
 
 static bool GetNativeLuaHash(int fileID, GarrysMod::Lua::LuaFile* luaFile, std::array<unsigned char, 32>& output)
@@ -2041,29 +2061,29 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 static void LogCanonicalLuaStubDeliveryComplete(int slot,
 	ClientCanonicalLuaStubQueue& queue)
 {
-	if (!queue.items.empty() || queue.engineTransferPending || queue.enqueued == 0 ||
+	if (!queue.items.empty() || queue.engineScratchPending || queue.enqueued == 0 ||
 		queue.summaryLogged)
 	{
 		return;
 	}
 
 	queue.summaryLogged = true;
-	Msg(PROJECT_NAME " - luapack: client slot %i completed paced canonical placeholder delivery: enqueued=%u committed=%u batches=%u transmit_attempts=%u\n",
+	Msg(PROJECT_NAME " - luapack: client slot %i completed paced canonical placeholder staging: enqueued=%u committed=%u batches=%u staging_attempts=%u\n",
 		slot, static_cast<unsigned int>(queue.enqueued),
 		static_cast<unsigned int>(queue.committed),
 		static_cast<unsigned int>(queue.batches),
-		static_cast<unsigned int>(queue.transmitAttempts));
+		static_cast<unsigned int>(queue.stagingAttempts));
 }
 
 static void DrainCanonicalLuaStubQueues(double currentTime,
-	std::size_t& transmitBudget)
+	std::size_t& batchBudget)
 {
 	using namespace HolyLib::LuaPack::Policy;
 	std::size_t globalBudget = ReliableStubGlobalBudgetBytes;
 	const int startSlot = g_nextCanonicalLuaStubSlot;
 
 	for (int offset = 0; offset < ABSOLUTE_PLAYER_LIMIT && globalBudget > 0 &&
-		transmitBudget > 0; ++offset)
+		batchBudget > 0; ++offset)
 	{
 		const int slot = (startSlot + offset) % ABSOLUTE_PLAYER_LIMIT;
 		g_nextCanonicalLuaStubSlot = (slot + 1) % ABSOLUTE_PLAYER_LIMIT;
@@ -2076,8 +2096,8 @@ static void DrainCanonicalLuaStubQueues(double currentTime,
 			? client->GetNetChannel() : nullptr;
 		CNetChan* channel = static_cast<CNetChan*>(engineChannel);
 		if (!CanBeginReliableStubBatch(channel != nullptr,
-			engineChannel && engineChannel->IsOverflowed(),
-			queue.engineTransferPending))
+			channel && channel->m_StreamReliable.IsOverflowed(),
+			queue.engineScratchPending))
 			continue;
 
 		std::size_t clientBudget = ReliableStubClientBudgetBytes;
@@ -2085,7 +2105,7 @@ static void DrainCanonicalLuaStubQueues(double currentTime,
 		bool queueInvalid = false;
 		std::vector<bool> orderedCanonicalHashes;
 		orderedCanonicalHashes.reserve(queue.items.size());
-		const int reliableBitsBefore = engineChannel->GetNumBitsWritten(true);
+		const int reliableBitsBefore = channel->m_StreamReliable.GetNumBitsWritten();
 		while (batchCount < queue.items.size())
 		{
 			const QueuedCanonicalLuaStub& item = queue.items[batchCount];
@@ -2123,7 +2143,7 @@ static void DrainCanonicalLuaStubQueues(double currentTime,
 				globalBudget = 0;
 				break;
 			}
-			if (!CanStageReliableStub(engineChannel->IsOverflowed(),
+			if (!CanStageReliableStub(channel->m_StreamReliable.IsOverflowed(),
 				channel->m_StreamReliable.GetNumBytesLeft(), clientBudget,
 				globalBudget, compressedBytes, orderedCanonicalHash))
 			{
@@ -2145,9 +2165,14 @@ static void DrainCanonicalLuaStubQueues(double currentTime,
 			}
 			if (!SendCompressedLuaFile(slot, item.fileID, *item.compressed, client))
 			{
-				// A full/choked reliable stream is transient. Leave this item at the
-				// front and retry after CNetChan has packet capacity; disconnecting here
-				// turns ordinary backpressure into a required-lane identity failure.
+				const char* registeredPath = g_pDataPack && g_pDataPack->m_pClientLuaFiles &&
+					item.fileID > 0 && item.fileID < g_pDataPack->m_pClientLuaFiles->GetNumStrings()
+					? g_pDataPack->m_pClientLuaFiles->GetString(item.fileID) : nullptr;
+				const std::string failedPath = registeredPath ? registeredPath : "an unknown file";
+				queue.Clear();
+				queueInvalid = true;
+				DisconnectLuaHashFailure(slot, failedPath.c_str(),
+					"the engine did not append a preflighted canonical placeholder");
 				break;
 			}
 
@@ -2159,32 +2184,26 @@ static void DrainCanonicalLuaStubQueues(double currentTime,
 		if (queueInvalid)
 			continue;
 
-		// Transmit is virtual and therefore lets the engine move its own reliable
-		// scratch bytes into its private fragment queue. Do not call the SDK mirror's
-		// non-virtual CreateFragmentsFromBuffer: a layout mismatch can create a shadow
-		// queue that the engine never sends, leaving the client in Requesting Lua.
-		bool engineOwned = false;
-		const bool wroteAnyBits = engineChannel->GetNumBitsWritten(true) >
+		// GMOD_SendToClient has now appended the bounded batch to the engine-owned
+		// reliable scratch stream. Do not force Transmit through the mirrored
+		// INetChannel vtable: current Linux x64 can accept that ABI call as a no-op.
+		// The engine's normal networking pass will move these bytes to fragments;
+		// wait for the observed scratch buffer to drain before staging another batch.
+		const bool wroteAnyBits = channel->m_StreamReliable.GetNumBitsWritten() >
 			reliableBitsBefore;
-		if (wroteAnyBits && !engineChannel->IsOverflowed())
+		const bool engineAccepted = wroteAnyBits && !channel->m_StreamReliable.IsOverflowed();
+		if (engineAccepted)
 		{
-			--transmitBudget;
-			++queue.transmitAttempts;
-			engineChannel->Transmit(false);
-			engineOwned = !engineChannel->IsOverflowed() &&
-				engineChannel->GetNumBitsWritten(true) == 0;
-			if (engineOwned)
-			{
-				queue.engineTransferPending = engineChannel->HasPendingReliableData();
-				queue.engineTransferStartedAt = queue.engineTransferPending
-					? currentTime : -1.0;
-				++queue.batches;
-			}
+			--batchBudget;
+			++queue.stagingAttempts;
+			queue.engineScratchPending = true;
+			queue.engineScratchStartedAt = currentTime;
+			++queue.batches;
 		}
 		if (!CommitReliableStubBatch(batchCount != 0,
-			engineChannel->IsOverflowed(), engineOwned))
+			channel->m_StreamReliable.IsOverflowed(), engineAccepted))
 		{
-			if (wroteAnyBits && !engineOwned)
+			if (batchCount != 0)
 			{
 				const QueuedCanonicalLuaStub& failedItem = queue.items.front();
 				const char* registeredPath = g_pDataPack && g_pDataPack->m_pClientLuaFiles &&
@@ -2193,7 +2212,7 @@ static void DrainCanonicalLuaStubQueues(double currentTime,
 				const std::string failedPath = registeredPath ? registeredPath : "an unknown file";
 				queue.Clear();
 				DisconnectLuaHashFailure(slot, failedPath.c_str(),
-					"the engine did not retain the paced canonical placeholder batch");
+					"the engine did not append the paced canonical placeholder batch");
 			}
 			continue;
 		}
@@ -2206,65 +2225,46 @@ static void DrainCanonicalLuaStubQueues(double currentTime,
 			g_clientHashUpdatesPending[slot].erase(fileID);
 			queue.PopFront();
 		}
-		LogCanonicalLuaStubDeliveryComplete(slot, queue);
 	}
 }
 
-static void PumpCanonicalLuaStubTransfers(double currentTime,
-	std::size_t& transmitBudget)
+static void ObserveCanonicalLuaStubScratch(double currentTime)
 {
 	using namespace HolyLib::LuaPack::Policy;
-	const int startSlot = g_nextCanonicalLuaStubPumpSlot;
-	for (int offset = 0; offset < ABSOLUTE_PLAYER_LIMIT &&
-		transmitBudget > 0; ++offset)
+	const int startSlot = g_nextCanonicalLuaStubScratchSlot;
+	for (int offset = 0; offset < ABSOLUTE_PLAYER_LIMIT; ++offset)
 	{
 		const int slot = (startSlot + offset) % ABSOLUTE_PLAYER_LIMIT;
 		ClientCanonicalLuaStubQueue& queue = g_clientCanonicalLuaStubQueues[slot];
-		if (!queue.engineTransferPending)
+		if (!queue.engineScratchPending)
 			continue;
-		g_nextCanonicalLuaStubPumpSlot = (slot + 1) % ABSOLUTE_PLAYER_LIMIT;
+		g_nextCanonicalLuaStubScratchSlot = (slot + 1) % ABSOLUTE_PLAYER_LIMIT;
 
 		CBaseClient* client = GetClientForLuaDelivery(slot);
 		INetChannel* engineChannel = client && client->IsConnected()
 			? client->GetNetChannel() : nullptr;
-		if (!engineChannel)
+		CNetChan* channel = static_cast<CNetChan*>(engineChannel);
+		if (!engineChannel || !channel)
 			continue;
 
-		const bool engineReliablePending = engineChannel->HasPendingReliableData();
-		if (ReliableStubEngineTransferComplete(true, engineReliablePending))
+		const bool scratchHasBits = channel->m_StreamReliable.GetNumBitsWritten() != 0;
+		if (ReliableStubEngineTransferComplete(true, scratchHasBits))
 		{
-			queue.engineTransferPending = false;
-			queue.engineTransferStartedAt = -1.0;
+			queue.engineScratchPending = false;
+			queue.engineScratchStartedAt = -1.0;
 			LogCanonicalLuaStubDeliveryComplete(slot, queue);
 			continue;
 		}
 
-		if (engineChannel->IsOverflowed() ||
+		if (channel->m_StreamReliable.IsOverflowed() ||
 			ReliableStubEngineTransferTimedOut(true,
-				queue.engineTransferStartedAt, currentTime))
+				queue.engineScratchStartedAt, currentTime))
 		{
-			const bool overflowed = engineChannel->IsOverflowed();
+			const bool overflowed = channel->m_StreamReliable.IsOverflowed();
 			queue.Clear();
 			DisconnectLuaHashFailure(slot, "the current engine-owned batch", overflowed
 				? "the engine reliable stream overflowed during paced canonical placeholder delivery"
-				: "the engine retained a paced canonical placeholder batch for too long");
-			continue;
-		}
-
-		if (!CanPumpReliableStubEngineTransfer(true, false, true,
-			engineReliablePending, transmitBudget))
-		{
-			continue;
-		}
-
-		--transmitBudget;
-		++queue.transmitAttempts;
-		engineChannel->Transmit(false);
-		if (!engineChannel->HasPendingReliableData())
-		{
-			queue.engineTransferPending = false;
-			queue.engineTransferStartedAt = -1.0;
-			LogCanonicalLuaStubDeliveryComplete(slot, queue);
+				: "the engine retained paced canonical placeholder scratch bytes for too long");
 		}
 	}
 }
@@ -2571,9 +2571,9 @@ void CGModDataPackModule::Think(bool bSimulating)
 		currentTime >= (g_nLastCanonicalStubSend + 0.05))
 	{
 		g_nLastCanonicalStubSend = currentTime;
-		std::size_t transmitBudget = HolyLib::LuaPack::Policy::ReliableStubGlobalPacketBudget;
-		PumpCanonicalLuaStubTransfers(currentTime, transmitBudget);
-		DrainCanonicalLuaStubQueues(currentTime, transmitBudget);
+		ObserveCanonicalLuaStubScratch(currentTime);
+		std::size_t batchBudget = HolyLib::LuaPack::Policy::ReliableStubGlobalBatchBudget;
+		DrainCanonicalLuaStubQueues(currentTime, batchBudget);
 	}
 	if (currentTime < (g_nLastSend + 0.05))
 		return;

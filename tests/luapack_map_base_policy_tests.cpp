@@ -354,8 +354,8 @@ int main()
 
 	// A 3,922-file required baseline can request every canonical placeholder in one
 	// frame. The scheduler must retain reliable-stream headroom, respect both budgets,
-	// and commit queue/hash state only after the complete batch moved into
-	// engine-owned reliable transport. Overflow/reset leaves every request retryable.
+	// and commit queue/hash state only after the exact engine sender appended the
+	// complete batch. A second batch waits until the reliable scratch stream drains.
 	{
 		constexpr std::size_t compressedStubBytes = 320;
 		constexpr std::size_t normalStagingBytes =
@@ -372,12 +372,6 @@ int main()
 		assert(!ReliableStubEngineTransferComplete(false, true));
 		assert(!ReliableStubEngineTransferComplete(true, true));
 		assert(ReliableStubEngineTransferComplete(true, false));
-		assert(!CanPumpReliableStubEngineTransfer(false, false, true, true, 1));
-		assert(!CanPumpReliableStubEngineTransfer(true, true, true, true, 1));
-		assert(!CanPumpReliableStubEngineTransfer(true, false, false, true, 1));
-		assert(!CanPumpReliableStubEngineTransfer(true, false, true, false, 1));
-		assert(!CanPumpReliableStubEngineTransfer(true, false, true, true, 0));
-		assert(CanPumpReliableStubEngineTransfer(true, false, true, true, 1));
 		assert(!ReliableStubEngineTransferTimedOut(false, 0.0, 600.0));
 		assert(!ReliableStubEngineTransferTimedOut(true, -1.0, 600.0));
 		assert(!ReliableStubEngineTransferTimedOut(true, 10.0,
@@ -480,75 +474,67 @@ int main()
 		assert(!CommitReliableStubBatch(true, false, false));
 		assert(CommitReliableStubBatch(true, false, true));
 
-		// A transient SendNetMsg rejection still defers the same front item. Once a
-		// batch is staged, only the virtual engine transmit boundary advances the queue,
-		// and a later batch waits for the engine's reliable-pending state to clear.
-		std::size_t backpressuredRemaining = 3;
+		// Once an exact engine append is accepted, a later batch waits until the
+		// observed reliable scratch stream has drained into the engine network path.
+		std::size_t pacedRemaining = 3;
 		std::size_t acceptedBodies = 0;
 		bool transferPending = false;
-		bool engineReliablePending = false;
-		for (std::size_t tick = 0; backpressuredRemaining != 0; ++tick)
+		bool scratchHasBits = false;
+		for (std::size_t tick = 0; pacedRemaining != 0; ++tick)
 		{
 			assert(tick < 16);
 			if (ReliableStubEngineTransferComplete(transferPending,
-				engineReliablePending))
+				scratchHasBits))
 			{
 				transferPending = false;
 			}
 			if (!CanBeginReliableStubBatch(true, false, transferPending))
 			{
-				engineReliablePending = false;
+				scratchHasBits = false;
 				continue;
 			}
-			const bool sendAccepted = tick != 0;
-			const std::size_t batchCount = sendAccepted ? 1u : 0u;
-			const bool engineOwned = batchCount != 0;
-			if (!CommitReliableStubBatch(batchCount != 0, false, engineOwned))
-				continue;
-			backpressuredRemaining -= batchCount;
+			const std::size_t batchCount = 1;
+			assert(CommitReliableStubBatch(true, false, true));
+			pacedRemaining -= batchCount;
 			acceptedBodies += batchCount;
 			transferPending = true;
-			engineReliablePending = true;
+			scratchHasBits = true;
 		}
 		assert(acceptedBodies == 3);
 
-		// The virtual pump retains the former connection-flood bound without
-		// inspecting a locally compiled CNetChan waiting-list layout. More pending
-		// clients than one global pass can service must rotate fairly.
-		std::array<bool, 80> floodTransferPending{};
-		floodTransferPending.fill(true);
-		std::array<std::size_t, 80> firstPumpTick{};
-		firstPumpTick.fill((std::numeric_limits<std::size_t>::max)());
-		std::size_t nextPumpSlot = 0;
-		std::size_t floodRemaining = floodTransferPending.size();
+		// The global batch cap retains the connection-flood bound. More queued
+		// clients than one pass can stage must rotate fairly.
+		std::array<bool, 80> floodNeedsBatch{};
+		floodNeedsBatch.fill(true);
+		std::array<std::size_t, 80> firstBatchTick{};
+		firstBatchTick.fill((std::numeric_limits<std::size_t>::max)());
+		std::size_t nextBatchSlot = 0;
+		std::size_t floodRemaining = floodNeedsBatch.size();
 		for (std::size_t tick = 0; floodRemaining != 0; ++tick)
 		{
 			assert(tick < 4);
-			std::size_t packetBudget = ReliableStubGlobalPacketBudget;
-			const std::size_t startSlot = nextPumpSlot;
+			std::size_t batchBudget = ReliableStubGlobalBatchBudget;
+			const std::size_t startSlot = nextBatchSlot;
 			for (std::size_t offset = 0;
-				offset < floodTransferPending.size() && packetBudget != 0; ++offset)
+				offset < floodNeedsBatch.size() && batchBudget != 0; ++offset)
 			{
-				const std::size_t slot = (startSlot + offset) % floodTransferPending.size();
-				nextPumpSlot = (slot + 1) % floodTransferPending.size();
-				if (!floodTransferPending[slot] ||
-					!CanPumpReliableStubEngineTransfer(true, false, true, true,
-						packetBudget))
-				{
+				const std::size_t slot = (startSlot + offset) % floodNeedsBatch.size();
+				nextBatchSlot = (slot + 1) % floodNeedsBatch.size();
+				if (!floodNeedsBatch[slot] ||
+					!CanBeginReliableStubBatch(true, false, false))
 					continue;
-				}
-				firstPumpTick[slot] = tick;
-				floodTransferPending[slot] = false;
+				firstBatchTick[slot] = tick;
+				floodNeedsBatch[slot] = false;
 				--floodRemaining;
-				--packetBudget;
+				--batchBudget;
 			}
 		}
-		for (std::size_t firstTick : firstPumpTick)
+		for (std::size_t firstTick : firstBatchTick)
 			assert(firstTick < 3);
 
 		// Pre-existing engine reliable/file work must not prevent the first bounded
 		// LuaPack batch from appending behind it. Once that batch is owned, the
-		// transfer flag prevents a second batch until the virtual engine state clears.
+		// transfer flag prevents a second batch until the scratch stream clears.
 		assert(CanBeginReliableStubBatch(true, false, false));
 		assert(!CanBeginReliableStubBatch(true, false, true));
 		assert(!ReliableStubEngineTransferComplete(true, true));
