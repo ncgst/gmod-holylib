@@ -436,28 +436,40 @@ namespace HolyLib::LuaPack::Policy
 	constexpr std::size_t ReliableStubGlobalPacketBudget = 32u;
 	constexpr std::size_t ReliableStubEnvelopeBytes = 32u;
 	constexpr std::size_t ReliableStubOrderedHashBytes = 96u;
+	constexpr double ReliableStubTransferTimeoutSeconds = 60.0;
 
-	// Packet availability is intentionally not a staging precondition. The batch is
-	// moved into CNetChan's owned reliable-fragment list without transmitting it;
-	// the bounded dedicated pump below then advances those owned fragments.
-	// CanPacket may be false every time a module Think callback runs when the
-	// engine or an async transport consumes each send opportunity later in-frame.
+	// The engine must own and finish one reliable batch before another batch uses
+	// the same connection. Do not populate CNetChan's private fragment list through
+	// the SDK mirror: that non-virtual layout is not an engine ownership boundary.
 	constexpr bool CanBeginReliableStubBatch(bool channelUsable,
-		bool streamOverflowed, bool fragmentsPending)
+		bool streamOverflowed, bool transferPending, bool engineReliablePending)
 	{
-		return channelUsable && !streamOverflowed && !fragmentsPending;
+		return channelUsable && !streamOverflowed && !transferPending &&
+			!engineReliablePending;
 	}
 
-	// Source can limit a PRESPAWN client with pending reliable fragments to one
-	// packet per second. Pump at the module's fixed 50 ms cadence instead of using
-	// CNetChan's clear time: the ordinary PRESPAWN packet sent elsewhere in the frame
-	// can continually move that window forward and starve this queue. The one-packet
-	// per-client rule and global cap provide the independent transport bound.
-	constexpr bool CanPumpReliableStubFragments(bool channelUsable,
-		bool streamOverflowed, bool fragmentsPending, std::size_t globalPacketBudget)
+	// HasPendingReliableData is virtual and therefore reports the engine's actual
+	// scratch/fragment ownership. Once it clears, the previously committed batch is
+	// acknowledged and the next bounded batch may be staged.
+	constexpr bool ReliableStubEngineTransferComplete(bool transferPending,
+		bool engineReliablePending)
 	{
-		return channelUsable && !streamOverflowed && fragmentsPending &&
-			globalPacketBudget != 0;
+		return transferPending && !engineReliablePending;
+	}
+
+	constexpr bool CanPumpReliableStubEngineTransfer(bool channelUsable,
+		bool streamOverflowed, bool transferPending, bool engineReliablePending,
+		std::size_t globalPacketBudget)
+	{
+		return channelUsable && !streamOverflowed && transferPending &&
+			engineReliablePending && globalPacketBudget != 0;
+	}
+
+	constexpr bool ReliableStubEngineTransferTimedOut(bool transferPending,
+		double startedAt, double currentTime)
+	{
+		return transferPending && startedAt >= 0.0 && currentTime >=
+			(startedAt + ReliableStubTransferTimeoutSeconds);
 	}
 
 	constexpr std::size_t ReliableStubStagingBytes(std::size_t compressedBytes,
@@ -490,9 +502,9 @@ namespace HolyLib::LuaPack::Policy
 	}
 
 	constexpr bool CommitReliableStubBatch(bool wroteBatch,
-		bool streamOverflowed, bool fragmentsOwned)
+		bool streamOverflowed, bool engineOwned)
 	{
-		return wroteBatch && !streamOverflowed && fragmentsOwned;
+		return wroteBatch && !streamOverflowed && engineOwned;
 	}
 
 	constexpr bool HoldPreSpawnForLuaDelivery(bool legacyQueuePending,

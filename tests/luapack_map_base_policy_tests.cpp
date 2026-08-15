@@ -355,7 +355,7 @@ int main()
 	// A 3,922-file required baseline can request every canonical placeholder in one
 	// frame. The scheduler must retain reliable-stream headroom, respect both budgets,
 	// and commit queue/hash state only after the complete batch moved into
-	// owned fragments. Overflow/reset leaves every request retryable.
+	// engine-owned reliable transport. Overflow/reset leaves every request retryable.
 	{
 		constexpr std::size_t compressedStubBytes = 320;
 		constexpr std::size_t normalStagingBytes =
@@ -364,15 +364,27 @@ int main()
 			ReliableStubStagingBytes(compressedStubBytes, true);
 		static_assert(orderedStagingBytes > normalStagingBytes,
 			"ordered canonical identity must consume part of the pacing budget");
-		assert(!CanBeginReliableStubBatch(false, false, false));
-		assert(!CanBeginReliableStubBatch(true, true, false));
-		assert(!CanBeginReliableStubBatch(true, false, true));
-		assert(CanBeginReliableStubBatch(true, false, false));
-		assert(!CanPumpReliableStubFragments(false, false, true, 1));
-		assert(!CanPumpReliableStubFragments(true, true, true, 1));
-		assert(!CanPumpReliableStubFragments(true, false, false, 1));
-		assert(!CanPumpReliableStubFragments(true, false, true, 0));
-		assert(CanPumpReliableStubFragments(true, false, true, 1));
+		assert(!CanBeginReliableStubBatch(false, false, false, false));
+		assert(!CanBeginReliableStubBatch(true, true, false, false));
+		assert(!CanBeginReliableStubBatch(true, false, true, false));
+		assert(!CanBeginReliableStubBatch(true, false, false, true));
+		assert(CanBeginReliableStubBatch(true, false, false, false));
+		assert(!ReliableStubEngineTransferComplete(false, false));
+		assert(!ReliableStubEngineTransferComplete(false, true));
+		assert(!ReliableStubEngineTransferComplete(true, true));
+		assert(ReliableStubEngineTransferComplete(true, false));
+		assert(!CanPumpReliableStubEngineTransfer(false, false, true, true, 1));
+		assert(!CanPumpReliableStubEngineTransfer(true, true, true, true, 1));
+		assert(!CanPumpReliableStubEngineTransfer(true, false, false, true, 1));
+		assert(!CanPumpReliableStubEngineTransfer(true, false, true, false, 1));
+		assert(!CanPumpReliableStubEngineTransfer(true, false, true, true, 0));
+		assert(CanPumpReliableStubEngineTransfer(true, false, true, true, 1));
+		assert(!ReliableStubEngineTransferTimedOut(false, 0.0, 600.0));
+		assert(!ReliableStubEngineTransferTimedOut(true, -1.0, 600.0));
+		assert(!ReliableStubEngineTransferTimedOut(true, 10.0,
+			10.0 + ReliableStubTransferTimeoutSeconds - 0.001));
+		assert(ReliableStubEngineTransferTimedOut(true, 10.0,
+			10.0 + ReliableStubTransferTimeoutSeconds));
 		assert(!CanStageReliableStub(true, 262144,
 			ReliableStubClientBudgetBytes, ReliableStubGlobalBudgetBytes,
 			compressedStubBytes, false));
@@ -469,76 +481,80 @@ int main()
 		assert(!CommitReliableStubBatch(true, false, false));
 		assert(CommitReliableStubBatch(true, false, true));
 
-		// Packet availability is deliberately absent from the staging predicate: a
-		// module callback can miss every send opportunity while the engine sends later
-		// in-frame. A transient SendNetMsg rejection still defers the same front item,
-		// and only transfer into owned fragments advances the queue.
+		// A transient SendNetMsg rejection still defers the same front item. Once a
+		// batch is staged, only the virtual engine transmit boundary advances the queue,
+		// and a later batch waits for the engine's reliable-pending state to clear.
 		std::size_t backpressuredRemaining = 3;
 		std::size_t acceptedBodies = 0;
+		bool transferPending = false;
+		bool engineReliablePending = false;
 		for (std::size_t tick = 0; backpressuredRemaining != 0; ++tick)
 		{
-			assert(tick < 8);
-			if (!CanBeginReliableStubBatch(true, false, false))
+			assert(tick < 16);
+			if (ReliableStubEngineTransferComplete(transferPending,
+				engineReliablePending))
+			{
+				transferPending = false;
+			}
+			if (!CanBeginReliableStubBatch(true, false, transferPending,
+				engineReliablePending))
+			{
+				engineReliablePending = false;
 				continue;
+			}
 			const bool sendAccepted = tick != 0;
 			const std::size_t batchCount = sendAccepted ? 1u : 0u;
-			const bool fragmentsOwned = batchCount != 0;
-			if (!CommitReliableStubBatch(batchCount != 0, false, fragmentsOwned))
+			const bool engineOwned = batchCount != 0;
+			if (!CommitReliableStubBatch(batchCount != 0, false, engineOwned))
 				continue;
 			backpressuredRemaining -= batchCount;
 			acceptedBodies += batchCount;
+			transferPending = true;
+			engineReliablePending = true;
 		}
 		assert(acceptedBodies == 3);
 
-		// A PRESPAWN client whose ordinary engine cadence is one packet per
-		// second must still make bounded progress. The dedicated pump sends at
-		// most one packet per client per 50 ms tick, independently of the clear
-		// time that ordinary signon traffic can continually move forward.
-		std::size_t reliablePackets = 100;
-		std::size_t pumpedPackets = 0;
-		for (std::size_t tick = 0; reliablePackets != 0; ++tick)
-		{
-			assert(tick < 110);
-			if (!CanPumpReliableStubFragments(true, false, true,
-				ReliableStubGlobalPacketBudget))
-			{
-				continue;
-			}
-			--reliablePackets;
-			++pumpedPackets;
-		}
-		assert(pumpedPackets == 100);
-
-		std::array<bool, 80> floodPacketPending{};
-		floodPacketPending.fill(true);
+		// The virtual pump retains the former connection-flood bound without
+		// inspecting a locally compiled CNetChan waiting-list layout. More pending
+		// clients than one global pass can service must rotate fairly.
+		std::array<bool, 80> floodTransferPending{};
+		floodTransferPending.fill(true);
 		std::array<std::size_t, 80> firstPumpTick{};
 		firstPumpTick.fill((std::numeric_limits<std::size_t>::max)());
 		std::size_t nextPumpSlot = 0;
-		std::size_t floodRemaining = floodPacketPending.size();
+		std::size_t floodRemaining = floodTransferPending.size();
 		for (std::size_t tick = 0; floodRemaining != 0; ++tick)
 		{
 			assert(tick < 4);
 			std::size_t packetBudget = ReliableStubGlobalPacketBudget;
 			const std::size_t startSlot = nextPumpSlot;
 			for (std::size_t offset = 0;
-				offset < floodPacketPending.size() && packetBudget != 0; ++offset)
+				offset < floodTransferPending.size() && packetBudget != 0; ++offset)
 			{
-				const std::size_t slot = (startSlot + offset) % floodPacketPending.size();
-				nextPumpSlot = (slot + 1) % floodPacketPending.size();
-				if (!floodPacketPending[slot] ||
-					!CanPumpReliableStubFragments(true, false, true,
+				const std::size_t slot = (startSlot + offset) % floodTransferPending.size();
+				nextPumpSlot = (slot + 1) % floodTransferPending.size();
+				if (!floodTransferPending[slot] ||
+					!CanPumpReliableStubEngineTransfer(true, false, true, true,
 						packetBudget))
 				{
 					continue;
 				}
 				firstPumpTick[slot] = tick;
-				floodPacketPending[slot] = false;
+				floodTransferPending[slot] = false;
 				--floodRemaining;
 				--packetBudget;
 			}
 		}
 		for (std::size_t firstTick : firstPumpTick)
 			assert(firstTick < 3);
+
+		// A mirror-only fragment flag must not authorize another batch when the
+		// engine still reports reliable work. Conversely, once the virtual engine
+		// state clears, the transfer completes without a private-list inspection.
+		assert(!CanBeginReliableStubBatch(true, false, false, true));
+		assert(!ReliableStubEngineTransferComplete(true, true));
+		assert(ReliableStubEngineTransferComplete(true, false));
+		assert(CanBeginReliableStubBatch(true, false, false, false));
 		assert(!HoldPreSpawnForLuaDelivery(false, 0));
 		assert(HoldPreSpawnForLuaDelivery(true, 0));
 		assert(HoldPreSpawnForLuaDelivery(false, 3922));

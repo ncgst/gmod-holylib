@@ -130,26 +130,28 @@ struct ClientCanonicalLuaStubQueue
 	{
 		items.clear();
 		fileIDs.clear();
-		fragmentsPending = false;
+		engineTransferPending = false;
+		engineTransferStartedAt = -1.0;
 		enqueued = 0;
 		committed = 0;
 		batches = 0;
-		pumpAttempts = 0;
+		transmitAttempts = 0;
 		summaryLogged = false;
 	}
 
 	std::size_t PendingWork() const
 	{
-		return items.size() + (fragmentsPending ? 1u : 0u);
+		return items.size() + (engineTransferPending ? 1u : 0u);
 	}
 
 	std::deque<QueuedCanonicalLuaStub> items;
 	std::unordered_set<int> fileIDs;
-	bool fragmentsPending = false;
+	bool engineTransferPending = false;
+	double engineTransferStartedAt = -1.0;
 	std::size_t enqueued = 0;
 	std::size_t committed = 0;
 	std::size_t batches = 0;
-	std::size_t pumpAttempts = 0;
+	std::size_t transmitAttempts = 0;
 	bool summaryLogged = false;
 };
 
@@ -2036,13 +2038,32 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 		SendNativeLuaFile(pDataPack, clientIdx, fileID, fileName, luaFile);
 }
 
-static void DrainCanonicalLuaStubQueues()
+static void LogCanonicalLuaStubDeliveryComplete(int slot,
+	ClientCanonicalLuaStubQueue& queue)
+{
+	if (!queue.items.empty() || queue.engineTransferPending || queue.enqueued == 0 ||
+		queue.summaryLogged)
+	{
+		return;
+	}
+
+	queue.summaryLogged = true;
+	Msg(PROJECT_NAME " - luapack: client slot %i completed paced canonical placeholder delivery: enqueued=%u committed=%u batches=%u transmit_attempts=%u\n",
+		slot, static_cast<unsigned int>(queue.enqueued),
+		static_cast<unsigned int>(queue.committed),
+		static_cast<unsigned int>(queue.batches),
+		static_cast<unsigned int>(queue.transmitAttempts));
+}
+
+static void DrainCanonicalLuaStubQueues(double currentTime,
+	std::size_t& transmitBudget)
 {
 	using namespace HolyLib::LuaPack::Policy;
 	std::size_t globalBudget = ReliableStubGlobalBudgetBytes;
 	const int startSlot = g_nextCanonicalLuaStubSlot;
 
-	for (int offset = 0; offset < ABSOLUTE_PLAYER_LIMIT && globalBudget > 0; ++offset)
+	for (int offset = 0; offset < ABSOLUTE_PLAYER_LIMIT && globalBudget > 0 &&
+		transmitBudget > 0; ++offset)
 	{
 		const int slot = (startSlot + offset) % ABSOLUTE_PLAYER_LIMIT;
 		g_nextCanonicalLuaStubSlot = (slot + 1) % ABSOLUTE_PLAYER_LIMIT;
@@ -2051,11 +2072,14 @@ static void DrainCanonicalLuaStubQueues()
 			continue;
 
 		CBaseClient* client = GetClientForLuaDelivery(slot);
-		CNetChan* channel = client && client->IsConnected() && client->GetNetChannel()
-			? (CNetChan*)client->GetNetChannel() : nullptr;
+		INetChannel* engineChannel = client && client->IsConnected()
+			? client->GetNetChannel() : nullptr;
+		CNetChan* channel = static_cast<CNetChan*>(engineChannel);
+		const bool engineReliablePending = engineChannel &&
+			engineChannel->HasPendingReliableData();
 		if (!CanBeginReliableStubBatch(channel != nullptr,
-			channel && channel->m_StreamReliable.IsOverflowed(),
-			queue.fragmentsPending))
+			engineChannel && engineChannel->IsOverflowed(),
+			queue.engineTransferPending, engineReliablePending))
 			continue;
 
 		std::size_t clientBudget = ReliableStubClientBudgetBytes;
@@ -2063,6 +2087,7 @@ static void DrainCanonicalLuaStubQueues()
 		bool queueInvalid = false;
 		std::vector<bool> orderedCanonicalHashes;
 		orderedCanonicalHashes.reserve(queue.items.size());
+		const int reliableBitsBefore = engineChannel->GetNumBitsWritten(true);
 		while (batchCount < queue.items.size())
 		{
 			const QueuedCanonicalLuaStub& item = queue.items[batchCount];
@@ -2100,7 +2125,7 @@ static void DrainCanonicalLuaStubQueues()
 				globalBudget = 0;
 				break;
 			}
-			if (!CanStageReliableStub(channel->m_StreamReliable.IsOverflowed(),
+			if (!CanStageReliableStub(engineChannel->IsOverflowed(),
 				channel->m_StreamReliable.GetNumBytesLeft(), clientBudget,
 				globalBudget, compressedBytes, orderedCanonicalHash))
 			{
@@ -2136,29 +2161,42 @@ static void DrainCanonicalLuaStubQueues()
 		if (queueInvalid)
 			continue;
 
-		if (channel->m_StreamReliable.IsOverflowed())
-			continue;
-
-		// Transfer an accepted batch directly into CNetChan-owned reliable fragments.
-		// Do not force a packet here: CanPacket can be unavailable at every module
-		// callback while the engine still consumes the next opportunity later in the
-		// frame. Fragment ownership makes the batch immune to a later scratch-buffer
-		// reset while preserving the engine's normal rate and retransmission policy.
-		bool fragmentsOwned = false;
-		if (batchCount != 0 && !channel->m_StreamReliable.IsOverflowed())
+		// Transmit is virtual and therefore lets the engine move its own reliable
+		// scratch bytes into its private fragment queue. Do not call the SDK mirror's
+		// non-virtual CreateFragmentsFromBuffer: a layout mismatch can create a shadow
+		// queue that the engine never sends, leaving the client in Requesting Lua.
+		bool engineOwned = false;
+		const bool wroteAnyBits = engineChannel->GetNumBitsWritten(true) >
+			reliableBitsBefore;
+		if (wroteAnyBits && !engineChannel->IsOverflowed())
 		{
-			fragmentsOwned = channel->CreateFragmentsFromBuffer(
-				&channel->m_StreamReliable, FRAG_NORMAL_STREAM);
-			if (fragmentsOwned)
+			--transmitBudget;
+			++queue.transmitAttempts;
+			engineChannel->Transmit(false);
+			engineOwned = !engineChannel->IsOverflowed() &&
+				engineChannel->GetNumBitsWritten(true) == 0;
+			if (engineOwned)
 			{
-				channel->m_StreamReliable.Reset();
-				queue.fragmentsPending = true;
+				queue.engineTransferPending = engineChannel->HasPendingReliableData();
+				queue.engineTransferStartedAt = queue.engineTransferPending
+					? currentTime : -1.0;
 				++queue.batches;
 			}
 		}
 		if (!CommitReliableStubBatch(batchCount != 0,
-			channel->m_StreamReliable.IsOverflowed(), fragmentsOwned))
+			engineChannel->IsOverflowed(), engineOwned))
 		{
+			if (wroteAnyBits && !engineOwned)
+			{
+				const QueuedCanonicalLuaStub& failedItem = queue.items.front();
+				const char* registeredPath = g_pDataPack && g_pDataPack->m_pClientLuaFiles &&
+					failedItem.fileID > 0 && failedItem.fileID < g_pDataPack->m_pClientLuaFiles->GetNumStrings()
+					? g_pDataPack->m_pClientLuaFiles->GetString(failedItem.fileID) : nullptr;
+				const std::string failedPath = registeredPath ? registeredPath : "an unknown file";
+				queue.Clear();
+				DisconnectLuaHashFailure(slot, failedPath.c_str(),
+					"the engine did not retain the paced canonical placeholder batch");
+			}
 			continue;
 		}
 
@@ -2170,54 +2208,65 @@ static void DrainCanonicalLuaStubQueues()
 			g_clientHashUpdatesPending[slot].erase(fileID);
 			queue.PopFront();
 		}
+		LogCanonicalLuaStubDeliveryComplete(slot, queue);
 	}
 }
 
-static void PumpCanonicalLuaStubFragments()
+static void PumpCanonicalLuaStubTransfers(double currentTime,
+	std::size_t& transmitBudget)
 {
 	using namespace HolyLib::LuaPack::Policy;
-	std::size_t packetBudget = ReliableStubGlobalPacketBudget;
 	const int startSlot = g_nextCanonicalLuaStubPumpSlot;
-	for (int offset = 0; offset < ABSOLUTE_PLAYER_LIMIT && packetBudget != 0;
-		++offset)
+	for (int offset = 0; offset < ABSOLUTE_PLAYER_LIMIT &&
+		transmitBudget > 0; ++offset)
 	{
 		const int slot = (startSlot + offset) % ABSOLUTE_PLAYER_LIMIT;
-		g_nextCanonicalLuaStubPumpSlot = (slot + 1) % ABSOLUTE_PLAYER_LIMIT;
 		ClientCanonicalLuaStubQueue& queue = g_clientCanonicalLuaStubQueues[slot];
-		if (!queue.fragmentsPending)
+		if (!queue.engineTransferPending)
 			continue;
+		g_nextCanonicalLuaStubPumpSlot = (slot + 1) % ABSOLUTE_PLAYER_LIMIT;
 
 		CBaseClient* client = GetClientForLuaDelivery(slot);
-		CNetChan* channel = client && client->IsConnected() && client->GetNetChannel()
-			? (CNetChan*)client->GetNetChannel() : nullptr;
-		if (!channel)
+		INetChannel* engineChannel = client && client->IsConnected()
+			? client->GetNetChannel() : nullptr;
+		if (!engineChannel)
 			continue;
 
-		if (channel->m_WaitingList[FRAG_NORMAL_STREAM].Count() == 0)
+		const bool engineReliablePending = engineChannel->HasPendingReliableData();
+		if (ReliableStubEngineTransferComplete(true, engineReliablePending))
 		{
-			queue.fragmentsPending = false;
-			if (queue.items.empty() && queue.enqueued != 0 && !queue.summaryLogged)
-			{
-				queue.summaryLogged = true;
-				Msg(PROJECT_NAME " - luapack: client slot %i completed paced canonical placeholder delivery: enqueued=%u committed=%u batches=%u pump_attempts=%u\n",
-					slot, static_cast<unsigned int>(queue.enqueued),
-					static_cast<unsigned int>(queue.committed),
-					static_cast<unsigned int>(queue.batches),
-					static_cast<unsigned int>(queue.pumpAttempts));
-			}
+			queue.engineTransferPending = false;
+			queue.engineTransferStartedAt = -1.0;
+			LogCanonicalLuaStubDeliveryComplete(slot, queue);
 			continue;
 		}
 
-		if (CanPumpReliableStubFragments(true,
-			channel->m_StreamReliable.IsOverflowed(), true, packetBudget))
+		if (engineChannel->IsOverflowed() ||
+			ReliableStubEngineTransferTimedOut(true,
+				queue.engineTransferStartedAt, currentTime))
 		{
-			// One packet at most per 50 ms module cadence. Transmit advances
-			// CNetChan's reliable subchannel state and retransmission bookkeeping.
-			// Count the attempt against a server-wide cap so a full connection flood
-			// cannot create one frame's worth of unbounded synchronous sends.
-			--packetBudget;
-			++queue.pumpAttempts;
-			channel->Transmit(false);
+			const bool overflowed = engineChannel->IsOverflowed();
+			queue.Clear();
+			DisconnectLuaHashFailure(slot, "the current engine-owned batch", overflowed
+				? "the engine reliable stream overflowed during paced canonical placeholder delivery"
+				: "the engine retained a paced canonical placeholder batch for too long");
+			continue;
+		}
+
+		if (!CanPumpReliableStubEngineTransfer(true, false, true,
+			engineReliablePending, transmitBudget))
+		{
+			continue;
+		}
+
+		--transmitBudget;
+		++queue.transmitAttempts;
+		engineChannel->Transmit(false);
+		if (!engineChannel->HasPendingReliableData())
+		{
+			queue.engineTransferPending = false;
+			queue.engineTransferStartedAt = -1.0;
+			LogCanonicalLuaStubDeliveryComplete(slot, queue);
 		}
 	}
 }
@@ -2524,8 +2573,9 @@ void CGModDataPackModule::Think(bool bSimulating)
 		currentTime >= (g_nLastCanonicalStubSend + 0.05))
 	{
 		g_nLastCanonicalStubSend = currentTime;
-		DrainCanonicalLuaStubQueues();
-		PumpCanonicalLuaStubFragments();
+		std::size_t transmitBudget = HolyLib::LuaPack::Policy::ReliableStubGlobalPacketBudget;
+		PumpCanonicalLuaStubTransfers(currentTime, transmitBudget);
+		DrainCanonicalLuaStubQueues(currentTime, transmitBudget);
 	}
 	if (currentTime < (g_nLastSend + 0.05))
 		return;
