@@ -428,17 +428,83 @@ namespace HolyLib::LuaPack::Policy
 	// GMod asks for every missing Lua ID in one request and the stock datapack answers
 	// those IDs synchronously. Keep that proven ownership boundary, but reserve enough
 	// reliable scratch space for the complete canonical-placeholder burst plus unrelated
-	// sign-on traffic. The wire envelope is: svc type (6), payload length (20), GMod
-	// message type (8), and Lua file ID (16).
+	// sign-on traffic. The outer wire envelope is the svc type (6) plus payload
+	// length (20); the payload is the GMod message type (8), Lua file ID (16), and
+	// compressed placeholder bytes.
 	constexpr std::size_t RequiredStubReliableReserveBytes = 64u * 1024u;
-	constexpr std::size_t RequiredStubWireEnvelopeBits = 6u + 20u + 8u + 16u;
+	constexpr int RequiredStubServiceTypeBits = 6;
+	constexpr int RequiredStubPayloadLengthBits = 20;
+	constexpr int RequiredStubMessageTypeBits = 8;
+	constexpr int RequiredStubFileIdBits = 16;
+	constexpr std::size_t RequiredStubOuterEnvelopeBits =
+		RequiredStubServiceTypeBits + RequiredStubPayloadLengthBits;
+	constexpr std::size_t RequiredStubPayloadEnvelopeBits =
+		RequiredStubMessageTypeBits + RequiredStubFileIdBits;
+	constexpr std::size_t RequiredStubMaximumPayloadBits =
+		(1u << RequiredStubPayloadLengthBits) - 1u;
+
+	constexpr std::size_t RequiredStubPayloadBits(std::size_t compressedBytes)
+	{
+		const std::size_t maximum = (std::numeric_limits<std::size_t>::max)();
+		return compressedBytes > (maximum - RequiredStubPayloadEnvelopeBits) / 8u
+			? maximum
+			: RequiredStubPayloadEnvelopeBits + compressedBytes * 8u;
+	}
 
 	constexpr std::size_t RequiredStubWireBits(std::size_t compressedBytes)
 	{
 		const std::size_t maximum = (std::numeric_limits<std::size_t>::max)();
-		return compressedBytes > (maximum - RequiredStubWireEnvelopeBits) / 8u
+		const std::size_t payloadBits = RequiredStubPayloadBits(compressedBytes);
+		return payloadBits == maximum || payloadBits > maximum - RequiredStubOuterEnvelopeBits
 			? maximum
-			: RequiredStubWireEnvelopeBits + compressedBytes * 8u;
+			: RequiredStubOuterEnvelopeBits + payloadBits;
+	}
+
+	constexpr bool CanAppendRequiredStub(bool reliableOverflowed,
+		std::size_t reliableBitsLeft, std::size_t compressedBytes)
+	{
+		const std::size_t payloadBits = RequiredStubPayloadBits(compressedBytes);
+		const std::size_t wireBits = RequiredStubWireBits(compressedBytes);
+		return !reliableOverflowed && payloadBits <= RequiredStubMaximumPayloadBits &&
+			wireBits != (std::numeric_limits<std::size_t>::max)() &&
+			wireBits <= reliableBitsLeft;
+	}
+
+	template <typename BitWriter>
+	bool AppendRequiredStubWire(BitWriter& reliable, std::uint32_t serviceType,
+		std::uint32_t messageType, std::uint32_t fileID,
+		const void* compressed, std::size_t compressedBytes)
+	{
+		if (serviceType >= (1u << RequiredStubServiceTypeBits) ||
+			messageType >= (1u << RequiredStubMessageTypeBits) ||
+			fileID >= (1u << RequiredStubFileIdBits) ||
+			(!compressed && compressedBytes != 0))
+		{
+			return false;
+		}
+
+		const int bitsBefore = reliable.GetNumBitsWritten();
+		const int bitsLeft = reliable.GetNumBitsLeft();
+		const std::size_t payloadBits = RequiredStubPayloadBits(compressedBytes);
+		const std::size_t wireBits = RequiredStubWireBits(compressedBytes);
+		if (bitsBefore < 0 || bitsLeft < 0 ||
+			!CanAppendRequiredStub(reliable.IsOverflowed(),
+				static_cast<std::size_t>(bitsLeft), compressedBytes) ||
+			payloadBits > static_cast<std::size_t>((std::numeric_limits<int>::max)()) ||
+			wireBits > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
+		{
+			return false;
+		}
+
+		reliable.WriteUBitLong(serviceType, RequiredStubServiceTypeBits);
+		reliable.WriteUBitLong(static_cast<std::uint32_t>(payloadBits),
+			RequiredStubPayloadLengthBits);
+		reliable.WriteUBitLong(messageType, RequiredStubMessageTypeBits);
+		reliable.WriteUBitLong(fileID, RequiredStubFileIdBits);
+		reliable.WriteBytes(compressed, static_cast<int>(compressedBytes));
+
+		return !reliable.IsOverflowed() && reliable.GetNumBitsWritten() - bitsBefore ==
+			static_cast<int>(wireBits);
 	}
 
 	constexpr std::size_t RequiredStubReliableCapacityBytes(std::size_t stubCount,

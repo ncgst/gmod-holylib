@@ -62,6 +62,7 @@ IModule* pGModDataPackModule = &g_pGModDataPackModule;
 
 #if MODULE_EXISTS_GAMESERVER
 extern bool Gameserver_HasExactGModSender();
+extern CBaseClient* Gameserver_GetClientBySlot(int slot);
 #endif
 
 // Linux connections begin from globally canonical hashes. Remember the exact
@@ -1307,6 +1308,7 @@ class ScopedClientLuaBaseline
 public:
 	explicit ScopedClientLuaBaseline(int slot, HolyLib::LuaPack::BaselineAction action)
 	{
+		VPROF_BUDGET("HolyLib - LuaPack baseline preparation", VPROF_BUDGETGROUP_HOLYLIB);
 		if (action != HolyLib::LuaPack::BaselineAction::BasePlusDelta &&
 			action != HolyLib::LuaPack::BaselineAction::CanonicalStub &&
 			action != HolyLib::LuaPack::BaselineAction::NativeSource)
@@ -1453,6 +1455,7 @@ public:
 private:
 	void Restore()
 	{
+		VPROF_BUDGET("HolyLib - LuaPack baseline restoration", VPROF_BUDGETGROUP_HOLYLIB);
 		for (ClientLuaBaselineHashOverride& replacement : overrides)
 		{
 			if (!replacement.item)
@@ -1561,6 +1564,7 @@ static bool EnsureRequiredLuaReliableCapacity(CBaseClient* client, int slot,
 
 static bool hook_CBaseClient_SendServerInfo(CBaseClient* client)
 {
+	VPROF_BUDGET("HolyLib - LuaPack SendServerInfo", VPROF_BUDGETGROUP_HOLYLIB);
 	const int slot = client ? client->GetPlayerSlot() : -1;
 	const HolyLib::LuaPack::BaselineDecision baseline = HolyLib::LuaPack::DecideBaselineForClient(slot);
 	if (baseline.action == HolyLib::LuaPack::BaselineAction::Reject)
@@ -1580,6 +1584,7 @@ static bool hook_CBaseClient_SendServerInfo(CBaseClient* client)
 
 	if (baseline.action == HolyLib::LuaPack::BaselineAction::Unchanged)
 	{
+		VPROF_BUDGET("HolyLib - engine SendServerInfo", VPROF_BUDGETGROUP_OTHER_NETWORKING);
 		return detour_CBaseClient_SendServerInfo.GetTrampoline<Symbols::CBaseClient_SendServerInfo>()(client);
 	}
 
@@ -1591,6 +1596,7 @@ static bool hook_CBaseClient_SendServerInfo(CBaseClient* client)
 		return false;
 	}
 
+	VPROF_BUDGET("HolyLib - engine SendServerInfo", VPROF_BUDGETGROUP_OTHER_NETWORKING);
 	return detour_CBaseClient_SendServerInfo.GetTrampoline<Symbols::CBaseClient_SendServerInfo>()(client);
 }
 #endif
@@ -1673,6 +1679,42 @@ static void SendCompressedLuaFile(int clientIdx, int fileID, const Bootil::AutoB
 
 	if (g_pGModDataPackModule.InDebug())
 		Msg(PROJECT_NAME " - gmoddatapack: Sent FileID %i though reliable stream!\n", fileID);
+}
+
+static bool AppendCanonicalLuaStub(int clientIdx, int fileID,
+	const Bootil::AutoBuffer& compressed)
+{
+	using namespace HolyLib::LuaPack::Policy;
+	static_assert(NETMSG_TYPE_BITS == RequiredStubServiceTypeBits,
+		"LuaPack reliable capacity math must match the engine message type width");
+	VPROF_BUDGET("HolyLib - LuaPack append canonical stub", VPROF_BUDGETGROUP_OTHER_NETWORKING);
+
+	CBaseClient* client = nullptr;
+#if MODULE_EXISTS_GAMESERVER
+	client = Gameserver_GetClientBySlot(clientIdx);
+#else
+	client = Util::server ? Util::GetClientByIndex(clientIdx) : nullptr;
+#endif
+	INetChannel* engineChannel = client ? client->GetNetChannel() : nullptr;
+	CNetChan* channel = static_cast<CNetChan*>(engineChannel);
+	if (!client || !engineChannel || !channel || !client->IsConnected() ||
+		client->GetPlayerSlot() != clientIdx)
+	{
+		return false;
+	}
+
+	bf_write& reliable = channel->m_StreamReliable;
+	const std::size_t compressedBytes = compressed.GetWritten();
+	// CNetChan::SendNetMsg ultimately invokes the GMod message's WriteToBuffer,
+	// which appends exactly this envelope to m_StreamReliable. Writing the same
+	// record here preserves the synchronous one-request/one-response boundary but
+	// avoids thousands of repeated CVEngineServer dispatches in ProcessMessages.
+	const bool appended = AppendRequiredStubWire(reliable, svc_GMod_ServerToClient,
+		GarrysMod::NetworkMessage::LuaFileDownload,
+		static_cast<std::uint32_t>(fileID), compressed.GetBase(), compressedBytes);
+	if (appended && g_pGModDataPackModule.InDebug())
+		Msg(PROJECT_NAME " - gmoddatapack: Appended canonical FileID %i to the reliable stream\n", fileID);
+	return appended;
 }
 
 static void SendLuaFile(int clientIdx, int fileID, LuaDataPack::LuaPackEntry* pEntry, bool bNoFastTransmit = false)
@@ -1865,6 +1907,7 @@ static bool SendNativeLuaFile(GModDataPack* pDataPack, int clientIdx, int fileID
 
 static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clientIdx, int fileID)
 {
+	VPROF_BUDGET("HolyLib - GModDataPack Lua request", VPROF_BUDGETGROUP_HOLYLIB);
 	if (!pDataPack || !pDataPack->m_pClientLuaFiles)
 	{
 		Warning(PROJECT_NAME " - gmoddatapack: Invalid datapack or missing client_lua_files stringtable?\n");
@@ -1884,14 +1927,23 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 
 	std::string fileName = clientFiles->GetString(fileID);
 	GarrysMod::Lua::LuaFile* luaFile = Lua::GetShared()->GetCache(fileName);
-	if (!RefreshRegistrationModeForRequest(fileID, fileName, luaFile))
+	bool registrationReady = false;
+	{
+		VPROF_BUDGET("HolyLib - LuaPack registration check", VPROF_BUDGETGROUP_HOLYLIB);
+		registrationReady = RefreshRegistrationModeForRequest(fileID, fileName, luaFile);
+	}
+	if (!registrationReady)
 	{
 		DisconnectLuaHashFailure(clientIdx, fileName.c_str(),
 			"the cached Lua registration mode changed but its native source is unavailable");
 		return;
 	}
-	const HolyLib::LuaPack::DeliveryDecision delivery = HolyLib::LuaPack::DecideDeliveryForClient(
-		clientIdx, fileName, luaFile ? luaFile->contents.length() : 0);
+	HolyLib::LuaPack::DeliveryDecision delivery;
+	{
+		VPROF_BUDGET("HolyLib - LuaPack delivery selection", VPROF_BUDGETGROUP_HOLYLIB);
+		delivery = HolyLib::LuaPack::DecideDeliveryForClient(
+			clientIdx, fileName, luaFile ? luaFile->contents.length() : 0);
+	}
 	if (delivery.action == HolyLib::LuaPack::DeliveryAction::Stub && delivery.compressed)
 	{
 		// A stub is a normal, reliably delivered LuaFileDownload. It preserves the engine's
@@ -1929,7 +1981,11 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 			if (pendingHash != pendingHashes.end())
 				pendingHashes.erase(pendingHash);
 		}
-		SendCompressedLuaFile(clientIdx, fileID, *delivery.compressed);
+		if (!AppendCanonicalLuaStub(clientIdx, fileID, *delivery.compressed))
+		{
+			DisconnectLuaHashFailure(clientIdx, fileName.c_str(),
+				"the canonical placeholder could not be appended to the reserved reliable buffer");
+		}
 		return;
 	}
 	if (delivery.action == HolyLib::LuaPack::DeliveryAction::Reject)

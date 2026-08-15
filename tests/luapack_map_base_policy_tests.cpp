@@ -6,10 +6,62 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 using HolyLib::LuaPack::Policy::Action;
 using HolyLib::LuaPack::Policy::BaseAvailability;
 using HolyLib::LuaPack::Policy::Lane;
+
+class TestBitWriter
+{
+public:
+	explicit TestBitWriter(std::size_t maximumBits) : maximumBits(maximumBits) {}
+
+	int GetNumBitsWritten() const { return static_cast<int>(bits.size()); }
+	int GetNumBitsLeft() const
+	{
+		return maximumBits >= bits.size()
+			? static_cast<int>(maximumBits - bits.size()) : 0;
+	}
+	bool IsOverflowed() const { return overflowed; }
+
+	void WriteUBitLong(std::uint32_t value, int bitCount)
+	{
+		for (int bit = 0; bit < bitCount; ++bit)
+			WriteBit((value >> bit) & 1u);
+	}
+
+	void WriteBytes(const void* data, int byteCount)
+	{
+		const auto* bytes = static_cast<const unsigned char*>(data);
+		for (int byte = 0; byte < byteCount; ++byte)
+			WriteUBitLong(bytes[byte], 8);
+	}
+
+	std::uint32_t ReadUBitLong(std::size_t start, int bitCount) const
+	{
+		std::uint32_t value = 0;
+		for (int bit = 0; bit < bitCount; ++bit)
+			value |= static_cast<std::uint32_t>(bits[start + bit]) << bit;
+		return value;
+	}
+
+	std::vector<bool> bits;
+
+private:
+	void WriteBit(bool value)
+	{
+		if (bits.size() >= maximumBits)
+		{
+			overflowed = true;
+			return;
+		}
+		bits.push_back(value);
+	}
+
+	std::size_t maximumBits;
+	bool overflowed = false;
+};
 
 int main()
 {
@@ -193,7 +245,69 @@ int main()
 		assert(NeedsOrderedCanonicalHash(false, true, false));
 		assert(NeedsOrderedCanonicalHash(false, false, true));
 		assert(!NeedsOrderedCanonicalHash(false, false, false));
+		assert(RequiredStubPayloadBits(73) == 608);
 		assert(RequiredStubWireBits(73) == 634);
+		assert(CanAppendRequiredStub(false, 634, 73));
+		assert(!CanAppendRequiredStub(false, 633, 73));
+		assert(!CanAppendRequiredStub(true, 634, 73));
+		assert(CanAppendRequiredStub(false,
+			(std::numeric_limits<std::size_t>::max)(), 131068));
+		assert(!CanAppendRequiredStub(false,
+			(std::numeric_limits<std::size_t>::max)(), 131069));
+		assert(!CanAppendRequiredStub(false,
+			(std::numeric_limits<std::size_t>::max)(), 1u << 17u));
+
+		const std::array<unsigned char, 3> compressed = {0x00, 0x7f, 0xff};
+		const std::size_t wireBits = RequiredStubWireBits(compressed.size());
+		TestBitWriter wire(3 + wireBits);
+		wire.WriteUBitLong(5, 3); // Exercise the production writer from an unaligned offset.
+		std::size_t start = wire.bits.size();
+		assert(AppendRequiredStubWire(wire, 33, 7, 0x1234,
+			compressed.data(), compressed.size()));
+		assert(wire.bits.size() - start == wireBits);
+		assert(wire.ReadUBitLong(start, RequiredStubServiceTypeBits) == 33);
+		start += RequiredStubServiceTypeBits;
+		assert(wire.ReadUBitLong(start, RequiredStubPayloadLengthBits) ==
+			RequiredStubPayloadBits(compressed.size()));
+		start += RequiredStubPayloadLengthBits;
+		assert(wire.ReadUBitLong(start, RequiredStubMessageTypeBits) == 7);
+		start += RequiredStubMessageTypeBits;
+		assert(wire.ReadUBitLong(start, RequiredStubFileIdBits) == 0x1234);
+		start += RequiredStubFileIdBits;
+		assert(wire.ReadUBitLong(start, 8) == compressed[0]);
+		assert(wire.ReadUBitLong(start + 8, 8) == compressed[1]);
+		assert(wire.ReadUBitLong(start + 16, 8) == compressed[2]);
+
+		TestBitWriter shortWire(wireBits - 1);
+		assert(!AppendRequiredStubWire(shortWire, 33, 7, 1,
+			compressed.data(), compressed.size()));
+		assert(shortWire.bits.empty());
+		assert(!shortWire.IsOverflowed());
+		TestBitWriter invalidWire(wireBits);
+		assert(!AppendRequiredStubWire(invalidWire, 64, 7, 1,
+			compressed.data(), compressed.size()));
+		assert(!AppendRequiredStubWire(invalidWire, 33, 256, 1,
+			compressed.data(), compressed.size()));
+		assert(!AppendRequiredStubWire(invalidWire, 33, 7, 65536,
+			compressed.data(), compressed.size()));
+		assert(!AppendRequiredStubWire(invalidWire, 33, 7, 1, nullptr, 1));
+		assert(invalidWire.bits.empty());
+
+		constexpr std::size_t scprpFiles = 3922;
+		const std::array<unsigned char, 73> canonicalStub{};
+		const std::size_t scprpCapacity = RequiredStubReliableCapacityBytes(
+			scprpFiles, canonicalStub.size());
+		TestBitWriter scprpBurst(scprpCapacity * 8);
+		for (std::size_t fileID = 1; fileID <= scprpFiles; ++fileID)
+		{
+			assert(AppendRequiredStubWire(scprpBurst, 33, 7,
+				static_cast<std::uint32_t>(fileID), canonicalStub.data(),
+				canonicalStub.size()));
+		}
+		assert(scprpBurst.bits.size() ==
+			scprpFiles * RequiredStubWireBits(canonicalStub.size()));
+		assert(scprpBurst.GetNumBitsLeft() >=
+			static_cast<int>(RequiredStubReliableReserveBytes * 8));
 		assert(RequiredStubReliableCapacityBytes(795, 73) == 128540);
 		assert(RequiredStubReliableCapacityBytes(3922, 73) == 376355);
 		assert(RequiredStubReliableCapacityBytes(3922, 73, 262144) == 572963);

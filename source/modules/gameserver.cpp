@@ -75,6 +75,31 @@ static std::vector<CGameClient*> g_pQueueClients;
 extern CGlobalVars* gpGlobals;
 static Symbols::CNetChan_SendNetMsg g_pEngineCNetChanSendNetMsg = nullptr;
 
+// Queue clients live outside CBaseServer's physical client array. LuaPack still
+// handles their engine-owned Lua requests synchronously, so callers need a
+// slot-owned lookup instead of assuming vector position or physical capacity.
+// Client-list mutation and Lua delivery both run on the main thread.
+CBaseClient* Gameserver_GetClientBySlot(int slot)
+{
+	if (slot < 0)
+		return nullptr;
+
+	if (Util::server && slot < Util::server->GetClientCount())
+	{
+		CBaseClient* client = static_cast<CBaseClient*>(Util::server->GetClient(slot));
+		if (client && client->m_nClientSlot == slot)
+			return client;
+	}
+
+	for (CGameClient* queueClient : g_pQueueClients)
+	{
+		if (queueClient && queueClient->m_nClientSlot == slot)
+			return static_cast<CBaseClient*>(queueClient);
+	}
+
+	return nullptr;
+}
+
 /*
  * Queue CGameClients use slots at/above gpGlobals->maxClients, but the engine's
  * CGameClient::Connect still derives an edict from slot + 1. Those edicts are
