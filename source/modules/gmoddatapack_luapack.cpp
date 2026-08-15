@@ -752,8 +752,8 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		// LuaPack uses this clock only for elapsed-time gates and expirations. The
 		// IVEngineServer mirror is not ABI-stable across current GMod engine builds;
 		// calling Time() through a stale virtual slot produced nonsensical values
-		// on Linux x64 and broke both pacing and recovery deadlines. Plat_FloatTime is
-		// monotonic and does not depend on that engine vtable layout.
+		// on Linux x64 and broke recovery deadlines. Plat_FloatTime is monotonic and
+		// does not depend on that engine vtable layout.
 		return Plat_FloatTime();
 	}
 
@@ -2212,6 +2212,22 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		return {BaselineAction::Reject, "invalid per-file map-base policy result"};
 	}
 
+	std::size_t RequiredStubCompressedBytesForClient(int slot)
+	{
+		if (!IsEnabled() || !IsValidSlot(slot))
+			return 0;
+
+		const ClientPin& client = state.clients[slot];
+		auto generation = state.generations.find(client.generation);
+		if (generation == state.generations.end() ||
+			!generation->second.compressedRequiredStub)
+		{
+			return 0;
+		}
+
+		return generation->second.compressedRequiredStub->GetWritten();
+	}
+
 	bool NeedsNativeHashUpdate(int slot)
 	{
 		if (!IsEnabled() || !IsValidSlot(slot))
@@ -2258,7 +2274,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 				Msg(PROJECT_NAME " - luapack: client slot %i is using required map base %s with per-path native deltas; stubbing unchanged files without waiting for READY\n",
 					slot, client.generation.c_str());
 		}
-		return {DeliveryAction::Stub, generation->second.compressedRequiredStub, nullptr};
+		return {DeliveryAction::Stub, generation->second.compressedRequiredStub.get(), nullptr};
 	}
 
 	void DisconnectRequiredClient(int slot, const char* failure)

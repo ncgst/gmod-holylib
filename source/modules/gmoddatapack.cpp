@@ -17,11 +17,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <limits>
 #include <deque>
-#include <memory>
 #include <unordered_map>
-#include <unordered_set>
-#include <vector>
 
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
@@ -58,28 +56,13 @@ public:
 static ConVar gmoddatapack_removeserverif("holylib_gmoddatapack_removeserverif", "0", 0, "If enabled, \"if SERVER then\" code blocks are removed from client files");
 static ConVar gmoddatapack_removecomments("holylib_gmoddatapack_removecomments", "0", 0, "If enabled, comments are removed from client files");
 static ConVar gmoddatapack_fastnetworking("holylib_gmoddatapack_fastnetworking", "0", 0, "(Very Experimental) If enabled, it'll do funky stuff to the networking");
-static ConVar gmoddatapack_luapack_delivery_diagnostics(
-	"holylib_gmoddatapack_luapack_delivery_diagnostics", "0", 0,
-	"Log bounded anonymous LuaPack placeholder queue and engine-send diagnostics");
 
 static CGModDataPackModule g_pGModDataPackModule;
 IModule* pGModDataPackModule = &g_pGModDataPackModule;
 
 #if MODULE_EXISTS_GAMESERVER
-extern CBaseClient* Gameserver_GetClientBySlot(int slot);
 extern bool Gameserver_HasExactGModSender();
-extern bool Gameserver_SendGModMessage(CBaseClient* client, int slot,
-	const void* data, int dataBits);
 #endif
-
-static CBaseClient* GetClientForLuaDelivery(int slot)
-{
-#if MODULE_EXISTS_GAMESERVER
-	if (CBaseClient* client = Gameserver_GetClientBySlot(slot))
-		return client;
-#endif
-	return Util::server ? Util::GetClientByIndex(slot) : nullptr;
-}
 
 // Linux connections begin from globally canonical hashes. Remember the exact
 // per-client native identities for every lane so initial native baselines do not
@@ -87,127 +70,6 @@ static CBaseClient* GetClientForLuaDelivery(int slot)
 using ClientLuaHash = std::array<unsigned char, 32>;
 static std::array<std::unordered_map<int, ClientLuaHash>, ABSOLUTE_PLAYER_LIMIT> g_clientNativeLuaHashes;
 static std::array<std::unordered_map<int, ClientLuaHash>, ABSOLUTE_PLAYER_LIMIT> g_clientHashUpdatesPending;
-
-struct QueuedCanonicalLuaStub
-{
-	int fileID = -1;
-	std::shared_ptr<const Bootil::AutoBuffer> compressed;
-};
-
-struct ClientCanonicalLuaStubQueue
-{
-	bool Enqueue(int fileID, const std::shared_ptr<const Bootil::AutoBuffer>& compressed)
-	{
-		if (fileID <= 0 || !compressed)
-			return false;
-		if (fileIDs.find(fileID) != fileIDs.end())
-			return true;
-		if (items.size() >= (1u << 13))
-			return false;
-
-		items.push_back({fileID, compressed});
-		fileIDs.insert(fileID);
-		if (enqueued == 0)
-		{
-			enqueuedAt = Plat_FloatTime();
-			lastDiagnosticAt = -1.0;
-			firstSendAttemptLogged = false;
-		}
-		++enqueued;
-		return true;
-	}
-
-	void Cancel(int fileID)
-	{
-		if (fileIDs.erase(fileID) == 0)
-			return;
-		auto item = std::find_if(items.begin(), items.end(), [fileID](const QueuedCanonicalLuaStub& queued) {
-			return queued.fileID == fileID;
-		});
-		if (item != items.end())
-			items.erase(item);
-	}
-
-	void PopFront()
-	{
-		if (items.empty())
-			return;
-		fileIDs.erase(items.front().fileID);
-		items.pop_front();
-		++committed;
-	}
-
-	void Clear()
-	{
-		items.clear();
-		fileIDs.clear();
-		engineScratchPending = false;
-		engineScratchStartedAt = -1.0;
-		enqueued = 0;
-		committed = 0;
-		batches = 0;
-		stagingAttempts = 0;
-		summaryLogged = false;
-		enqueuedAt = -1.0;
-		lastDiagnosticAt = -1.0;
-		firstSendAttemptLogged = false;
-	}
-
-	std::size_t PendingWork() const
-	{
-		return items.size() + (engineScratchPending ? 1u : 0u);
-	}
-
-	std::deque<QueuedCanonicalLuaStub> items;
-	std::unordered_set<int> fileIDs;
-	bool engineScratchPending = false;
-	double engineScratchStartedAt = -1.0;
-	std::size_t enqueued = 0;
-	std::size_t committed = 0;
-	std::size_t batches = 0;
-	std::size_t stagingAttempts = 0;
-	bool summaryLogged = false;
-	double enqueuedAt = -1.0;
-	double lastDiagnosticAt = -1.0;
-	bool firstSendAttemptLogged = false;
-};
-
-static std::array<ClientCanonicalLuaStubQueue, ABSOLUTE_PLAYER_LIMIT> g_clientCanonicalLuaStubQueues;
-static int g_nextCanonicalLuaStubSlot = 0;
-static int g_nextCanonicalLuaStubScratchSlot = 0;
-static double g_nLastSend = 0;
-static double g_nLastCanonicalStubSend = 0;
-
-static void ClearClientCanonicalLuaStubs(int slot, const char* reason)
-{
-	if (slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT)
-	{
-		ClientCanonicalLuaStubQueue& queue = g_clientCanonicalLuaStubQueues[slot];
-		if (gmoddatapack_luapack_delivery_diagnostics.GetBool() && queue.PendingWork() != 0)
-		{
-			Msg(PROJECT_NAME " - luapack transport diagnostic: clearing client slot %i queue: pending=%u enqueued=%u committed=%u reason=%s\n",
-				slot, static_cast<unsigned int>(queue.PendingWork()),
-				static_cast<unsigned int>(queue.enqueued),
-				static_cast<unsigned int>(queue.committed),
-				reason ? reason : "unspecified");
-		}
-		g_clientCanonicalLuaStubQueues[slot].Clear();
-	}
-}
-
-static void ClearAllClientCanonicalLuaStubs(const char* reason)
-{
-	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
-		ClearClientCanonicalLuaStubs(slot, reason);
-	g_nextCanonicalLuaStubSlot = 0;
-	g_nextCanonicalLuaStubScratchSlot = 0;
-}
-
-static void CancelClientCanonicalLuaStub(int slot, int fileID)
-{
-	if (slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT)
-		g_clientCanonicalLuaStubQueues[slot].Cancel(fileID);
-}
 
 static void ClearClientNativeLuaHashes(int slot)
 {
@@ -1609,18 +1471,112 @@ private:
 };
 
 static Detouring::Hook detour_CBaseClient_SendServerInfo;
+
+static bool EnsureRequiredLuaReliableCapacity(CBaseClient* client, int slot,
+	HolyLib::LuaPack::BaselineAction action, std::string& failure)
+{
+	using namespace HolyLib::LuaPack::Policy;
+	if (action != HolyLib::LuaPack::BaselineAction::BasePlusDelta)
+		return true;
+	if (!client || !g_pDataPack || !g_pDataPack->m_pClientLuaFiles)
+	{
+		failure = "the client Lua string table is unavailable";
+		return false;
+	}
+
+	INetChannel* engineChannel = client->GetNetChannel();
+	CNetChan* channel = static_cast<CNetChan*>(engineChannel);
+	if (!engineChannel || !channel)
+	{
+		failure = "the client netchannel is unavailable";
+		return false;
+	}
+
+	const int registeredFiles = g_pDataPack->m_pClientLuaFiles->GetNumStrings();
+	const std::size_t maximumStubCount = registeredFiles > 1
+		? static_cast<std::size_t>(registeredFiles - 1) : 0u;
+	const std::size_t compressedStubBytes =
+		HolyLib::LuaPack::RequiredStubCompressedBytesForClient(slot);
+	if (compressedStubBytes == 0)
+	{
+		failure = "the canonical placeholder body is unavailable";
+		return false;
+	}
+
+	const std::size_t minimumRequiredBytes = RequiredStubReliableCapacityBytes(
+		maximumStubCount, compressedStubBytes);
+	if (minimumRequiredBytes == (std::numeric_limits<std::size_t>::max)())
+	{
+		failure = "the canonical placeholder burst exceeds the addressable reliable buffer";
+		return false;
+	}
+
+	const int previousBits = channel->m_StreamReliable.GetMaxNumBits();
+	if (previousBits <= 0)
+	{
+		failure = "the engine reported an invalid reliable buffer capacity";
+		return false;
+	}
+	const std::size_t previousBytes =
+		(static_cast<std::size_t>(previousBits) + 7u) / 8u;
+	if (previousBytes >= minimumRequiredBytes)
+		return true;
+
+	// When growth is necessary, preserve the channel's entire previous capacity as
+	// sign-on headroom. This makes the reservation scale from the engine's own
+	// baseline rather than relying only on the 64 KiB minimum used for the no-growth
+	// decision.
+	const std::size_t requiredBytes = RequiredStubReliableCapacityBytes(
+		maximumStubCount, compressedStubBytes, previousBytes);
+	if (requiredBytes == (std::numeric_limits<std::size_t>::max)() ||
+		requiredBytes > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
+	{
+		failure = "the canonical placeholder burst exceeds the addressable reliable buffer";
+		return false;
+	}
+
+	// Resizing an occupied scratch stream can invalidate bytes already staged by the
+	// engine. SendServerInfo is normally entered with an empty scratch stream; if that
+	// invariant changes, fail closed instead of copying through an unproven layout.
+	if (channel->m_StreamReliable.GetNumBitsWritten() != 0)
+	{
+		failure = "reliable sign-on bytes were already staged before capacity reservation";
+		return false;
+	}
+
+	engineChannel->SetMaxBufferSize(true, static_cast<int>(requiredBytes), false);
+	const int actualBits = channel->m_StreamReliable.GetMaxNumBits();
+	const std::size_t actualBytes = actualBits > 0
+		? (static_cast<std::size_t>(actualBits) + 7u) / 8u : 0u;
+	if (actualBytes < requiredBytes)
+	{
+		failure = "the engine refused the required reliable buffer capacity";
+		return false;
+	}
+
+	Msg(PROJECT_NAME " - luapack: client slot %i reserved %u reliable bytes (previously %u) for at most %u canonical placeholders\n",
+		slot, static_cast<unsigned int>(actualBytes),
+		static_cast<unsigned int>(previousBytes),
+		static_cast<unsigned int>(maximumStubCount));
+	return true;
+}
+
 static bool hook_CBaseClient_SendServerInfo(CBaseClient* client)
 {
 	const int slot = client ? client->GetPlayerSlot() : -1;
-	// SendServerInfo is the physical connection's Lua-baseline boundary. A retry or
-	// recovery baseline must never inherit placeholder replies queued for the previous
-	// epoch, while late game-layer callbacks intentionally do not touch this queue.
-	ClearClientCanonicalLuaStubs(slot, "SendServerInfo baseline boundary");
 	const HolyLib::LuaPack::BaselineDecision baseline = HolyLib::LuaPack::DecideBaselineForClient(slot);
 	if (baseline.action == HolyLib::LuaPack::BaselineAction::Reject)
 	{
 		if (client)
 			client->Disconnect("%s", baseline.failure ? baseline.failure : "required LuaPack baseline was rejected");
+		return false;
+	}
+
+	std::string capacityFailure;
+	if (!EnsureRequiredLuaReliableCapacity(client, slot, baseline.action, capacityFailure))
+	{
+		if (client)
+			client->Disconnect("Required Lua delivery could not reserve its engine buffer: %s", capacityFailure.c_str());
 		return false;
 	}
 
@@ -1648,8 +1604,8 @@ bool HolyLib::LuaPack::SupportsCanonicalRegistration()
 {
 	// Required delivery needs the complete hook set: global canonical registration,
 	// the per-connection baseline override, canonical/native body selection, and the
-	// exact engine custom-message sender. Platform support alone is not enough; any
-	// disabled, unresolved, or failed detour must keep required admission closed.
+	// exact queue-client sender. Platform support alone is not enough; any disabled,
+	// unresolved, or failed detour must keep required admission closed.
 #if defined(SYSTEM_LINUX) && MODULE_EXISTS_GAMESERVER
 	return DETOUR_ISVALID(detour_CBaseClient_SendServerInfo) &&
 		DETOUR_ISENABLED(detour_CBaseClient_SendServerInfo) &&
@@ -1706,8 +1662,7 @@ static void hook_GModDataPack_AddOrUpdateFile(GModDataPack* pDataPack, GarrysMod
 	// The SHA256 is generated by GModDataPack::GetHashFromString
 }
 
-static bool SendCompressedLuaFile(int clientIdx, int fileID, const Bootil::AutoBuffer& compressed,
-	CBaseClient* knownClient = nullptr)
+static void SendCompressedLuaFile(int clientIdx, int fileID, const Bootil::AutoBuffer& compressed)
 {
 	char pBuffer[1 << 16];
 	bf_write msg(pBuffer, sizeof(pBuffer));
@@ -1715,29 +1670,11 @@ static bool SendCompressedLuaFile(int clientIdx, int fileID, const Bootil::AutoB
 	msg.WriteByte(GarrysMod::NetworkMessage::LuaFileDownload);
 	msg.WriteUBitLong(fileID, 16);
 	msg.WriteBytes(compressed.GetBase(), compressed.GetWritten());
-	if (msg.IsOverflowed())
-		return false;
 
-	bool queued = true;
-#if MODULE_EXISTS_GAMESERVER
-	if (knownClient)
-	{
-		// Use the engine's resolved CNetChan::SendNetMsg implementation for both
-		// physical and parked clients. Calling through HolyLib's mirrored vtables or
-		// replaying CVEngineServer::GMOD_SendToClient later in Think is not a stable
-		// early-sign-on ownership boundary on current Linux x64.
-		queued = Gameserver_SendGModMessage(knownClient, clientIdx, msg.GetData(),
-			msg.GetNumBitsWritten());
-	}
-	else
-#endif
-	{
-		Util::engineserver->GMOD_SendToClient(clientIdx, msg.GetData(), msg.GetNumBitsWritten());
-	}
+	Util::engineserver->GMOD_SendToClient(clientIdx, msg.GetData(), msg.GetNumBitsWritten());
 
-	if (queued && g_pGModDataPackModule.InDebug())
+	if (g_pGModDataPackModule.InDebug())
 		Msg(PROJECT_NAME " - gmoddatapack: Sent FileID %i though reliable stream!\n", fileID);
-	return queued;
 }
 
 static void SendLuaFile(int clientIdx, int fileID, LuaDataPack::LuaPackEntry* pEntry, bool bNoFastTransmit = false)
@@ -1753,7 +1690,7 @@ static void SendLuaFile(int clientIdx, int fileID, LuaDataPack::LuaPackEntry* pE
 		return;
 	}
 
-	(void)SendCompressedLuaFile(clientIdx, fileID, pEntry->compressed);
+	SendCompressedLuaFile(clientIdx, fileID, pEntry->compressed);
 }
 
 static void SendOriginalLuaFile(GModDataPack* pDataPack, int clientIdx, int fileID)
@@ -1766,10 +1703,8 @@ static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned ch
 	if (!g_pDataPack || !g_pDataPack->m_pClientLuaFiles || !hash || hashLength != 32)
 		return false;
 
-	CBaseClient* client = GetClientForLuaDelivery(clientIdx);
-	INetChannel* engineChannel = client ? client->GetNetChannel() : nullptr;
-	CNetChan* channel = static_cast<CNetChan*>(engineChannel);
-	if (!client || !engineChannel || !channel)
+	CBaseClient* client = Util::server ? Util::GetClientByIndex(clientIdx) : nullptr;
+	if (!client || !client->GetNetChannel())
 		return false;
 
 	INetworkStringTable* table = g_pDataPack->m_pClientLuaFiles;
@@ -1805,11 +1740,7 @@ static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned ch
 		update.m_DataOut.WriteBits(hash, static_cast<int>(hashLength * 8));
 	}
 
-	if (update.m_DataOut.IsOverflowed())
-		return false;
-	const int reliableBitsBefore = channel->m_StreamReliable.GetNumBitsWritten();
-	return client->SendNetMsg(update, true) && !channel->m_StreamReliable.IsOverflowed() &&
-		channel->m_StreamReliable.GetNumBitsWritten() > reliableBitsBefore;
+	return !update.m_DataOut.IsOverflowed() && client->SendNetMsg(update, true);
 }
 
 static bool GetNativeLuaHash(int fileID, GarrysMod::Lua::LuaFile* luaFile, std::array<unsigned char, 32>& output)
@@ -1848,7 +1779,7 @@ static void DisconnectLuaHashFailure(int clientIdx, const char* fileName, const 
 {
 	Warning(PROJECT_NAME " - luapack: disconnecting client slot %i because %s for %s\n",
 		clientIdx, failure ? failure : "Lua hash identity failed", fileName ? fileName : "?");
-	CBaseClient* client = GetClientForLuaDelivery(clientIdx);
+	CBaseClient* client = Util::server ? Util::GetClientByIndex(clientIdx) : nullptr;
 	if (client)
 		client->Disconnect("Lua delivery identity failed for %s", fileName ? fileName : "an unknown file");
 }
@@ -1963,42 +1894,44 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 	}
 	const HolyLib::LuaPack::DeliveryDecision delivery = HolyLib::LuaPack::DecideDeliveryForClient(
 		clientIdx, fileName, luaFile ? luaFile->contents.length() : 0);
-	if (delivery.action != HolyLib::LuaPack::DeliveryAction::Stub)
-	{
-		// A later hot update can replace an earlier canonical request with a native
-		// delta request for the same ID. Never let the older queued stub follow the
-		// newer native body.
-		CancelClientCanonicalLuaStub(clientIdx, fileID);
-	}
 	if (delivery.action == HolyLib::LuaPack::DeliveryAction::Stub && delivery.compressed)
 	{
-		// Preserve the engine's one-response-per-file barrier, but do not append thousands
-		// of tiny reliable messages in the request callback. Think drains this queue under
-		// per-client/global budgets and atomically fragments each successful batch.
+		// A stub is a normal, reliably delivered LuaFileDownload. It preserves the engine's
+		// per-file barrier contract while the multi-megabyte payload stays exclusively on FastDL.
+		// Its identity is already canonical in this connection's server-info baseline, so a
+		// same-hash string-table update here would only make the client process 1 update per file.
 		if (delivery.compressed->GetWritten() < 32)
 		{
 			DisconnectLuaHashFailure(clientIdx, fileName.c_str(), "the canonical placeholder payload is incomplete");
 			return;
 		}
 
-		if (clientIdx < 0 || clientIdx >= ABSOLUTE_PLAYER_LIMIT)
+		if (clientIdx >= 0 && clientIdx < ABSOLUTE_PLAYER_LIMIT)
 		{
-			DisconnectLuaHashFailure(clientIdx, fileName.c_str(),
-				"the canonical placeholder queue could not retain this request");
-			return;
+			auto& nativeHashes = g_clientNativeLuaHashes[clientIdx];
+			auto nativeHash = nativeHashes.find(fileID);
+			CBaseClient* client = Util::server ? Util::GetClientByIndex(clientIdx) : nullptr;
+			const bool clientActive = client && client->IsActive();
+			auto& pendingHashes = g_clientHashUpdatesPending[clientIdx];
+			auto pendingHash = pendingHashes.find(fileID);
+			const bool publishedHashMatchesCanonical = pendingHash != pendingHashes.end() &&
+				std::equal(pendingHash->second.begin(), pendingHash->second.end(),
+					static_cast<const unsigned char*>(delivery.compressed->GetBase()));
+			if (HolyLib::LuaPack::Policy::NeedsOrderedCanonicalHash(clientActive,
+				nativeHash != nativeHashes.end(), publishedHashMatchesCanonical))
+			{
+				if (!SendClientLuaHashUpdate(clientIdx, fileID,
+					static_cast<const unsigned char*>(delivery.compressed->GetBase()), 32))
+				{
+					DisconnectLuaHashFailure(clientIdx, fileName.c_str(), "the canonical placeholder hash could not be restored");
+					return;
+				}
+				HolyLib::LuaPack::Policy::RestoreCanonicalHash(nativeHashes, fileID);
+			}
+			if (pendingHash != pendingHashes.end())
+				pendingHashes.erase(pendingHash);
 		}
-
-		ClientCanonicalLuaStubQueue& queue = g_clientCanonicalLuaStubQueues[clientIdx];
-		const std::size_t enqueuedBefore = queue.enqueued;
-		if (!queue.Enqueue(fileID, delivery.compressed))
-		{
-			DisconnectLuaHashFailure(clientIdx, fileName.c_str(),
-				"the canonical placeholder queue could not retain this request");
-			return;
-		}
-		if (enqueuedBefore == 0 && queue.enqueued == 1)
-			Msg(PROJECT_NAME " - luapack: client slot %i began paced canonical placeholder delivery\n",
-				clientIdx);
+		SendCompressedLuaFile(clientIdx, fileID, *delivery.compressed);
 		return;
 	}
 	if (delivery.action == HolyLib::LuaPack::DeliveryAction::Reject)
@@ -2074,274 +2007,6 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 	// vanilla payload; never consume a request merely because luapack is active.
 	if (HolyLib::LuaPack::IsEnabled())
 		SendNativeLuaFile(pDataPack, clientIdx, fileID, fileName, luaFile);
-}
-
-static void LogCanonicalLuaStubDeliveryComplete(int slot,
-	ClientCanonicalLuaStubQueue& queue)
-{
-	if (!queue.items.empty() || queue.engineScratchPending || queue.enqueued == 0 ||
-		queue.summaryLogged)
-	{
-		return;
-	}
-
-	queue.summaryLogged = true;
-	Msg(PROJECT_NAME " - luapack: client slot %i completed paced canonical placeholder delivery: enqueued=%u committed=%u batches=%u dispatch_attempts=%u\n",
-		slot, static_cast<unsigned int>(queue.enqueued),
-		static_cast<unsigned int>(queue.committed),
-		static_cast<unsigned int>(queue.batches),
-		static_cast<unsigned int>(queue.stagingAttempts));
-}
-
-static void LogCanonicalLuaStubTransportDiagnostics(double monotonicTime)
-{
-	if (!gmoddatapack_luapack_delivery_diagnostics.GetBool())
-		return;
-
-	const double wallTime = Plat_FloatTime();
-	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
-	{
-		ClientCanonicalLuaStubQueue& queue = g_clientCanonicalLuaStubQueues[slot];
-		if (queue.PendingWork() == 0 ||
-			(queue.lastDiagnosticAt >= 0.0 && wallTime < queue.lastDiagnosticAt + 10.0))
-		{
-			continue;
-		}
-
-		queue.lastDiagnosticAt = wallTime;
-		CBaseClient* client = GetClientForLuaDelivery(slot);
-		const bool connected = client && client->IsConnected();
-		INetChannel* engineChannel = connected ? client->GetNetChannel() : nullptr;
-		CNetChan* channel = static_cast<CNetChan*>(engineChannel);
-		Msg(PROJECT_NAME " - luapack transport diagnostic: client slot %i queue heartbeat: pending=%u items=%u connected=%i channel=%i active=%i signon=%i overflow=%i reliable_bits=%i reliable_bytes_left=%i monotonic_time=%.6f last_batch=%.6f wall_age=%.3f\n",
-			slot, static_cast<unsigned int>(queue.PendingWork()),
-			static_cast<unsigned int>(queue.items.size()), connected ? 1 : 0,
-			channel ? 1 : 0, client && client->IsActive() ? 1 : 0,
-			client ? client->m_nSignonState : -1,
-			channel && channel->m_StreamReliable.IsOverflowed() ? 1 : 0,
-			channel ? channel->m_StreamReliable.GetNumBitsWritten() : -1,
-			channel ? channel->m_StreamReliable.GetNumBytesLeft() : -1,
-			monotonicTime, g_nLastCanonicalStubSend,
-			queue.enqueuedAt >= 0.0 ? wallTime - queue.enqueuedAt : -1.0);
-	}
-}
-
-static void DrainCanonicalLuaStubQueues(double currentTime,
-	std::size_t& batchBudget)
-{
-	using namespace HolyLib::LuaPack::Policy;
-	std::size_t globalBudget = ReliableStubGlobalBudgetBytes;
-	const int startSlot = g_nextCanonicalLuaStubSlot;
-
-	for (int offset = 0; offset < ABSOLUTE_PLAYER_LIMIT && globalBudget > 0 &&
-		batchBudget > 0; ++offset)
-	{
-		const int slot = (startSlot + offset) % ABSOLUTE_PLAYER_LIMIT;
-		g_nextCanonicalLuaStubSlot = (slot + 1) % ABSOLUTE_PLAYER_LIMIT;
-		ClientCanonicalLuaStubQueue& queue = g_clientCanonicalLuaStubQueues[slot];
-		if (queue.items.empty())
-			continue;
-
-		CBaseClient* client = GetClientForLuaDelivery(slot);
-		INetChannel* engineChannel = client && client->IsConnected()
-			? client->GetNetChannel() : nullptr;
-		CNetChan* channel = static_cast<CNetChan*>(engineChannel);
-		if (!CanBeginReliableStubBatch(channel != nullptr,
-			channel && channel->m_StreamReliable.IsOverflowed(),
-			queue.engineScratchPending))
-			continue;
-
-		std::size_t clientBudget = ReliableStubClientBudgetBytes;
-		std::size_t batchCount = 0;
-		bool queueInvalid = false;
-		std::vector<bool> orderedCanonicalHashes;
-		orderedCanonicalHashes.reserve(queue.items.size());
-		while (batchCount < queue.items.size())
-		{
-			const QueuedCanonicalLuaStub& item = queue.items[batchCount];
-			if (!item.compressed || item.compressed->GetWritten() < 32)
-			{
-				const char* registeredPath = g_pDataPack && g_pDataPack->m_pClientLuaFiles &&
-					item.fileID > 0 && item.fileID < g_pDataPack->m_pClientLuaFiles->GetNumStrings()
-					? g_pDataPack->m_pClientLuaFiles->GetString(item.fileID) : nullptr;
-				const std::string failedPath = registeredPath ? registeredPath : "an unknown file";
-				queue.Clear();
-				queueInvalid = true;
-				DisconnectLuaHashFailure(slot, failedPath.c_str(),
-					"the queued canonical placeholder payload became incomplete");
-				break;
-			}
-
-			auto& nativeHashes = g_clientNativeLuaHashes[slot];
-			auto nativeHash = nativeHashes.find(item.fileID);
-			auto& pendingHashes = g_clientHashUpdatesPending[slot];
-			auto pendingHash = pendingHashes.find(item.fileID);
-			const unsigned char* canonicalHash =
-				static_cast<const unsigned char*>(item.compressed->GetBase());
-			const bool publishedHashMatchesCanonical = pendingHash != pendingHashes.end() &&
-				std::equal(pendingHash->second.begin(), pendingHash->second.end(), canonicalHash);
-			const bool orderedCanonicalHash = NeedsOrderedCanonicalHash(client->IsActive(),
-				nativeHash != nativeHashes.end(), publishedHashMatchesCanonical);
-			const std::size_t compressedBytes = item.compressed->GetWritten();
-			const std::size_t stagedBytes = ReliableStubStagingBytes(
-				compressedBytes, orderedCanonicalHash);
-			if (MustDeferReliableStubForGlobalBudget(globalBudget, stagedBytes))
-			{
-				// Resume at the first globally deferred client next tick. Continuing the
-				// scan would wrap to startSlot and repeatedly favor the same low slots.
-				g_nextCanonicalLuaStubSlot = slot;
-				globalBudget = 0;
-				break;
-			}
-			if (!CanStageReliableStub(channel->m_StreamReliable.IsOverflowed(),
-				channel->m_StreamReliable.GetNumBytesLeft(), clientBudget,
-				globalBudget, compressedBytes, orderedCanonicalHash))
-			{
-				break;
-			}
-
-			if (orderedCanonicalHash &&
-				!SendClientLuaHashUpdate(slot, item.fileID, canonicalHash, 32))
-			{
-				const char* registeredPath = g_pDataPack && g_pDataPack->m_pClientLuaFiles &&
-					item.fileID > 0 && item.fileID < g_pDataPack->m_pClientLuaFiles->GetNumStrings()
-					? g_pDataPack->m_pClientLuaFiles->GetString(item.fileID) : nullptr;
-				const std::string failedPath = registeredPath ? registeredPath : "an unknown file";
-				queue.Clear();
-				queueInvalid = true;
-				DisconnectLuaHashFailure(slot, failedPath.c_str(),
-					"the ordered canonical hash could not be staged safely");
-				break;
-			}
-			const bool firstSendAttempt = !queue.firstSendAttemptLogged;
-			const double sendStartedAt = firstSendAttempt ? Plat_FloatTime() : 0.0;
-			const int sendBitsBefore = firstSendAttempt
-				? channel->m_StreamReliable.GetNumBitsWritten() : 0;
-			if (firstSendAttempt)
-			{
-				queue.firstSendAttemptLogged = true;
-				if (gmoddatapack_luapack_delivery_diagnostics.GetBool())
-				{
-					Msg(PROJECT_NAME " - luapack transport diagnostic: client slot %i entering first engine placeholder send: file_id=%i reliable_bits=%i reliable_bytes_left=%i monotonic_time=%.6f wall_age=%.3f\n",
-						slot, item.fileID, sendBitsBefore,
-						channel->m_StreamReliable.GetNumBytesLeft(), currentTime,
-						queue.enqueuedAt >= 0.0 ? sendStartedAt - queue.enqueuedAt : -1.0);
-				}
-			}
-			const bool sent = SendCompressedLuaFile(slot, item.fileID, *item.compressed, client);
-			if (firstSendAttempt && gmoddatapack_luapack_delivery_diagnostics.GetBool())
-			{
-				const double sendFinishedAt = Plat_FloatTime();
-				Msg(PROJECT_NAME " - luapack transport diagnostic: client slot %i returned from first engine placeholder send: accepted=%i overflow=%i reliable_bits_before=%i reliable_bits_after=%i call_ms=%.3f\n",
-					slot, sent ? 1 : 0,
-					channel->m_StreamReliable.IsOverflowed() ? 1 : 0,
-					sendBitsBefore, channel->m_StreamReliable.GetNumBitsWritten(),
-					(sendFinishedAt - sendStartedAt) * 1000.0);
-			}
-			if (!sent)
-			{
-				const char* registeredPath = g_pDataPack && g_pDataPack->m_pClientLuaFiles &&
-					item.fileID > 0 && item.fileID < g_pDataPack->m_pClientLuaFiles->GetNumStrings()
-					? g_pDataPack->m_pClientLuaFiles->GetString(item.fileID) : nullptr;
-				const std::string failedPath = registeredPath ? registeredPath : "an unknown file";
-				queue.Clear();
-				queueInvalid = true;
-				DisconnectLuaHashFailure(slot, failedPath.c_str(),
-					"the exact engine delivery path rejected a preflighted canonical placeholder");
-				break;
-			}
-
-			orderedCanonicalHashes.push_back(orderedCanonicalHash);
-			++batchCount;
-			clientBudget -= stagedBytes;
-			globalBudget -= stagedBytes;
-		}
-		if (queueInvalid)
-			continue;
-
-		// Every item reached the exact engine-owned CNetChan sender and its reliable
-		// append was observed. Wait for the engine to move this bounded scratch batch
-		// out before staging the next batch for the same client.
-		const bool streamOverflowed = channel->m_StreamReliable.IsOverflowed();
-		const bool engineAccepted = batchCount != 0 && !streamOverflowed;
-		if (engineAccepted)
-		{
-			--batchBudget;
-			++queue.stagingAttempts;
-			queue.engineScratchPending = ReliableStubNeedsTransferWait(true,
-				channel->m_StreamReliable.GetNumBitsWritten() != 0);
-			queue.engineScratchStartedAt = queue.engineScratchPending
-				? currentTime : -1.0;
-			++queue.batches;
-		}
-		if (!CommitReliableStubBatch(batchCount != 0,
-			streamOverflowed, engineAccepted))
-		{
-			if (batchCount != 0)
-			{
-				const QueuedCanonicalLuaStub& failedItem = queue.items.front();
-				const char* registeredPath = g_pDataPack && g_pDataPack->m_pClientLuaFiles &&
-					failedItem.fileID > 0 && failedItem.fileID < g_pDataPack->m_pClientLuaFiles->GetNumStrings()
-					? g_pDataPack->m_pClientLuaFiles->GetString(failedItem.fileID) : nullptr;
-				const std::string failedPath = registeredPath ? registeredPath : "an unknown file";
-				queue.Clear();
-				DisconnectLuaHashFailure(slot, failedPath.c_str(),
-					"the engine did not own the paced canonical placeholder batch");
-			}
-			continue;
-		}
-
-		for (std::size_t committed = 0; committed < batchCount; ++committed)
-		{
-			const int fileID = queue.items.front().fileID;
-			if (orderedCanonicalHashes[committed])
-				RestoreCanonicalHash(g_clientNativeLuaHashes[slot], fileID);
-			g_clientHashUpdatesPending[slot].erase(fileID);
-			queue.PopFront();
-		}
-		LogCanonicalLuaStubDeliveryComplete(slot, queue);
-	}
-}
-
-static void ObserveCanonicalLuaStubScratch(double currentTime)
-{
-	using namespace HolyLib::LuaPack::Policy;
-	const int startSlot = g_nextCanonicalLuaStubScratchSlot;
-	for (int offset = 0; offset < ABSOLUTE_PLAYER_LIMIT; ++offset)
-	{
-		const int slot = (startSlot + offset) % ABSOLUTE_PLAYER_LIMIT;
-		ClientCanonicalLuaStubQueue& queue = g_clientCanonicalLuaStubQueues[slot];
-		if (!queue.engineScratchPending)
-			continue;
-		g_nextCanonicalLuaStubScratchSlot = (slot + 1) % ABSOLUTE_PLAYER_LIMIT;
-
-		CBaseClient* client = GetClientForLuaDelivery(slot);
-		INetChannel* engineChannel = client && client->IsConnected()
-			? client->GetNetChannel() : nullptr;
-		CNetChan* channel = static_cast<CNetChan*>(engineChannel);
-		if (!engineChannel || !channel)
-			continue;
-
-		const bool scratchHasBits = channel->m_StreamReliable.GetNumBitsWritten() != 0;
-		if (ReliableStubEngineTransferComplete(true, scratchHasBits))
-		{
-			queue.engineScratchPending = false;
-			queue.engineScratchStartedAt = -1.0;
-			LogCanonicalLuaStubDeliveryComplete(slot, queue);
-			continue;
-		}
-
-		if (channel->m_StreamReliable.IsOverflowed() ||
-			ReliableStubEngineTransferTimedOut(true,
-				queue.engineScratchStartedAt, currentTime))
-		{
-			const bool overflowed = channel->m_StreamReliable.IsOverflowed();
-			queue.Clear();
-			DisconnectLuaHashFailure(slot, "the current engine-owned batch", overflowed
-				? "the engine reliable stream overflowed during paced canonical placeholder delivery"
-				: "the engine retained paced canonical placeholder scratch bytes for too long");
-		}
-	}
 }
 
 
@@ -2517,16 +2182,14 @@ void CGModDataPackModule::OnClientDisconnect(CBaseClient* pClient)
 		? pClient->m_SteamID.ConvertToUint64() : 0;
 
 	g_pLuaDataPack.m_pPlayerQueue[slot].Clear();
-	ClearClientCanonicalLuaStubs(slot, "physical client disconnect");
 	ClearClientNativeLuaHashes(slot);
 	HolyLib::LuaPack::PhysicalClientDisconnect(slot, steamID64);
 }
 
+static double g_nLastSend = 0;
 void CGModDataPackModule::Think(bool bSimulating)
 {
 	HolyLib::LuaPack::Think();
-	if (!HolyLib::LuaPack::IsEnabled())
-		ClearAllClientCanonicalLuaStubs("LuaPack disabled");
 	// Do not consume the one-shot refresh until both the engine datapack and shared Lua
 	// cache can supply every registered path. Either detour can bind g_pDataPack later.
 	if (g_pDataPack && g_pDataPack->m_pClientLuaFiles && Lua::GetShared() &&
@@ -2639,16 +2302,7 @@ void CGModDataPackModule::Think(bool bSimulating)
 		g_pLuaDataPack.m_pStringTableUpdateQueue.clear();
 	}
 
-	const double currentTime = Plat_FloatTime();
-	LogCanonicalLuaStubTransportDiagnostics(currentTime);
-	if (HolyLib::LuaPack::IsEnabled() &&
-		currentTime >= (g_nLastCanonicalStubSend + 0.05))
-	{
-		g_nLastCanonicalStubSend = currentTime;
-		ObserveCanonicalLuaStubScratch(currentTime);
-		std::size_t batchBudget = HolyLib::LuaPack::Policy::ReliableStubGlobalBatchBudget;
-		DrainCanonicalLuaStubQueues(currentTime, batchBudget);
-	}
+	double currentTime = Util::engineserver->Time();
 	if (currentTime < (g_nLastSend + 0.05))
 		return;
 
@@ -2736,9 +2390,7 @@ bool GMODDataPack_SetSignOnState(CBaseClient* cl, int state)
 	if (state != SIGNONSTATE_PRESPAWN)
 		return false;
 
-	return HolyLib::LuaPack::Policy::HoldPreSpawnForLuaDelivery(
-		!g_pLuaDataPack.m_pPlayerQueue[slot].pQueue.empty(),
-		g_clientCanonicalLuaStubQueues[slot].PendingWork());
+	return !g_pLuaDataPack.m_pPlayerQueue[slot].pQueue.empty();
 }
 
 #if SYSTEM_WINDOWS
@@ -2854,15 +2506,11 @@ void CGModDataPackModule::LuaShutdown(GarrysMod::Lua::ILuaInterface* pLua)
 
 void CGModDataPackModule::LevelShutdown()
 {
-	ClearAllClientCanonicalLuaStubs("level shutdown");
-	g_nLastCanonicalStubSend = 0;
 	HolyLib::LuaPack::LevelShutdown();
 	g_pLuaDataPack.Shutdown();
 }
 
 void CGModDataPackModule::Shutdown()
 {
-	ClearAllClientCanonicalLuaStubs("module shutdown");
-	g_nLastCanonicalStubSend = 0;
 	HolyLib::LuaPack::Shutdown();
 }

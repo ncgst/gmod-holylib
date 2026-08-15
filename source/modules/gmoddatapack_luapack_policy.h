@@ -425,91 +425,33 @@ namespace HolyLib::LuaPack::Policy
 		return clientActive || nativeHashKnown || publishedHashMatchesCanonical;
 	}
 
-	// Canonical LuaPack placeholders are small, but thousands can be requested in one
-	// frame. Keep a large part of the engine's reliable stream available to unrelated
-	// signon traffic and pace both each client and the server as a whole. The envelope
-	// allowance covers the GMod custom-message frame and an optional one-entry string-
-	// table update; it is deliberately larger than their encoded wire size.
-	constexpr std::size_t ReliableStubStreamReserveBytes = 64u * 1024u;
-	constexpr std::size_t ReliableStubClientBudgetBytes = 16u * 1024u;
-	constexpr std::size_t ReliableStubGlobalBudgetBytes = 128u * 1024u;
-	constexpr std::size_t ReliableStubGlobalBatchBudget = 32u;
-	constexpr std::size_t ReliableStubEnvelopeBytes = 32u;
-	constexpr std::size_t ReliableStubOrderedHashBytes = 96u;
-	constexpr double ReliableStubTransferTimeoutSeconds = 60.0;
+	// GMod asks for every missing Lua ID in one request and the stock datapack answers
+	// those IDs synchronously. Keep that proven ownership boundary, but reserve enough
+	// reliable scratch space for the complete canonical-placeholder burst plus unrelated
+	// sign-on traffic. The wire envelope is: svc type (6), payload length (20), GMod
+	// message type (8), and Lua file ID (16).
+	constexpr std::size_t RequiredStubReliableReserveBytes = 64u * 1024u;
+	constexpr std::size_t RequiredStubWireEnvelopeBits = 6u + 20u + 8u + 16u;
 
-	// If an exact engine dispatch leaves reliable scratch bytes behind, the engine must
-	// first move them out before another LuaPack batch uses the same connection. Earlier
-	// engine-owned fragment/file work is not a precondition. Requiring every engine
-	// fragment to be acknowledged here can deadlock PRESPAWN on an otherwise idle
-	// file-stream entry.
-	constexpr bool CanBeginReliableStubBatch(bool channelUsable,
-		bool streamOverflowed, bool transferPending)
+	constexpr std::size_t RequiredStubWireBits(std::size_t compressedBytes)
 	{
-		return channelUsable && !streamOverflowed && !transferPending;
+		const std::size_t maximum = (std::numeric_limits<std::size_t>::max)();
+		return compressedBytes > (maximum - RequiredStubWireEnvelopeBits) / 8u
+			? maximum
+			: RequiredStubWireEnvelopeBits + compressedBytes * 8u;
 	}
 
-	// When an exact dispatch retained scratch bytes, their later disappearance means the
-	// engine moved them into its own network path and the next bounded batch may start.
-	// An exact dispatch that leaves no scratch bytes needs no pending-transfer state.
-	constexpr bool ReliableStubEngineTransferComplete(bool transferPending,
-		bool scratchHasBits)
+	constexpr std::size_t RequiredStubReliableCapacityBytes(std::size_t stubCount,
+		std::size_t compressedBytes,
+		std::size_t reserveBytes = RequiredStubReliableReserveBytes)
 	{
-		return transferPending && !scratchHasBits;
-	}
+		const std::size_t maximum = (std::numeric_limits<std::size_t>::max)();
+		const std::size_t wireBits = RequiredStubWireBits(compressedBytes);
+		if (wireBits == maximum || (stubCount != 0 && wireBits > (maximum - 7u) / stubCount))
+			return maximum;
 
-	constexpr bool ReliableStubNeedsTransferWait(bool engineOwned,
-		bool scratchHasBits)
-	{
-		return engineOwned && scratchHasBits;
-	}
-
-	constexpr bool ReliableStubEngineTransferTimedOut(bool transferPending,
-		double startedAt, double currentTime)
-	{
-		return transferPending && startedAt >= 0.0 && currentTime >=
-			(startedAt + ReliableStubTransferTimeoutSeconds);
-	}
-
-	constexpr std::size_t ReliableStubStagingBytes(std::size_t compressedBytes,
-		bool orderedCanonicalHash)
-	{
-		const std::size_t overhead = ReliableStubEnvelopeBytes +
-			(orderedCanonicalHash ? ReliableStubOrderedHashBytes : 0u);
-		return compressedBytes > (std::numeric_limits<std::size_t>::max)() - overhead
-			? (std::numeric_limits<std::size_t>::max)()
-			: compressedBytes + overhead;
-	}
-
-	constexpr bool CanStageReliableStub(bool streamOverflowed,
-		std::size_t streamBytesLeft, std::size_t clientBudgetBytes,
-		std::size_t globalBudgetBytes, std::size_t compressedBytes,
-		bool orderedCanonicalHash)
-	{
-		if (streamOverflowed || streamBytesLeft < ReliableStubStreamReserveBytes)
-			return false;
-		const std::size_t stagedBytes = ReliableStubStagingBytes(
-			compressedBytes, orderedCanonicalHash);
-		return stagedBytes <= clientBudgetBytes && stagedBytes <= globalBudgetBytes &&
-			stagedBytes <= streamBytesLeft - ReliableStubStreamReserveBytes;
-	}
-
-	constexpr bool MustDeferReliableStubForGlobalBudget(
-		std::size_t globalBudgetBytes, std::size_t stagedBytes)
-	{
-		return stagedBytes > globalBudgetBytes;
-	}
-
-	constexpr bool CommitReliableStubBatch(bool wroteBatch,
-		bool streamOverflowed, bool engineOwned)
-	{
-		return wroteBatch && !streamOverflowed && engineOwned;
-	}
-
-	constexpr bool HoldPreSpawnForLuaDelivery(bool legacyQueuePending,
-		std::size_t canonicalStubQueueSize)
-	{
-		return legacyQueuePending || canonicalStubQueueSize != 0;
+		const std::size_t burstBytes = (wireBits * stubCount + 7u) / 8u;
+		return reserveBytes > maximum - burstBytes ? maximum : burstBytes + reserveBytes;
 	}
 
 	constexpr bool NeedsPerClientNativeHashes(Lane lane)

@@ -3,8 +3,8 @@
 #include "interface.h"
 #include "public/imodule.h"
 
+#include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <string>
 
 class CBaseClient;
@@ -74,11 +74,11 @@ namespace HolyLib::LuaPack
 	struct DeliveryDecision
 	{
 		DeliveryDecision(DeliveryAction deliveryAction = DeliveryAction::Native,
-			std::shared_ptr<const Bootil::AutoBuffer> payload = {}, const char* rejectionFailure = nullptr)
+			const Bootil::AutoBuffer* payload = nullptr, const char* rejectionFailure = nullptr)
 			: action(deliveryAction), compressed(payload), failure(rejectionFailure) {}
 
 		DeliveryAction action;
-		std::shared_ptr<const Bootil::AutoBuffer> compressed;
+		const Bootil::AutoBuffer* compressed;
 		const char* failure;
 	};
 
@@ -99,6 +99,7 @@ namespace HolyLib::LuaPack
 	bool ConsumeBootstrapRefresh();
 	BaselineDecision DecideBaselineForClient(int slot);
 	BaselineDecision DecideFileBaselineForClient(int slot, const std::string& virtualPath);
+	std::size_t RequiredStubCompressedBytesForClient(int slot);
 	bool NeedsNativeHashUpdate(int slot);
 	DeliveryDecision DecideDeliveryForClient(int slot, const std::string& virtualPath, size_t nativeSourceBytes);
 	void DisconnectRequiredClient(int slot, const char* failure);

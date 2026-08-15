@@ -3,7 +3,6 @@
 #include <cassert>
 #include <array>
 #include <iostream>
-#include <limits>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -194,6 +193,18 @@ int main()
 		assert(NeedsOrderedCanonicalHash(false, true, false));
 		assert(NeedsOrderedCanonicalHash(false, false, true));
 		assert(!NeedsOrderedCanonicalHash(false, false, false));
+		assert(RequiredStubWireBits(73) == 634);
+		assert(RequiredStubReliableCapacityBytes(795, 73) == 128540);
+		assert(RequiredStubReliableCapacityBytes(3922, 73) == 376355);
+		assert(RequiredStubReliableCapacityBytes(3922, 73, 262144) == 572963);
+		assert(RequiredStubReliableCapacityBytes(795, 73) <= 262144);
+		assert(RequiredStubReliableCapacityBytes(3922, 73) > 262144);
+		assert(RequiredStubReliableCapacityBytes(3922, 73, 262144) <= 576000);
+		assert(RequiredStubWireBits((std::numeric_limits<std::size_t>::max)()) ==
+			(std::numeric_limits<std::size_t>::max)());
+		assert(RequiredStubReliableCapacityBytes(
+			(std::numeric_limits<std::size_t>::max)(), 73) ==
+			(std::numeric_limits<std::size_t>::max)());
 		RequiredRecoveryTracker recovery;
 		RequiredRecoveryHandoff handoff;
 		assert(recovery.Arm(0, 200, 0.0, 30.0) == RecoveryArmResult::Invalid);
@@ -351,207 +362,6 @@ int main()
 	assert(SelectBaseline(Lane::Required, true, BaseAvailability::Unusable) == Action::Reject);
 	assert(SelectBaseline(Lane::Required, false, BaseAvailability::Ready) == Action::Reject);
 	assert(SelectFile(Lane::Required, true, BaseAvailability::Missing, false, true) == Action::Reject);
-
-	// A 3,922-file required baseline can request every canonical placeholder in one
-	// frame. The scheduler must retain reliable-stream headroom, respect both budgets,
-	// and commit queue/hash state only after the exact engine sender owns the complete
-	// batch. If that call retains reliable scratch bytes, a second batch waits for them
-	// to drain; an immediate transfer needs no scratch-growth proof.
-	{
-		constexpr std::size_t compressedStubBytes = 320;
-		constexpr std::size_t normalStagingBytes =
-			ReliableStubStagingBytes(compressedStubBytes, false);
-		constexpr std::size_t orderedStagingBytes =
-			ReliableStubStagingBytes(compressedStubBytes, true);
-		static_assert(orderedStagingBytes > normalStagingBytes,
-			"ordered canonical identity must consume part of the pacing budget");
-		assert(!CanBeginReliableStubBatch(false, false, false));
-		assert(!CanBeginReliableStubBatch(true, true, false));
-		assert(!CanBeginReliableStubBatch(true, false, true));
-		assert(CanBeginReliableStubBatch(true, false, false));
-		assert(!ReliableStubEngineTransferComplete(false, false));
-		assert(!ReliableStubEngineTransferComplete(false, true));
-		assert(!ReliableStubEngineTransferComplete(true, true));
-		assert(ReliableStubEngineTransferComplete(true, false));
-		assert(!ReliableStubNeedsTransferWait(false, false));
-		assert(!ReliableStubNeedsTransferWait(false, true));
-		assert(!ReliableStubNeedsTransferWait(true, false));
-		assert(ReliableStubNeedsTransferWait(true, true));
-		assert(!ReliableStubEngineTransferTimedOut(false, 0.0, 600.0));
-		assert(!ReliableStubEngineTransferTimedOut(true, -1.0, 600.0));
-		assert(!ReliableStubEngineTransferTimedOut(true, 10.0,
-			10.0 + ReliableStubTransferTimeoutSeconds - 0.001));
-		assert(ReliableStubEngineTransferTimedOut(true, 10.0,
-			10.0 + ReliableStubTransferTimeoutSeconds));
-		assert(!CanStageReliableStub(true, 262144,
-			ReliableStubClientBudgetBytes, ReliableStubGlobalBudgetBytes,
-			compressedStubBytes, false));
-		assert(CanStageReliableStub(false,
-			ReliableStubStreamReserveBytes + normalStagingBytes,
-			normalStagingBytes, normalStagingBytes, compressedStubBytes, false));
-		assert(!CanStageReliableStub(false,
-			ReliableStubStreamReserveBytes + normalStagingBytes - 1,
-			normalStagingBytes, normalStagingBytes, compressedStubBytes, false));
-		assert(!CanStageReliableStub(false, 262144,
-			normalStagingBytes - 1, ReliableStubGlobalBudgetBytes,
-			compressedStubBytes, false));
-		assert(!CanStageReliableStub(false, 262144,
-			ReliableStubClientBudgetBytes, normalStagingBytes - 1,
-			compressedStubBytes, false));
-		assert(!MustDeferReliableStubForGlobalBudget(normalStagingBytes,
-			normalStagingBytes));
-		assert(MustDeferReliableStubForGlobalBudget(normalStagingBytes - 1,
-			normalStagingBytes));
-		assert(ReliableStubStagingBytes((std::numeric_limits<std::size_t>::max)(), true) ==
-			(std::numeric_limits<std::size_t>::max)());
-
-		std::size_t remaining = 3922;
-		std::size_t ticks = 0;
-		while (remaining != 0)
-		{
-			std::size_t streamLeft = 262144;
-			std::size_t clientBudget = ReliableStubClientBudgetBytes;
-			std::size_t globalBudget = ReliableStubGlobalBudgetBytes;
-			std::size_t stagedThisTick = 0;
-			while (remaining != 0 && CanStageReliableStub(false, streamLeft,
-				clientBudget, globalBudget, compressedStubBytes, false))
-			{
-				streamLeft -= normalStagingBytes;
-				clientBudget -= normalStagingBytes;
-				globalBudget -= normalStagingBytes;
-				stagedThisTick += normalStagingBytes;
-				--remaining;
-			}
-			assert(stagedThisTick != 0);
-			assert(stagedThisTick <= ReliableStubClientBudgetBytes);
-			assert(stagedThisTick <= ReliableStubGlobalBudgetBytes);
-			assert(streamLeft >= ReliableStubStreamReserveBytes);
-			++ticks;
-		}
-		assert(ticks > 1 && ticks < 100);
-
-		// More clients than fit in one global tick must rotate at the first deferred
-		// slot instead of wrapping to slot zero and starving the tail of the flood.
-		std::array<std::size_t, 16> clientRequests{};
-		clientRequests.fill(100);
-		std::array<std::size_t, 16> firstServedTick{};
-		firstServedTick.fill((std::numeric_limits<std::size_t>::max)());
-		std::size_t nextSlot = 0;
-		std::size_t totalRemaining = clientRequests.size() * clientRequests[0];
-		for (std::size_t tick = 0; totalRemaining != 0; ++tick)
-		{
-			assert(tick < 32);
-			std::size_t globalBudget = ReliableStubGlobalBudgetBytes;
-			const std::size_t startSlot = nextSlot;
-			for (std::size_t offset = 0;
-				offset < clientRequests.size() && globalBudget != 0; ++offset)
-			{
-				const std::size_t slot = (startSlot + offset) % clientRequests.size();
-				nextSlot = (slot + 1) % clientRequests.size();
-				std::size_t clientBudget = ReliableStubClientBudgetBytes;
-				while (clientRequests[slot] != 0)
-				{
-					if (MustDeferReliableStubForGlobalBudget(globalBudget,
-						normalStagingBytes))
-					{
-						nextSlot = slot;
-						globalBudget = 0;
-						break;
-					}
-					if (normalStagingBytes > clientBudget)
-						break;
-					if (firstServedTick[slot] ==
-						(std::numeric_limits<std::size_t>::max)())
-					{
-						firstServedTick[slot] = tick;
-					}
-					clientBudget -= normalStagingBytes;
-					globalBudget -= normalStagingBytes;
-					--clientRequests[slot];
-					--totalRemaining;
-				}
-			}
-		}
-		for (std::size_t firstTick : firstServedTick)
-			assert(firstTick < 3);
-		assert(!CommitReliableStubBatch(false, false, true));
-		assert(!CommitReliableStubBatch(true, true, false));
-		assert(!CommitReliableStubBatch(true, false, false));
-		assert(CommitReliableStubBatch(true, false, true));
-		// The exact engine call is a void ownership boundary. Zero scratch bits after
-		// the call is a valid immediate transfer, not a rejected batch.
-		assert(!ReliableStubNeedsTransferWait(true, false));
-
-		// When an exact engine dispatch retains scratch bytes, a later batch waits
-		// until the observed stream has drained into the engine network path.
-		std::size_t pacedRemaining = 3;
-		std::size_t acceptedBodies = 0;
-		bool transferPending = false;
-		bool scratchHasBits = false;
-		for (std::size_t tick = 0; pacedRemaining != 0; ++tick)
-		{
-			assert(tick < 16);
-			if (ReliableStubEngineTransferComplete(transferPending,
-				scratchHasBits))
-			{
-				transferPending = false;
-			}
-			if (!CanBeginReliableStubBatch(true, false, transferPending))
-			{
-				scratchHasBits = false;
-				continue;
-			}
-			const std::size_t batchCount = 1;
-			assert(CommitReliableStubBatch(true, false, true));
-			pacedRemaining -= batchCount;
-			acceptedBodies += batchCount;
-			transferPending = true;
-			scratchHasBits = true;
-		}
-		assert(acceptedBodies == 3);
-
-		// The global batch cap retains the connection-flood bound. More queued
-		// clients than one pass can stage must rotate fairly.
-		std::array<bool, 80> floodNeedsBatch{};
-		floodNeedsBatch.fill(true);
-		std::array<std::size_t, 80> firstBatchTick{};
-		firstBatchTick.fill((std::numeric_limits<std::size_t>::max)());
-		std::size_t nextBatchSlot = 0;
-		std::size_t floodRemaining = floodNeedsBatch.size();
-		for (std::size_t tick = 0; floodRemaining != 0; ++tick)
-		{
-			assert(tick < 4);
-			std::size_t batchBudget = ReliableStubGlobalBatchBudget;
-			const std::size_t startSlot = nextBatchSlot;
-			for (std::size_t offset = 0;
-				offset < floodNeedsBatch.size() && batchBudget != 0; ++offset)
-			{
-				const std::size_t slot = (startSlot + offset) % floodNeedsBatch.size();
-				nextBatchSlot = (slot + 1) % floodNeedsBatch.size();
-				if (!floodNeedsBatch[slot] ||
-					!CanBeginReliableStubBatch(true, false, false))
-					continue;
-				firstBatchTick[slot] = tick;
-				floodNeedsBatch[slot] = false;
-				--floodRemaining;
-				--batchBudget;
-			}
-		}
-		for (std::size_t firstTick : firstBatchTick)
-			assert(firstTick < 3);
-
-		// Pre-existing engine reliable/file work must not prevent the first bounded
-		// LuaPack batch. When that dispatch leaves scratch bytes behind, the transfer
-		// flag prevents a second batch until the observed stream clears.
-		assert(CanBeginReliableStubBatch(true, false, false));
-		assert(!CanBeginReliableStubBatch(true, false, true));
-		assert(!ReliableStubEngineTransferComplete(true, true));
-		assert(ReliableStubEngineTransferComplete(true, false));
-		assert(CanBeginReliableStubBatch(true, false, false));
-		assert(!HoldPreSpawnForLuaDelivery(false, 0));
-		assert(HoldPreSpawnForLuaDelivery(true, 0));
-		assert(HoldPreSpawnForLuaDelivery(false, 3922));
-	}
 
 	std::cout << "luapack map-base policy tests passed\n";
 	return 0;
