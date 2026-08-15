@@ -1311,6 +1311,7 @@ namespace Symbols
 
 	const std::vector<Symbol> GModDataPack_OnFilesRequestedSym = {
 		Symbol::FromName("_ZN12GModDataPack16OnFilesRequestedEiP7bf_readi"),
+		Symbol::FromName("_ZN12GModDataPack16OnFilesRequestedEiP7bf_readi"),
 	};
 
 	const std::vector<Symbol> GModDataPack_AddOrUpdateFileSym = { // search for singleplayer_files%i
