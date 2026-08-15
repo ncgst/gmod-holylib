@@ -3163,8 +3163,14 @@ static void hook_CServerPlugin_ClientSettingsChanged(void* _this, edict_t* pEdic
 }
 
 static Detouring::Hook detour_CVEngineServer_GMOD_SendToClient;
+// The resolved non-static symbol must be called with the exact owning object
+// supplied by the engine. The IVEngineServer interface pointer returned by the
+// factory is not assumed to be interchangeable with that call-site owner.
+static void* g_pCVEngineServerGModSendOwner = nullptr;
 static void hook_CVEngineServer_GMOD_SendToClient(void* _this, int client, void *data, int dataSize)
 {
+	g_pCVEngineServerGModSendOwner = _this;
+
 	if (client < gpGlobals->maxClients)
 	{
 		detour_CVEngineServer_GMOD_SendToClient.GetTrampoline<Symbols::CVEngineServer_GMOD_SendToClient>()(_this, client, data, dataSize);
@@ -3230,12 +3236,12 @@ bool Gameserver_SendGModMessage(CBaseClient* client, int slot, const void* data,
 
 	if (slot < gpGlobals->maxClients)
 	{
-		if (!Gameserver_HasExactGModSender())
+		if (!Gameserver_HasExactGModSender() || !g_pCVEngineServerGModSendOwner)
 			return false;
 
 		detour_CVEngineServer_GMOD_SendToClient
 			.GetTrampoline<Symbols::CVEngineServer_GMOD_SendToClient>()(
-				Util::engineserver, slot, const_cast<void*>(data), dataBits);
+				g_pCVEngineServerGModSendOwner, slot, const_cast<void*>(data), dataBits);
 		return true;
 	}
 
