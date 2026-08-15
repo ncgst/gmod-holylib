@@ -364,11 +364,10 @@ int main()
 			ReliableStubStagingBytes(compressedStubBytes, true);
 		static_assert(orderedStagingBytes > normalStagingBytes,
 			"ordered canonical identity must consume part of the pacing budget");
-		assert(!CanBeginReliableStubBatch(false, false, false, false));
-		assert(!CanBeginReliableStubBatch(true, true, false, false));
-		assert(!CanBeginReliableStubBatch(true, false, true, false));
-		assert(!CanBeginReliableStubBatch(true, false, false, true));
-		assert(CanBeginReliableStubBatch(true, false, false, false));
+		assert(!CanBeginReliableStubBatch(false, false, false));
+		assert(!CanBeginReliableStubBatch(true, true, false));
+		assert(!CanBeginReliableStubBatch(true, false, true));
+		assert(CanBeginReliableStubBatch(true, false, false));
 		assert(!ReliableStubEngineTransferComplete(false, false));
 		assert(!ReliableStubEngineTransferComplete(false, true));
 		assert(!ReliableStubEngineTransferComplete(true, true));
@@ -496,8 +495,7 @@ int main()
 			{
 				transferPending = false;
 			}
-			if (!CanBeginReliableStubBatch(true, false, transferPending,
-				engineReliablePending))
+			if (!CanBeginReliableStubBatch(true, false, transferPending))
 			{
 				engineReliablePending = false;
 				continue;
@@ -548,13 +546,14 @@ int main()
 		for (std::size_t firstTick : firstPumpTick)
 			assert(firstTick < 3);
 
-		// A mirror-only fragment flag must not authorize another batch when the
-		// engine still reports reliable work. Conversely, once the virtual engine
-		// state clears, the transfer completes without a private-list inspection.
-		assert(!CanBeginReliableStubBatch(true, false, false, true));
+		// Pre-existing engine reliable/file work must not prevent the first bounded
+		// LuaPack batch from appending behind it. Once that batch is owned, the
+		// transfer flag prevents a second batch until the virtual engine state clears.
+		assert(CanBeginReliableStubBatch(true, false, false));
+		assert(!CanBeginReliableStubBatch(true, false, true));
 		assert(!ReliableStubEngineTransferComplete(true, true));
 		assert(ReliableStubEngineTransferComplete(true, false));
-		assert(CanBeginReliableStubBatch(true, false, false, false));
+		assert(CanBeginReliableStubBatch(true, false, false));
 		assert(!HoldPreSpawnForLuaDelivery(false, 0));
 		assert(HoldPreSpawnForLuaDelivery(true, 0));
 		assert(HoldPreSpawnForLuaDelivery(false, 3922));

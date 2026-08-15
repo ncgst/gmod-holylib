@@ -2075,11 +2075,9 @@ static void DrainCanonicalLuaStubQueues(double currentTime,
 		INetChannel* engineChannel = client && client->IsConnected()
 			? client->GetNetChannel() : nullptr;
 		CNetChan* channel = static_cast<CNetChan*>(engineChannel);
-		const bool engineReliablePending = engineChannel &&
-			engineChannel->HasPendingReliableData();
 		if (!CanBeginReliableStubBatch(channel != nullptr,
 			engineChannel && engineChannel->IsOverflowed(),
-			queue.engineTransferPending, engineReliablePending))
+			queue.engineTransferPending))
 			continue;
 
 		std::size_t clientBudget = ReliableStubClientBudgetBytes;

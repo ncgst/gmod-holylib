@@ -438,14 +438,15 @@ namespace HolyLib::LuaPack::Policy
 	constexpr std::size_t ReliableStubOrderedHashBytes = 96u;
 	constexpr double ReliableStubTransferTimeoutSeconds = 60.0;
 
-	// The engine must own and finish one reliable batch before another batch uses
-	// the same connection. Do not populate CNetChan's private fragment list through
-	// the SDK mirror: that non-virtual layout is not an engine ownership boundary.
+	// The engine must own and finish one LuaPack batch before another batch uses the
+	// same connection. Earlier engine-owned reliable/file work is not a precondition:
+	// the virtual transmit boundary appends this batch behind it and the bounded pump
+	// advances both in wire order. Requiring all engine work to be empty here can
+	// deadlock PRESPAWN on an otherwise idle file-stream entry.
 	constexpr bool CanBeginReliableStubBatch(bool channelUsable,
-		bool streamOverflowed, bool transferPending, bool engineReliablePending)
+		bool streamOverflowed, bool transferPending)
 	{
-		return channelUsable && !streamOverflowed && !transferPending &&
-			!engineReliablePending;
+		return channelUsable && !streamOverflowed && !transferPending;
 	}
 
 	// HasPendingReliableData is virtual and therefore reports the engine's actual
