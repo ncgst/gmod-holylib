@@ -1311,7 +1311,9 @@ namespace Symbols
 
 	const std::vector<Symbol> GModDataPack_OnFilesRequestedSym = {
 		Symbol::FromName("_ZN12GModDataPack16OnFilesRequestedEiP7bf_readi"),
-		Symbol::FromName("_ZN12GModDataPack16OnFilesRequestedEiP7bf_readi"),
+		// Linux x64 strips this private symbol. Signature verified unique in the
+		// 2026-08-16 server.so (SHA-256 7371BC3CBBFB5379...).
+		Symbol::FromSignature("\x55\x48\x63\xC6\x48\x8D\x04\x87\x48\x89\xE5\x41\x57\x41\x56\x49\x89\xFF\x41\x55\x41\x54\x53\x48\x89\xD3\x48\x83\xEC\x78\x89\xB5\x70\xFF\xFF\xFF\x8B\x50\x20\x85\xD2\x7E\x0B\x83\xEA\x01\xF6\xC1\x0F"), // bits must be a non-empty multiple of 16 before the request tree is built
 	};
 
 	const std::vector<Symbol> GModDataPack_AddOrUpdateFileSym = { // search for singleplayer_files%i
