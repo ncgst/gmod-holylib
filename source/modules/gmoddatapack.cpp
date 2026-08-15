@@ -1722,11 +1722,10 @@ static bool SendCompressedLuaFile(int clientIdx, int fileID, const Bootil::AutoB
 #if MODULE_EXISTS_GAMESERVER
 	if (knownClient)
 	{
-		// Use the already-resolved CVEngineServer symbol for physical clients and
-		// the owning CBaseClient path for parked queue clients. The IVEngineServer
-		// virtual layout is not ABI-stable on current Linux x64. The exact void call
-		// is the ownership boundary; it may transfer the message immediately instead
-		// of leaving observable bytes in the mirrored reliable scratch buffer.
+		// Use the engine's resolved CNetChan::SendNetMsg implementation for both
+		// physical and parked clients. Calling through HolyLib's mirrored vtables or
+		// replaying CVEngineServer::GMOD_SendToClient later in Think is not a stable
+		// early-sign-on ownership boundary on current Linux x64.
 		queued = Gameserver_SendGModMessage(knownClient, clientIdx, msg.GetData(),
 			msg.GetNumBitsWritten());
 	}
@@ -2260,10 +2259,9 @@ static void DrainCanonicalLuaStubQueues(double currentTime,
 		if (queueInvalid)
 			continue;
 
-		// Every item reached the exact engine-owned sender. That void call may either
-		// retain bytes in the reliable scratch stream or transfer them immediately;
-		// scratch growth is therefore not an acceptance contract. If bytes remain,
-		// wait for the observed stream to clear before dispatching the next batch.
+		// Every item reached the exact engine-owned CNetChan sender and its reliable
+		// append was observed. Wait for the engine to move this bounded scratch batch
+		// out before staging the next batch for the same client.
 		const bool streamOverflowed = channel->m_StreamReliable.IsOverflowed();
 		const bool engineAccepted = batchCount != 0 && !streamOverflowed;
 		if (engineAccepted)

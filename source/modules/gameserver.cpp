@@ -73,6 +73,7 @@ IModule* pGameServerModule = &g_pGameServerModule;
 
 static std::vector<CGameClient*> g_pQueueClients;
 extern CGlobalVars* gpGlobals;
+static Symbols::CNetChan_SendNetMsg g_pEngineCNetChanSendNetMsg = nullptr;
 
 // Lua download requests can originate from both ordinary server slots and the
 // parked pre-game queue. Util::GetClientByIndex only sees CBaseServer::m_Clients,
@@ -188,9 +189,9 @@ public:
 
 // Queue clients are outside CVEngineServer::GMOD_SendToClient's physical array,
 // so its detour must reproduce the engine's custom message through the owning
-// CBaseClient. Do not call SendNetMsg/SendData through the locally mirrored
-// INetChannel vtable: current Linux x64 can report success there without
-// appending reliable bytes during early sign-on.
+// channel. Call the resolved engine implementation directly: the locally
+// mirrored CBaseClient/INetChannel vtables are not ABI-stable on current Linux
+// x64 and can report success without appending reliable bytes during sign-on.
 bool Gameserver_StageGModMessage(CBaseClient* client, const void* data, int dataBits)
 {
 	// GetNetChannel() is authoritative during early sign-on. The mirrored
@@ -213,7 +214,17 @@ bool Gameserver_StageGModMessage(CBaseClient* client, const void* data, int data
 
 	CNetChan* concreteChannel = static_cast<CNetChan*>(channel);
 	const int reliableBitsBefore = concreteChannel->m_StreamReliable.GetNumBitsWritten();
-	return client->SendNetMsg(msg, true) && !concreteChannel->m_StreamReliable.IsOverflowed() &&
+#if defined(SYSTEM_LINUX)
+	if (!g_pEngineCNetChanSendNetMsg)
+		return false;
+	const bool sent = g_pEngineCNetChanSendNetMsg(concreteChannel, msg, true, false);
+#else
+	// Other platforms retain the established queue-client path. LuaPack required
+	// admission is Linux-only and never treats this fallback as exact support.
+	const bool sent = client->SendNetMsg(msg, true);
+#endif
+	return sent &&
+		!concreteChannel->m_StreamReliable.IsOverflowed() &&
 		concreteChannel->m_StreamReliable.GetNumBitsWritten() > reliableBitsBefore;
 }
 
@@ -3163,14 +3174,8 @@ static void hook_CServerPlugin_ClientSettingsChanged(void* _this, edict_t* pEdic
 }
 
 static Detouring::Hook detour_CVEngineServer_GMOD_SendToClient;
-// The resolved non-static symbol must be called with the exact owning object
-// supplied by the engine. The IVEngineServer interface pointer returned by the
-// factory is not assumed to be interchangeable with that call-site owner.
-static void* g_pCVEngineServerGModSendOwner = nullptr;
 static void hook_CVEngineServer_GMOD_SendToClient(void* _this, int client, void *data, int dataSize)
 {
-	g_pCVEngineServerGModSendOwner = _this;
-
 	if (client < gpGlobals->maxClients)
 	{
 		detour_CVEngineServer_GMOD_SendToClient.GetTrampoline<Symbols::CVEngineServer_GMOD_SendToClient>()(_this, client, data, dataSize);
@@ -3213,12 +3218,11 @@ static void hook_CVEngineServer_GMOD_SendToClient(void* _this, int client, void 
 	(void)Gameserver_StageGModMessage(pClient, data, dataSize);
 }
 
-// Dispatch a GMod custom message without depending on the locally declared
-// IVEngineServer vtable. Physical clients use the exact symbol resolved for the
-// detour; parked queue clients retain their CBaseClient-owned staging path.
+// Report whether the exact engine channel sender and the queue-client routing
+// detour are both available. Required LuaPack admission fails closed otherwise.
 bool Gameserver_HasExactGModSender()
 {
-	return Util::engineserver &&
+	return g_pEngineCNetChanSendNetMsg &&
 		DETOUR_ISVALID(detour_CVEngineServer_GMOD_SendToClient) &&
 		DETOUR_ISENABLED(detour_CVEngineServer_GMOD_SendToClient);
 }
@@ -3232,17 +3236,6 @@ bool Gameserver_SendGModMessage(CBaseClient* client, int slot, const void* data,
 		!client->IsConnected() || !channel)
 	{
 		return false;
-	}
-
-	if (slot < gpGlobals->maxClients)
-	{
-		if (!Gameserver_HasExactGModSender() || !g_pCVEngineServerGModSendOwner)
-			return false;
-
-		detour_CVEngineServer_GMOD_SendToClient
-			.GetTrampoline<Symbols::CVEngineServer_GMOD_SendToClient>()(
-				g_pCVEngineServerGModSendOwner, slot, const_cast<void*>(data), dataBits);
-		return true;
 	}
 
 	return Gameserver_StageGModMessage(client, data, dataBits);
@@ -4740,6 +4733,14 @@ void CGameServerModule::InitDetour(bool bPreServer)
 
 	DETOUR_PREPARE_THISCALL();
 	SourceSDK::FactoryLoader engine_loader("engine");
+	g_pEngineCNetChanSendNetMsg = reinterpret_cast<Symbols::CNetChan_SendNetMsg>(
+		Detour::GetFunction(engine_loader.GetModule(), Symbols::CNetChan_SendNetMsgSym));
+#if defined(SYSTEM_LINUX)
+	if (!g_pEngineCNetChanSendNetMsg)
+	{
+		Warning(PROJECT_NAME " - gameserver: could not resolve CNetChan::SendNetMsg; exact early-sign-on GMod delivery is unavailable\n");
+	}
+#endif
 
 #if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
 	void* pHostBuildConVarUpdateMessage = Detour::GetFunction(engine_loader.GetModule(), Symbols::Host_BuildConVarUpdateMessageSym);
