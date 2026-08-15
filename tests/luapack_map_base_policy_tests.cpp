@@ -280,6 +280,71 @@ int main()
 		assert(!clientPlans[1].Contains(2));
 		assert(clientPlans[0].Contains(5));
 
+		RequiredStubQueue<4> requiredQueue;
+		assert(requiredQueue.Empty());
+		assert(requiredQueue.Enqueue(2) == RequiredStubEnqueueResult::Queued);
+		assert(requiredQueue.Enqueue(2) == RequiredStubEnqueueResult::AlreadyQueued);
+		assert(requiredQueue.Enqueue(1) == RequiredStubEnqueueResult::Queued);
+		assert(requiredQueue.Enqueue(-1) == RequiredStubEnqueueResult::OutOfRange);
+		assert(requiredQueue.Enqueue(4) == RequiredStubEnqueueResult::OutOfRange);
+		assert(requiredQueue.Size() == 2);
+		assert(requiredQueue.Front() == 2);
+		requiredQueue.Pop();
+		assert(requiredQueue.Size() == 1);
+		assert(requiredQueue.Front() == 1);
+		assert(requiredQueue.Enqueue(2) == RequiredStubEnqueueResult::Queued);
+		requiredQueue.Pop();
+		assert(requiredQueue.Front() == 2);
+		requiredQueue.Reset();
+		assert(requiredQueue.Empty());
+		assert(requiredQueue.Front() == -1);
+
+		RequiredStubScheduler<4> requiredScheduler;
+		assert(requiredScheduler.Empty());
+		assert(requiredScheduler.Schedule(1));
+		assert(requiredScheduler.Schedule(2));
+		assert(!requiredScheduler.Schedule(1));
+		assert(!requiredScheduler.Schedule(-1));
+		assert(!requiredScheduler.Schedule(4));
+		assert(requiredScheduler.Size() == 2);
+		assert(requiredScheduler.TakeNext() == 1);
+		assert(!requiredScheduler.IsScheduled(1));
+		assert(requiredScheduler.Schedule(1));
+		assert(requiredScheduler.TakeNext() == 2);
+		assert(requiredScheduler.TakeNext() == 1);
+		assert(requiredScheduler.Empty());
+		assert(requiredScheduler.Schedule(3));
+		requiredScheduler.Unschedule(3);
+		assert(requiredScheduler.Empty());
+		requiredScheduler.Schedule(0);
+		requiredScheduler.Reset();
+		assert(requiredScheduler.Empty());
+
+		// A global budget advances clients in round-robin order instead of letting the
+		// first cold join monopolize a frame.
+		std::array<RequiredStubQueue<8>, 2> fairQueues;
+		for (int fileID : {1, 2})
+			assert(fairQueues[0].Enqueue(fileID) == RequiredStubEnqueueResult::Queued);
+		for (int fileID : {3, 4})
+			assert(fairQueues[1].Enqueue(fileID) == RequiredStubEnqueueResult::Queued);
+		RequiredStubScheduler<2> fairScheduler;
+		assert(fairScheduler.Schedule(0));
+		assert(fairScheduler.Schedule(1));
+		std::array<int, 3> fairOrder{};
+		for (std::size_t sent = 0; sent < fairOrder.size(); ++sent)
+		{
+			const int slot = fairScheduler.TakeNext();
+			assert(slot >= 0);
+			fairOrder[sent] = slot;
+			fairQueues[slot].Pop();
+			if (!fairQueues[slot].Empty())
+				assert(fairScheduler.Schedule(slot));
+		}
+		assert((fairOrder == std::array<int, 3>{0, 1, 0}));
+		assert(fairQueues[0].Empty());
+		assert(fairQueues[1].Size() == 1);
+		assert(fairScheduler.TakeNext() == 1);
+
 		assert(RequiredStubPayloadBits(73) == 608);
 		assert(RequiredStubWireBits(73) == 634);
 		assert(CanAppendRequiredStub(false, 634, 73));
@@ -291,6 +356,24 @@ int main()
 			(std::numeric_limits<std::size_t>::max)(), 131069));
 		assert(!CanAppendRequiredStub(false,
 			(std::numeric_limits<std::size_t>::max)(), 1u << 17u));
+		assert(SelectRequiredStubDrainAction(true, true, true, true, 73,
+			true, false, 634) == RequiredStubDrainAction::Append);
+		assert(SelectRequiredStubDrainAction(true, true, true, true, 73,
+			true, false, 633) == RequiredStubDrainAction::WaitForReliableSpace);
+		assert(SelectRequiredStubDrainAction(false, true, true, true, 73,
+			true, false, 634) == RequiredStubDrainAction::Reject);
+		assert(SelectRequiredStubDrainAction(true, false, true, true, 73,
+			true, false, 634) == RequiredStubDrainAction::Reject);
+		assert(SelectRequiredStubDrainAction(true, true, false, true, 73,
+			true, false, 634) == RequiredStubDrainAction::Reject);
+		assert(SelectRequiredStubDrainAction(true, true, true, false, 73,
+			true, false, 634) == RequiredStubDrainAction::Reject);
+		assert(SelectRequiredStubDrainAction(true, true, true, true, 31,
+			true, false, 634) == RequiredStubDrainAction::Reject);
+		assert(SelectRequiredStubDrainAction(true, true, true, true, 73,
+			false, false, 634) == RequiredStubDrainAction::Reject);
+		assert(SelectRequiredStubDrainAction(true, true, true, true, 73,
+			true, true, 634) == RequiredStubDrainAction::Reject);
 
 		const std::array<unsigned char, 3> compressed = {0x00, 0x7f, 0xff};
 		const std::size_t wireBits = RequiredStubWireBits(compressed.size());
@@ -344,6 +427,7 @@ int main()
 		assert(scprpBurst.GetNumBitsLeft() >=
 			static_cast<int>(RequiredStubReliableReserveBytes * 8));
 		assert(RequiredStubReliableCapacityBytes(795, 73) == 128540);
+		assert(RequiredStubReliableCapacityBytes(32, 73) == 68072);
 		assert(RequiredStubReliableCapacityBytes(3922, 73) == 376355);
 		assert(RequiredStubReliableCapacityBytes(3922, 73, 262144) == 572963);
 		assert(RequiredStubReliableCapacityBytes(5048, 73) == 465590);

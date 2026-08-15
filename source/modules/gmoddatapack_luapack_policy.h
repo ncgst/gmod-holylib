@@ -1,9 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <string>
 #include <unordered_map>
@@ -40,6 +42,131 @@ namespace HolyLib::LuaPack::Policy
 
 	private:
 		std::bitset<Capacity> files;
+	};
+
+	enum class RequiredStubEnqueueResult
+	{
+		Queued,
+		AlreadyQueued,
+		OutOfRange,
+	};
+
+	// GMod can request the complete missing Lua baseline in one ProcessMessages call.
+	// Retain one response per unique file ID without allocating an unbounded queue or
+	// allowing a repeated request to amplify the reliable response burst.
+	template <std::size_t Capacity>
+	class RequiredStubQueue
+	{
+	public:
+		RequiredStubEnqueueResult Enqueue(int fileID)
+		{
+			if (fileID < 0 || static_cast<std::size_t>(fileID) >= Capacity)
+				return RequiredStubEnqueueResult::OutOfRange;
+			if (queued.Contains(fileID))
+				return RequiredStubEnqueueResult::AlreadyQueued;
+
+			queued.Mark(fileID);
+			files.push_back(fileID);
+			return RequiredStubEnqueueResult::Queued;
+		}
+
+		bool Empty() const
+		{
+			return files.empty();
+		}
+
+		std::size_t Size() const
+		{
+			return files.size();
+		}
+
+		int Front() const
+		{
+			return files.empty() ? -1 : files.front();
+		}
+
+		void Pop()
+		{
+			if (files.empty())
+				return;
+
+			queued.Invalidate(files.front());
+			files.pop_front();
+		}
+
+		void Reset()
+		{
+			files.clear();
+			queued.Reset();
+		}
+
+	private:
+		std::deque<int> files;
+		PinnedCanonicalFileSet<Capacity> queued;
+	};
+
+	template <std::size_t SlotCount>
+	class RequiredStubScheduler
+	{
+	public:
+		bool Schedule(int slot)
+		{
+			if (slot < 0 || static_cast<std::size_t>(slot) >= SlotCount ||
+			scheduled.test(static_cast<std::size_t>(slot)))
+			{
+				return false;
+			}
+
+			scheduled.set(static_cast<std::size_t>(slot));
+			active.push_back(slot);
+			return true;
+		}
+
+		int TakeNext()
+		{
+			if (active.empty())
+				return -1;
+
+			const int slot = active.front();
+			active.pop_front();
+			scheduled.reset(static_cast<std::size_t>(slot));
+			return slot;
+		}
+
+		void Unschedule(int slot)
+		{
+			if (slot < 0 || static_cast<std::size_t>(slot) >= SlotCount)
+				return;
+
+			scheduled.reset(static_cast<std::size_t>(slot));
+			active.erase(std::remove(active.begin(), active.end(), slot), active.end());
+		}
+
+		bool IsScheduled(int slot) const
+		{
+			return slot >= 0 && static_cast<std::size_t>(slot) < SlotCount &&
+				scheduled.test(static_cast<std::size_t>(slot));
+		}
+
+		bool Empty() const
+		{
+			return active.empty();
+		}
+
+		std::size_t Size() const
+		{
+			return active.size();
+		}
+
+		void Reset()
+		{
+			active.clear();
+			scheduled.reset();
+		}
+
+	private:
+		std::deque<int> active;
+		std::bitset<SlotCount> scheduled;
 	};
 
 	constexpr bool CanUsePinnedRequiredStub(bool enabled, bool canonicalRegistration,
@@ -464,9 +591,9 @@ namespace HolyLib::LuaPack::Policy
 		return clientActive || nativeHashKnown || publishedHashMatchesCanonical;
 	}
 
-	// GMod asks for every missing Lua ID in one request and the stock datapack answers
-	// those IDs synchronously. Keep that proven ownership boundary, but reserve enough
-	// reliable scratch space for the complete canonical-placeholder burst plus unrelated
+	// GMod asks for every missing Lua ID in one request. Required delivery retains that
+	// ownership boundary but stages a bounded number of canonical placeholders per frame.
+	// This math reserves reliable scratch space for one bounded batch plus unrelated
 	// sign-on traffic. The outer wire envelope is the svc type (6) plus payload
 	// length (20); the payload is the GMod message type (8), Lua file ID (16), and
 	// compressed placeholder bytes.
@@ -507,6 +634,39 @@ namespace HolyLib::LuaPack::Policy
 		return !reliableOverflowed && payloadBits <= RequiredStubMaximumPayloadBits &&
 			wireBits != (std::numeric_limits<std::size_t>::max)() &&
 			wireBits <= reliableBitsLeft;
+	}
+
+	enum class RequiredStubDrainAction
+	{
+		Append,
+		WaitForReliableSpace,
+		Reject,
+	};
+
+	constexpr RequiredStubDrainAction SelectRequiredStubDrainAction(
+		bool enabled, bool canonicalRegistration, bool filePinned,
+		bool payloadAvailable, std::size_t compressedBytes,
+		bool clientConnected, bool reliableOverflowed,
+		std::size_t reliableBitsLeft)
+	{
+		if (!CanUsePinnedRequiredStub(enabled, canonicalRegistration,
+			filePinned, payloadAvailable, compressedBytes) ||
+			!clientConnected || reliableOverflowed)
+		{
+			return RequiredStubDrainAction::Reject;
+		}
+
+		const std::size_t payloadBits = RequiredStubPayloadBits(compressedBytes);
+		const std::size_t wireBits = RequiredStubWireBits(compressedBytes);
+		if (payloadBits > RequiredStubMaximumPayloadBits ||
+			wireBits == (std::numeric_limits<std::size_t>::max)())
+		{
+			return RequiredStubDrainAction::Reject;
+		}
+
+		return wireBits <= reliableBitsLeft
+			? RequiredStubDrainAction::Append
+			: RequiredStubDrainAction::WaitForReliableSpace;
 	}
 
 	template <typename BitWriter>
