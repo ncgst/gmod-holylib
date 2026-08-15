@@ -58,6 +58,9 @@ public:
 static ConVar gmoddatapack_removeserverif("holylib_gmoddatapack_removeserverif", "0", 0, "If enabled, \"if SERVER then\" code blocks are removed from client files");
 static ConVar gmoddatapack_removecomments("holylib_gmoddatapack_removecomments", "0", 0, "If enabled, comments are removed from client files");
 static ConVar gmoddatapack_fastnetworking("holylib_gmoddatapack_fastnetworking", "0", 0, "(Very Experimental) If enabled, it'll do funky stuff to the networking");
+static ConVar gmoddatapack_luapack_delivery_diagnostics(
+	"holylib_gmoddatapack_luapack_delivery_diagnostics", "0", 0,
+	"Log bounded anonymous LuaPack placeholder queue and engine-send diagnostics");
 
 static CGModDataPackModule g_pGModDataPackModule;
 IModule* pGModDataPackModule = &g_pGModDataPackModule;
@@ -101,6 +104,12 @@ struct ClientCanonicalLuaStubQueue
 
 		items.push_back({fileID, compressed});
 		fileIDs.insert(fileID);
+		if (enqueued == 0)
+		{
+			enqueuedAt = Plat_FloatTime();
+			lastDiagnosticAt = -1.0;
+			firstSendAttemptLogged = false;
+		}
 		++enqueued;
 		return true;
 	}
@@ -136,6 +145,9 @@ struct ClientCanonicalLuaStubQueue
 		batches = 0;
 		stagingAttempts = 0;
 		summaryLogged = false;
+		enqueuedAt = -1.0;
+		lastDiagnosticAt = -1.0;
+		firstSendAttemptLogged = false;
 	}
 
 	std::size_t PendingWork() const
@@ -152,22 +164,38 @@ struct ClientCanonicalLuaStubQueue
 	std::size_t batches = 0;
 	std::size_t stagingAttempts = 0;
 	bool summaryLogged = false;
+	double enqueuedAt = -1.0;
+	double lastDiagnosticAt = -1.0;
+	bool firstSendAttemptLogged = false;
 };
 
 static std::array<ClientCanonicalLuaStubQueue, ABSOLUTE_PLAYER_LIMIT> g_clientCanonicalLuaStubQueues;
 static int g_nextCanonicalLuaStubSlot = 0;
 static int g_nextCanonicalLuaStubScratchSlot = 0;
+static double g_nLastSend = 0;
+static double g_nLastCanonicalStubSend = 0;
 
-static void ClearClientCanonicalLuaStubs(int slot)
+static void ClearClientCanonicalLuaStubs(int slot, const char* reason)
 {
 	if (slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT)
+	{
+		ClientCanonicalLuaStubQueue& queue = g_clientCanonicalLuaStubQueues[slot];
+		if (gmoddatapack_luapack_delivery_diagnostics.GetBool() && queue.PendingWork() != 0)
+		{
+			Msg(PROJECT_NAME " - luapack transport diagnostic: clearing client slot %i queue: pending=%u enqueued=%u committed=%u reason=%s\n",
+				slot, static_cast<unsigned int>(queue.PendingWork()),
+				static_cast<unsigned int>(queue.enqueued),
+				static_cast<unsigned int>(queue.committed),
+				reason ? reason : "unspecified");
+		}
 		g_clientCanonicalLuaStubQueues[slot].Clear();
+	}
 }
 
-static void ClearAllClientCanonicalLuaStubs()
+static void ClearAllClientCanonicalLuaStubs(const char* reason)
 {
-	for (ClientCanonicalLuaStubQueue& queue : g_clientCanonicalLuaStubQueues)
-		queue.Clear();
+	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
+		ClearClientCanonicalLuaStubs(slot, reason);
 	g_nextCanonicalLuaStubSlot = 0;
 	g_nextCanonicalLuaStubScratchSlot = 0;
 }
@@ -1584,7 +1612,7 @@ static bool hook_CBaseClient_SendServerInfo(CBaseClient* client)
 	// SendServerInfo is the physical connection's Lua-baseline boundary. A retry or
 	// recovery baseline must never inherit placeholder replies queued for the previous
 	// epoch, while late game-layer callbacks intentionally do not touch this queue.
-	ClearClientCanonicalLuaStubs(slot);
+	ClearClientCanonicalLuaStubs(slot, "SendServerInfo baseline boundary");
 	const HolyLib::LuaPack::BaselineDecision baseline = HolyLib::LuaPack::DecideBaselineForClient(slot);
 	if (baseline.action == HolyLib::LuaPack::BaselineAction::Reject)
 	{
@@ -2075,6 +2103,39 @@ static void LogCanonicalLuaStubDeliveryComplete(int slot,
 		static_cast<unsigned int>(queue.stagingAttempts));
 }
 
+static void LogCanonicalLuaStubTransportDiagnostics(double engineTime)
+{
+	if (!gmoddatapack_luapack_delivery_diagnostics.GetBool())
+		return;
+
+	const double wallTime = Plat_FloatTime();
+	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
+	{
+		ClientCanonicalLuaStubQueue& queue = g_clientCanonicalLuaStubQueues[slot];
+		if (queue.PendingWork() == 0 ||
+			(queue.lastDiagnosticAt >= 0.0 && wallTime < queue.lastDiagnosticAt + 10.0))
+		{
+			continue;
+		}
+
+		queue.lastDiagnosticAt = wallTime;
+		CBaseClient* client = GetClientForLuaDelivery(slot);
+		const bool connected = client && client->IsConnected();
+		INetChannel* engineChannel = connected ? client->GetNetChannel() : nullptr;
+		CNetChan* channel = static_cast<CNetChan*>(engineChannel);
+		Msg(PROJECT_NAME " - luapack transport diagnostic: client slot %i queue heartbeat: pending=%u items=%u connected=%i channel=%i active=%i signon=%i overflow=%i reliable_bits=%i reliable_bytes_left=%i engine_time=%.6f last_send=%.6f wall_age=%.3f\n",
+			slot, static_cast<unsigned int>(queue.PendingWork()),
+			static_cast<unsigned int>(queue.items.size()), connected ? 1 : 0,
+			channel ? 1 : 0, client && client->IsActive() ? 1 : 0,
+			client ? client->m_nSignonState : -1,
+			channel && channel->m_StreamReliable.IsOverflowed() ? 1 : 0,
+			channel ? channel->m_StreamReliable.GetNumBitsWritten() : -1,
+			channel ? channel->m_StreamReliable.GetNumBytesLeft() : -1,
+			engineTime, g_nLastCanonicalStubSend,
+			queue.enqueuedAt >= 0.0 ? wallTime - queue.enqueuedAt : -1.0);
+	}
+}
+
 static void DrainCanonicalLuaStubQueues(double currentTime,
 	std::size_t& batchBudget)
 {
@@ -2163,7 +2224,32 @@ static void DrainCanonicalLuaStubQueues(double currentTime,
 					"the ordered canonical hash could not be staged safely");
 				break;
 			}
-			if (!SendCompressedLuaFile(slot, item.fileID, *item.compressed, client))
+			const bool firstSendAttempt = !queue.firstSendAttemptLogged;
+			const double sendStartedAt = firstSendAttempt ? Plat_FloatTime() : 0.0;
+			const int sendBitsBefore = firstSendAttempt
+				? channel->m_StreamReliable.GetNumBitsWritten() : 0;
+			if (firstSendAttempt)
+			{
+				queue.firstSendAttemptLogged = true;
+				if (gmoddatapack_luapack_delivery_diagnostics.GetBool())
+				{
+					Msg(PROJECT_NAME " - luapack transport diagnostic: client slot %i entering first engine placeholder send: file_id=%i reliable_bits=%i reliable_bytes_left=%i engine_time=%.6f wall_age=%.3f\n",
+						slot, item.fileID, sendBitsBefore,
+						channel->m_StreamReliable.GetNumBytesLeft(), currentTime,
+						queue.enqueuedAt >= 0.0 ? sendStartedAt - queue.enqueuedAt : -1.0);
+				}
+			}
+			const bool sent = SendCompressedLuaFile(slot, item.fileID, *item.compressed, client);
+			if (firstSendAttempt && gmoddatapack_luapack_delivery_diagnostics.GetBool())
+			{
+				const double sendFinishedAt = Plat_FloatTime();
+				Msg(PROJECT_NAME " - luapack transport diagnostic: client slot %i returned from first engine placeholder send: accepted=%i overflow=%i reliable_bits_before=%i reliable_bits_after=%i call_ms=%.3f\n",
+					slot, sent ? 1 : 0,
+					channel->m_StreamReliable.IsOverflowed() ? 1 : 0,
+					sendBitsBefore, channel->m_StreamReliable.GetNumBitsWritten(),
+					(sendFinishedAt - sendStartedAt) * 1000.0);
+			}
+			if (!sent)
 			{
 				const char* registeredPath = g_pDataPack && g_pDataPack->m_pClientLuaFiles &&
 					item.fileID > 0 && item.fileID < g_pDataPack->m_pClientLuaFiles->GetNumStrings()
@@ -2442,18 +2528,16 @@ void CGModDataPackModule::OnClientDisconnect(CBaseClient* pClient)
 		? pClient->m_SteamID.ConvertToUint64() : 0;
 
 	g_pLuaDataPack.m_pPlayerQueue[slot].Clear();
-	ClearClientCanonicalLuaStubs(slot);
+	ClearClientCanonicalLuaStubs(slot, "physical client disconnect");
 	ClearClientNativeLuaHashes(slot);
 	HolyLib::LuaPack::PhysicalClientDisconnect(slot, steamID64);
 }
 
-static double g_nLastSend = 0;
-static double g_nLastCanonicalStubSend = 0;
 void CGModDataPackModule::Think(bool bSimulating)
 {
 	HolyLib::LuaPack::Think();
 	if (!HolyLib::LuaPack::IsEnabled())
-		ClearAllClientCanonicalLuaStubs();
+		ClearAllClientCanonicalLuaStubs("LuaPack disabled");
 	// Do not consume the one-shot refresh until both the engine datapack and shared Lua
 	// cache can supply every registered path. Either detour can bind g_pDataPack later.
 	if (g_pDataPack && g_pDataPack->m_pClientLuaFiles && Lua::GetShared() &&
@@ -2567,6 +2651,7 @@ void CGModDataPackModule::Think(bool bSimulating)
 	}
 
 	double currentTime = Util::engineserver->Time();
+	LogCanonicalLuaStubTransportDiagnostics(currentTime);
 	if (HolyLib::LuaPack::IsEnabled() &&
 		currentTime >= (g_nLastCanonicalStubSend + 0.05))
 	{
@@ -2780,7 +2865,7 @@ void CGModDataPackModule::LuaShutdown(GarrysMod::Lua::ILuaInterface* pLua)
 
 void CGModDataPackModule::LevelShutdown()
 {
-	ClearAllClientCanonicalLuaStubs();
+	ClearAllClientCanonicalLuaStubs("level shutdown");
 	g_nLastCanonicalStubSend = 0;
 	HolyLib::LuaPack::LevelShutdown();
 	g_pLuaDataPack.Shutdown();
@@ -2788,7 +2873,7 @@ void CGModDataPackModule::LevelShutdown()
 
 void CGModDataPackModule::Shutdown()
 {
-	ClearAllClientCanonicalLuaStubs();
+	ClearAllClientCanonicalLuaStubs("module shutdown");
 	g_nLastCanonicalStubSend = 0;
 	HolyLib::LuaPack::Shutdown();
 }
