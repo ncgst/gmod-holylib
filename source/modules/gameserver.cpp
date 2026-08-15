@@ -193,8 +193,13 @@ public:
 // the CNetChan boolean for that narrow native caller.
 bool Gameserver_StageGModMessage(CBaseClient* client, const void* data, int dataBits)
 {
+	// GetNetChannel() is authoritative during early sign-on. The mirrored
+	// m_NetChannel field can be stale while the engine is moving the channel;
+	// rejecting on that field strands a PRESPAWN client before the first paced
+	// Lua response even though its live channel is usable.
+	INetChannel* channel = client ? client->GetNetChannel() : nullptr;
 	if (!client || !data || dataBits <= 0 || client->IsFakeClient() ||
-		dataBits >= (1 << 20) || !client->IsConnected() || !client->m_NetChannel)
+		dataBits >= (1 << 20) || !client->IsConnected() || !channel)
 	{
 		return false;
 	}
@@ -208,7 +213,7 @@ bool Gameserver_StageGModMessage(CBaseClient* client, const void* data, int data
 	msg.m_iLength = dataBits;
 	msg.m_iLengthBits = 20;
 	msg.m_iType = svc_GMod_ServerToClient;
-	return client->m_NetChannel->SendNetMsg(msg, true, false);
+	return channel->SendNetMsg(msg, true, false);
 }
 
 PushReferenced_LuaClass(CBaseClient)
