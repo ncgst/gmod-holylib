@@ -749,7 +749,12 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 
 	static double ServerTime()
 	{
-		return Util::engineserver ? Util::engineserver->Time() : 0.0;
+		// LuaPack uses this clock only for elapsed-time gates and expirations. The
+		// IVEngineServer mirror is not ABI-stable across current GMod engine builds;
+		// calling Time() through a stale virtual slot produced nonsensical values
+		// on Linux x64 and broke both pacing and recovery deadlines. Plat_FloatTime is
+		// monotonic and does not depend on that engine vtable layout.
+		return Plat_FloatTime();
 	}
 
 	static void ReleaseGenerationReference(ClientPin& client)

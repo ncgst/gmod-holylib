@@ -438,24 +438,30 @@ namespace HolyLib::LuaPack::Policy
 	constexpr std::size_t ReliableStubOrderedHashBytes = 96u;
 	constexpr double ReliableStubTransferTimeoutSeconds = 60.0;
 
-	// The engine must first move one LuaPack batch out of its reliable scratch stream
-	// before another batch uses the same connection. Earlier engine-owned fragment/file
-	// work is not a precondition: the exact GMod sender appends this batch behind the
-	// current scratch bytes. Requiring every engine fragment to be acknowledged here can
-	// deadlock PRESPAWN on an otherwise idle file-stream entry.
+	// If an exact engine dispatch leaves reliable scratch bytes behind, the engine must
+	// first move them out before another LuaPack batch uses the same connection. Earlier
+	// engine-owned fragment/file work is not a precondition. Requiring every engine
+	// fragment to be acknowledged here can deadlock PRESPAWN on an otherwise idle
+	// file-stream entry.
 	constexpr bool CanBeginReliableStubBatch(bool channelUsable,
 		bool streamOverflowed, bool transferPending)
 	{
 		return channelUsable && !streamOverflowed && !transferPending;
 	}
 
-	// Once the observed reliable scratch stream clears, the engine has moved the
-	// previously committed batch into its own network path and the next bounded batch
-	// may be staged. This intentionally does not call the mirrored INetChannel vtable.
+	// When an exact dispatch retained scratch bytes, their later disappearance means the
+	// engine moved them into its own network path and the next bounded batch may start.
+	// An exact dispatch that leaves no scratch bytes needs no pending-transfer state.
 	constexpr bool ReliableStubEngineTransferComplete(bool transferPending,
 		bool scratchHasBits)
 	{
 		return transferPending && !scratchHasBits;
+	}
+
+	constexpr bool ReliableStubNeedsTransferWait(bool engineOwned,
+		bool scratchHasBits)
+	{
+		return engineOwned && scratchHasBits;
 	}
 
 	constexpr bool ReliableStubEngineTransferTimedOut(bool transferPending,

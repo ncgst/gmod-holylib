@@ -3207,6 +3207,41 @@ static void hook_CVEngineServer_GMOD_SendToClient(void* _this, int client, void 
 	(void)Gameserver_StageGModMessage(pClient, data, dataSize);
 }
 
+// Dispatch a GMod custom message without depending on the locally declared
+// IVEngineServer vtable. Physical clients use the exact symbol resolved for the
+// detour; parked queue clients retain their CBaseClient-owned staging path.
+bool Gameserver_HasExactGModSender()
+{
+	return Util::engineserver &&
+		DETOUR_ISVALID(detour_CVEngineServer_GMOD_SendToClient) &&
+		DETOUR_ISENABLED(detour_CVEngineServer_GMOD_SendToClient);
+}
+
+bool Gameserver_SendGModMessage(CBaseClient* client, int slot, const void* data,
+	int dataBits)
+{
+	INetChannel* channel = client ? client->GetNetChannel() : nullptr;
+	if (!client || !data || dataBits <= 0 || dataBits >= (1 << 20) || slot < 0 ||
+		!gpGlobals || client->m_nClientSlot != slot || client->IsFakeClient() ||
+		!client->IsConnected() || !channel)
+	{
+		return false;
+	}
+
+	if (slot < gpGlobals->maxClients)
+	{
+		if (!Gameserver_HasExactGModSender())
+			return false;
+
+		detour_CVEngineServer_GMOD_SendToClient
+			.GetTrampoline<Symbols::CVEngineServer_GMOD_SendToClient>()(
+				Util::engineserver, slot, const_cast<void*>(data), dataBits);
+		return true;
+	}
+
+	return Gameserver_StageGModMessage(client, data, dataBits);
+}
+
 #if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
 static Detouring::Hook detour_CVarIterator_Get;
 static bool g_bSafeCVarIteratorInstalled = false;

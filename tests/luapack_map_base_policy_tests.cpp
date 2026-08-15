@@ -354,8 +354,9 @@ int main()
 
 	// A 3,922-file required baseline can request every canonical placeholder in one
 	// frame. The scheduler must retain reliable-stream headroom, respect both budgets,
-	// and commit queue/hash state only after the exact engine sender appended the
-	// complete batch. A second batch waits until the reliable scratch stream drains.
+	// and commit queue/hash state only after the exact engine sender owns the complete
+	// batch. If that call retains reliable scratch bytes, a second batch waits for them
+	// to drain; an immediate transfer needs no scratch-growth proof.
 	{
 		constexpr std::size_t compressedStubBytes = 320;
 		constexpr std::size_t normalStagingBytes =
@@ -372,6 +373,10 @@ int main()
 		assert(!ReliableStubEngineTransferComplete(false, true));
 		assert(!ReliableStubEngineTransferComplete(true, true));
 		assert(ReliableStubEngineTransferComplete(true, false));
+		assert(!ReliableStubNeedsTransferWait(false, false));
+		assert(!ReliableStubNeedsTransferWait(false, true));
+		assert(!ReliableStubNeedsTransferWait(true, false));
+		assert(ReliableStubNeedsTransferWait(true, true));
 		assert(!ReliableStubEngineTransferTimedOut(false, 0.0, 600.0));
 		assert(!ReliableStubEngineTransferTimedOut(true, -1.0, 600.0));
 		assert(!ReliableStubEngineTransferTimedOut(true, 10.0,
@@ -473,9 +478,12 @@ int main()
 		assert(!CommitReliableStubBatch(true, true, false));
 		assert(!CommitReliableStubBatch(true, false, false));
 		assert(CommitReliableStubBatch(true, false, true));
+		// The exact engine call is a void ownership boundary. Zero scratch bits after
+		// the call is a valid immediate transfer, not a rejected batch.
+		assert(!ReliableStubNeedsTransferWait(true, false));
 
-		// Once an exact engine append is accepted, a later batch waits until the
-		// observed reliable scratch stream has drained into the engine network path.
+		// When an exact engine dispatch retains scratch bytes, a later batch waits
+		// until the observed stream has drained into the engine network path.
 		std::size_t pacedRemaining = 3;
 		std::size_t acceptedBodies = 0;
 		bool transferPending = false;
@@ -533,8 +541,8 @@ int main()
 			assert(firstTick < 3);
 
 		// Pre-existing engine reliable/file work must not prevent the first bounded
-		// LuaPack batch from appending behind it. Once that batch is owned, the
-		// transfer flag prevents a second batch until the scratch stream clears.
+		// LuaPack batch. When that dispatch leaves scratch bytes behind, the transfer
+		// flag prevents a second batch until the observed stream clears.
 		assert(CanBeginReliableStubBatch(true, false, false));
 		assert(!CanBeginReliableStubBatch(true, false, true));
 		assert(!ReliableStubEngineTransferComplete(true, true));
