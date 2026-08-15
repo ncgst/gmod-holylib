@@ -905,6 +905,9 @@ namespace Symbols
 	using GModDataPack_SendFileToClient = void (*)(void* dataPack, int userID, int fileID);
 	extern const std::vector<Symbol> GModDataPack_SendFileToClientSym;
 
+	using GModDataPack_OnFilesRequested = void (*)(void* dataPack, int userID, bf_read* message, int bits);
+	extern const std::vector<Symbol> GModDataPack_OnFilesRequestedSym;
+
 	using GModDataPack_AddOrUpdateFile = void (*)(void* dataPack, void* luaFile, bool);
 	extern const std::vector<Symbol> GModDataPack_AddOrUpdateFileSym;
 

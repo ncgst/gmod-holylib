@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 using HolyLib::LuaPack::Policy::Action;
@@ -60,6 +61,37 @@ private:
 	}
 
 	std::size_t maximumBits;
+	bool overflowed = false;
+};
+
+class TestBitReader
+{
+public:
+	explicit TestBitReader(std::vector<std::uint16_t> values,
+		int availableBits = -1) : values(std::move(values)),
+		availableBits(availableBits >= 0 ? availableBits :
+			static_cast<int>(this->values.size() * 16)) {}
+
+	int GetNumBitsLeft() const { return availableBits - bitsRead; }
+	bool IsOverflowed() const { return overflowed; }
+
+	std::uint32_t ReadUBitLong(int bitCount)
+	{
+		if (bitCount != 16 || bitsRead + bitCount > availableBits ||
+			position >= values.size())
+		{
+			overflowed = true;
+			return 0;
+		}
+		bitsRead += bitCount;
+		return values[position++];
+	}
+
+private:
+	std::vector<std::uint16_t> values;
+	std::size_t position = 0;
+	int availableBits = 0;
+	int bitsRead = 0;
 	bool overflowed = false;
 };
 
@@ -264,6 +296,45 @@ int main()
 		assert(!CanUsePinnedRequiredStub(true, true, false, true, 73));
 		assert(!CanUsePinnedRequiredStub(true, true, pinned.Contains(3), false, 73));
 		assert(!CanUsePinnedRequiredStub(true, true, pinned.Contains(3), true, 31));
+		assert(CanDecodePinnedRequiredRequestBatch(true, true, true, 73,
+			16 * 7, 16 * 7, 8, 8));
+		assert(!CanDecodePinnedRequiredRequestBatch(false, true, true, 73,
+			16 * 7, 16 * 7, 8, 8));
+		assert(!CanDecodePinnedRequiredRequestBatch(true, false, true, 73,
+			16 * 7, 16 * 7, 8, 8));
+		assert(!CanDecodePinnedRequiredRequestBatch(true, true, false, 73,
+			16 * 7, 16 * 7, 8, 8));
+		assert(!CanDecodePinnedRequiredRequestBatch(true, true, true, 31,
+			16 * 7, 16 * 7, 8, 8));
+		assert(!CanDecodePinnedRequiredRequestBatch(true, true, true, 73,
+			0, 0, 8, 8));
+		assert(!CanDecodePinnedRequiredRequestBatch(true, true, true, 73,
+			17, 17, 8, 8));
+		assert(!CanDecodePinnedRequiredRequestBatch(true, true, true, 73,
+			16 * 7, 16 * 6, 8, 8));
+		assert(!CanDecodePinnedRequiredRequestBatch(true, true, true, 73,
+			16 * 9, 16 * 9, 8, 8));
+		assert(!CanDecodePinnedRequiredRequestBatch(true, true, true, 73,
+			16 * 7, 16 * 7, 9, 8));
+
+		TestBitReader requestedIds({5, 2, 5, 0, 7, 8});
+		PinnedCanonicalFileSet<8> decodedRequests;
+		std::size_t uniqueRequests = 0;
+		assert(DecodeRequiredRequestIds(requestedIds, 16 * 6, 8,
+			decodedRequests, uniqueRequests));
+		assert(uniqueRequests == 3);
+		std::vector<int> orderedRequests;
+		for (int fileID = 1; fileID < 8; ++fileID)
+		{
+			if (decodedRequests.Contains(fileID))
+				orderedRequests.push_back(fileID);
+		}
+		assert((orderedRequests == std::vector<int>{2, 5, 7}));
+		TestBitReader shortRequest({1}, 15);
+		PinnedCanonicalFileSet<8> rejectedRequests;
+		assert(!DecodeRequiredRequestIds(shortRequest, 16, 8,
+			rejectedRequests, uniqueRequests));
+		assert(uniqueRequests == 0);
 		pinned.Invalidate(3);
 		assert(!pinned.Contains(3));
 		pinned.Mark(4);

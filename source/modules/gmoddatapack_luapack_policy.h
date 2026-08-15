@@ -176,6 +176,48 @@ namespace HolyLib::LuaPack::Policy
 			compressedBytes >= 32u;
 	}
 
+	// GMod encodes one requested Lua file ID in each 16-bit word. Required delivery
+	// may decode that bounded batch directly only while the exact pinned baseline and
+	// payload remain usable. Empty or malformed messages retain the engine parser.
+	constexpr bool CanDecodePinnedRequiredRequestBatch(bool enabled,
+		bool canonicalRegistration, bool payloadAvailable,
+		std::size_t compressedBytes, int messageBits, int availableBits,
+		int registeredFiles, std::size_t trackedCapacity)
+	{
+		return CanUsePinnedRequiredStub(enabled, canonicalRegistration, true,
+			payloadAvailable, compressedBytes) &&
+			messageBits > 0 && availableBits >= messageBits &&
+			(messageBits % 16) == 0 && registeredFiles > 1 &&
+			static_cast<std::size_t>(registeredFiles) <= trackedCapacity &&
+			(messageBits / 16) <= registeredFiles;
+	}
+
+	template <std::size_t Capacity, typename BitReader>
+	bool DecodeRequiredRequestIds(BitReader& message, int messageBits,
+		int registeredFiles, PinnedCanonicalFileSet<Capacity>& requested,
+		std::size_t& uniqueRequests)
+	{
+		uniqueRequests = 0;
+		if (messageBits <= 0 || message.GetNumBitsLeft() < messageBits ||
+			(messageBits % 16) != 0 || registeredFiles <= 1 ||
+			static_cast<std::size_t>(registeredFiles) > Capacity ||
+			(messageBits / 16) > registeredFiles)
+		{
+			return false;
+		}
+
+		const int requestCount = messageBits / 16;
+		for (int request = 0; request < requestCount; ++request)
+		{
+			const int fileID = static_cast<int>(message.ReadUBitLong(16));
+			if (fileID <= 0 || fileID >= registeredFiles || requested.Contains(fileID))
+				continue;
+			requested.Mark(fileID);
+			++uniqueRequests;
+		}
+		return !message.IsOverflowed();
+	}
+
 	enum class Lane
 	{
 		NativeRescue,

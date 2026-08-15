@@ -87,7 +87,11 @@ struct ClientRequiredStubQueue
 	unsigned int sent = 0;
 	unsigned int duplicates = 0;
 	unsigned int drainFrames = 0;
+	unsigned int requestBatches = 0;
+	unsigned int requestedFiles = 0;
 	std::size_t peakDepth = 0;
+	double requestBatchMilliseconds = 0.0;
+	double peakRequestBatchMilliseconds = 0.0;
 
 	void Reset()
 	{
@@ -96,7 +100,11 @@ struct ClientRequiredStubQueue
 		sent = 0;
 		duplicates = 0;
 		drainFrames = 0;
+		requestBatches = 0;
+		requestedFiles = 0;
 		peakDepth = 0;
+		requestBatchMilliseconds = 0.0;
+		peakRequestBatchMilliseconds = 0.0;
 	}
 };
 
@@ -163,9 +171,11 @@ static void ReportRequiredStubQueue(int slot)
 	if (queue.accepted == 0)
 		return;
 
-	Msg(PROJECT_NAME " - luapack: required stub queue slot %i staged %u/%u canonical placeholders over %u frame(s), peak depth %u, coalesced %u duplicate request(s)\n",
+	Msg(PROJECT_NAME " - luapack: required stub queue slot %i staged %u/%u canonical placeholders over %u frame(s), peak depth %u, coalesced %u duplicate request(s); decoded %u unique request(s) in %u batch(es), %.3f ms total / %.3f ms peak\n",
 		slot, queue.sent, queue.accepted, queue.drainFrames,
-		static_cast<unsigned int>(queue.peakDepth), queue.duplicates);
+		static_cast<unsigned int>(queue.peakDepth), queue.duplicates,
+		queue.requestedFiles, queue.requestBatches,
+		queue.requestBatchMilliseconds, queue.peakRequestBatchMilliseconds);
 }
 
 static void DrainRequiredStubQueues();
@@ -1743,6 +1753,11 @@ static bool hook_CBaseClient_SendServerInfo(CBaseClient* client)
 
 static Detouring::Hook detour_GModDataPack_AddOrUpdateFile;
 static Detouring::Hook detour_GModDataPack_SendFileToClient;
+#if defined(SYSTEM_LINUX)
+static Detouring::Hook detour_GModDataPack_OnFilesRequested;
+static thread_local int g_requiredRequestProbeSlot = -1;
+static thread_local bool g_requiredRequestProbeAccepted = false;
+#endif
 
 bool HolyLib::LuaPack::SupportsCanonicalRegistration()
 {
@@ -1753,6 +1768,8 @@ bool HolyLib::LuaPack::SupportsCanonicalRegistration()
 #if defined(SYSTEM_LINUX) && MODULE_EXISTS_GAMESERVER
 	return DETOUR_ISVALID(detour_CBaseClient_SendServerInfo) &&
 		DETOUR_ISENABLED(detour_CBaseClient_SendServerInfo) &&
+		DETOUR_ISVALID(detour_GModDataPack_OnFilesRequested) &&
+		DETOUR_ISENABLED(detour_GModDataPack_OnFilesRequested) &&
 		DETOUR_ISVALID(detour_GModDataPack_AddOrUpdateFile) &&
 		DETOUR_ISENABLED(detour_GModDataPack_AddOrUpdateFile) &&
 		DETOUR_ISVALID(detour_GModDataPack_SendFileToClient) &&
@@ -2149,6 +2166,16 @@ static bool SendNativeLuaFile(GModDataPack* pDataPack, int clientIdx, int fileID
 
 static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clientIdx, int fileID)
 {
+#if defined(SYSTEM_LINUX)
+	// The required batch decoder asks the engine parser to consume its normal request
+	// allowance with one harmless valid ID. Intercept only that thread-local probe;
+	// every real body request continues below.
+	if (g_requiredRequestProbeSlot == clientIdx)
+	{
+		g_requiredRequestProbeAccepted = true;
+		return;
+	}
+#endif
 	VPROF_BUDGET("HolyLib - GModDataPack Lua request", VPROF_BUDGETGROUP_HOLYLIB);
 	if (!pDataPack || !pDataPack->m_pClientLuaFiles)
 	{
@@ -2337,6 +2364,87 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 	if (HolyLib::LuaPack::IsEnabled())
 		SendNativeLuaFile(pDataPack, clientIdx, fileID, fileName, luaFile);
 }
+
+#if defined(SYSTEM_LINUX)
+static void hook_GModDataPack_OnFilesRequested(GModDataPack* pDataPack,
+	int clientIdx, bf_read* message, int bits)
+{
+	auto original = detour_GModDataPack_OnFilesRequested.GetTrampoline<
+		Symbols::GModDataPack_OnFilesRequested>();
+	if (!pDataPack || !pDataPack->m_pClientLuaFiles || !message ||
+		clientIdx < 0 || clientIdx >= ABSOLUTE_PLAYER_LIMIT)
+	{
+		original(pDataPack, clientIdx, message, bits);
+		return;
+	}
+
+	const Bootil::AutoBuffer* payload = g_clientPinnedCanonicalPayloads[clientIdx];
+	const std::size_t compressedBytes = payload ? payload->GetWritten() : 0u;
+	const int registeredFiles = pDataPack->m_pClientLuaFiles->GetNumStrings();
+	if (!HolyLib::LuaPack::Policy::CanDecodePinnedRequiredRequestBatch(
+		HolyLib::LuaPack::IsEnabled(), HolyLib::LuaPack::SupportsCanonicalRegistration(),
+		payload != nullptr, compressedBytes, bits, message->GetNumBitsLeft(),
+		registeredFiles, MAX_TRACKED_LUA_FILES))
+	{
+		original(pDataPack, clientIdx, message, bits);
+		return;
+	}
+
+	const double startedAt = Plat_FloatTime();
+	// Preserve GModDataPack's private per-client request allowance without paying for
+	// its red-black-tree construction over the complete cold ID batch. A one-ID probe
+	// reaches our SendFile detour only when the engine accepted this request attempt.
+	unsigned char probeBytes[2] = {1u, 0u};
+	bf_read probe(probeBytes, sizeof(probeBytes));
+	g_requiredRequestProbeSlot = clientIdx;
+	g_requiredRequestProbeAccepted = false;
+	original(pDataPack, clientIdx, &probe, 16);
+	const bool requestAccepted = g_requiredRequestProbeAccepted;
+	g_requiredRequestProbeAccepted = false;
+	g_requiredRequestProbeSlot = -1;
+	if (!requestAccepted)
+		return;
+
+	PinnedCanonicalFiles requested;
+	std::size_t uniqueRequests = 0;
+	if (!HolyLib::LuaPack::Policy::DecodeRequiredRequestIds(
+		*message, bits, registeredFiles, requested, uniqueRequests))
+	{
+		DisconnectLuaHashFailure(clientIdx, "the required Lua request batch",
+			"the bounded request decoder could not consume the advertised bits");
+		return;
+	}
+
+	ClientRequiredStubQueue& queue = g_clientRequiredStubQueues[clientIdx];
+	++queue.requestBatches;
+	queue.requestedFiles += static_cast<unsigned int>(uniqueRequests);
+	for (int fileID = 1; fileID < registeredFiles; ++fileID)
+	{
+		if (!requested.Contains(fileID))
+			continue;
+
+		if (g_clientPinnedCanonicalFiles[clientIdx].Contains(fileID))
+		{
+			if (!EnqueuePinnedRequiredStub(clientIdx, fileID))
+			{
+				DisconnectLuaHashFailure(clientIdx,
+					pDataPack->m_pClientLuaFiles->GetString(fileID),
+					"the pinned canonical placeholder could not enter its bounded queue");
+				break;
+			}
+			continue;
+		}
+
+		// Init and exact map deltas remain on the existing identity-aware path.
+		hook_GModDataPack_SendFileToClient(pDataPack, clientIdx, fileID);
+	}
+
+	const double elapsedMilliseconds = (Plat_FloatTime() - startedAt) * 1000.0;
+	queue.requestBatchMilliseconds += elapsedMilliseconds;
+	queue.peakRequestBatchMilliseconds = (std::max)(
+		queue.peakRequestBatchMilliseconds, elapsedMilliseconds);
+}
+#endif
 
 
 LUA_FUNCTION_STATIC(gmoddatapack_StripCode)
@@ -2820,6 +2928,14 @@ void CGModDataPackModule::InitDetour(bool bPreServer)
 		server_loader.GetModule(), Symbols::GModDataPack_SendFileToClientSym,
 		(void*)DETOUR_THISCALL(hook_GModDataPack_SendFileToClient, SendFileToClient), m_pID
 	);
+
+#if defined(SYSTEM_LINUX)
+	Detour::Create(
+		&detour_GModDataPack_OnFilesRequested, "GModDataPack::OnFilesRequested",
+		server_loader.GetModule(), Symbols::GModDataPack_OnFilesRequestedSym,
+		(void*)hook_GModDataPack_OnFilesRequested, m_pID
+	);
+#endif
 }
 
 void CGModDataPackModule::LuaInit(GarrysMod::Lua::ILuaInterface* pLua, bool bServerInit)

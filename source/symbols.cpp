@@ -1309,6 +1309,10 @@ namespace Symbols
 		Symbol::FromName("?SendFileToClient@GModDataPack@@QEAAXHH@Z"),
 	};
 
+	const std::vector<Symbol> GModDataPack_OnFilesRequestedSym = {
+		Symbol::FromName("_ZN12GModDataPack16OnFilesRequestedEiP7bf_readi"),
+	};
+
 	const std::vector<Symbol> GModDataPack_AddOrUpdateFileSym = { // search for singleplayer_files%i
 		Symbol::FromName("_ZN12GModDataPack15AddOrUpdateFileEP7LuaFileb"),
 		Symbol::FromName("_ZN12GModDataPack15AddOrUpdateFileEP7LuaFileb"),
