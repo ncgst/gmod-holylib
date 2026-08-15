@@ -1505,7 +1505,8 @@ static bool EnsureRequiredLuaReliableCapacity(CBaseClient* client, int slot,
 
 	const std::size_t minimumRequiredBytes = RequiredStubReliableCapacityBytes(
 		maximumStubCount, compressedStubBytes);
-	if (minimumRequiredBytes == (std::numeric_limits<std::size_t>::max)())
+	if (minimumRequiredBytes == (std::numeric_limits<std::size_t>::max)() ||
+		minimumRequiredBytes > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
 	{
 		failure = "the canonical placeholder burst exceeds the addressable reliable buffer";
 		return false;
@@ -1522,18 +1523,15 @@ static bool EnsureRequiredLuaReliableCapacity(CBaseClient* client, int slot,
 	if (previousBytes >= minimumRequiredBytes)
 		return true;
 
-	// When growth is necessary, preserve the channel's entire previous capacity as
-	// sign-on headroom. This makes the reservation scale from the engine's own
-	// baseline rather than relying only on the 64 KiB minimum used for the no-growth
-	// decision.
-	const std::size_t requiredBytes = RequiredStubReliableCapacityBytes(
+	// When growth is necessary, ask to preserve the channel's entire previous capacity
+	// as sign-on headroom. The engine may clamp that preference, but the verified result
+	// must still retain the 64 KiB minimum used for the no-growth decision.
+	const std::size_t preferredBytes = RequiredStubReliableCapacityBytes(
 		maximumStubCount, compressedStubBytes, previousBytes);
-	if (requiredBytes == (std::numeric_limits<std::size_t>::max)() ||
-		requiredBytes > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
-	{
-		failure = "the canonical placeholder burst exceeds the addressable reliable buffer";
-		return false;
-	}
+	const std::size_t requestedBytes = preferredBytes !=
+		(std::numeric_limits<std::size_t>::max)() && preferredBytes <=
+		static_cast<std::size_t>((std::numeric_limits<int>::max)())
+		? preferredBytes : minimumRequiredBytes;
 
 	// Resizing an occupied scratch stream can invalidate bytes already staged by the
 	// engine. SendServerInfo is normally entered with an empty scratch stream; if that
@@ -1544,11 +1542,11 @@ static bool EnsureRequiredLuaReliableCapacity(CBaseClient* client, int slot,
 		return false;
 	}
 
-	engineChannel->SetMaxBufferSize(true, static_cast<int>(requiredBytes), false);
+	engineChannel->SetMaxBufferSize(true, static_cast<int>(requestedBytes), false);
 	const int actualBits = channel->m_StreamReliable.GetMaxNumBits();
 	const std::size_t actualBytes = actualBits > 0
 		? (static_cast<std::size_t>(actualBits) + 7u) / 8u : 0u;
-	if (actualBytes < requiredBytes)
+	if (actualBytes < minimumRequiredBytes)
 	{
 		failure = "the engine refused the required reliable buffer capacity";
 		return false;

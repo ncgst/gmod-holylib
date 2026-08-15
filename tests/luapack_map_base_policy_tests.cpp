@@ -197,9 +197,13 @@ int main()
 		assert(RequiredStubReliableCapacityBytes(795, 73) == 128540);
 		assert(RequiredStubReliableCapacityBytes(3922, 73) == 376355);
 		assert(RequiredStubReliableCapacityBytes(3922, 73, 262144) == 572963);
+		assert(RequiredStubReliableCapacityBytes(5048, 73) == 465590);
+		assert(RequiredStubReliableCapacityBytes(5048, 73, 262144) == 662198);
 		assert(RequiredStubReliableCapacityBytes(795, 73) <= 262144);
 		assert(RequiredStubReliableCapacityBytes(3922, 73) > 262144);
 		assert(RequiredStubReliableCapacityBytes(3922, 73, 262144) <= 576000);
+		assert(RequiredStubReliableCapacityBytes(5048, 73) <= 576000);
+		assert(RequiredStubReliableCapacityBytes(5048, 73, 262144) > 576000);
 		assert(RequiredStubWireBits((std::numeric_limits<std::size_t>::max)()) ==
 			(std::numeric_limits<std::size_t>::max)());
 		assert(RequiredStubReliableCapacityBytes(
