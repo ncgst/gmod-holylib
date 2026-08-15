@@ -2212,20 +2212,44 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		return {BaselineAction::Reject, "invalid per-file map-base policy result"};
 	}
 
-	std::size_t RequiredStubCompressedBytesForClient(int slot)
+	const Bootil::AutoBuffer* RequiredStubPayloadForClient(int slot)
 	{
 		if (!IsEnabled() || !IsValidSlot(slot))
-			return 0;
+			return nullptr;
 
 		const ClientPin& client = state.clients[slot];
 		auto generation = state.generations.find(client.generation);
 		if (generation == state.generations.end() ||
 			!generation->second.compressedRequiredStub)
 		{
-			return 0;
+			return nullptr;
 		}
 
-		return generation->second.compressedRequiredStub->GetWritten();
+		return generation->second.compressedRequiredStub.get();
+	}
+
+	std::size_t RequiredStubCompressedBytesForClient(int slot)
+	{
+		const Bootil::AutoBuffer* payload = RequiredStubPayloadForClient(slot);
+		return payload ? payload->GetWritten() : 0;
+	}
+
+	bool RecordPinnedRequiredStubForClient(int slot)
+	{
+		if (!IsEnabled() || !IsValidSlot(slot))
+			return false;
+
+		ClientPin& client = state.clients[slot];
+		if (ClientLane(client) != Policy::Lane::Required || client.generation.empty())
+			return false;
+		if (!client.active)
+		{
+			++client.joinRequiredStubs;
+			if (client.joinRequiredStubs == 1)
+				Msg(PROJECT_NAME " - luapack: client slot %i is using required map base %s with per-path native deltas; stubbing unchanged files without waiting for READY\n",
+					slot, client.generation.c_str());
+		}
+		return true;
 	}
 
 	bool NeedsNativeHashUpdate(int slot)
@@ -2267,13 +2291,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		auto generation = state.generations.find(client.generation);
 		if (generation == state.generations.end() || !generation->second.compressedRequiredStub)
 			return {DeliveryAction::Reject, nullptr, "the immutable map base became unavailable during Lua transfer"};
-		if (!client.active)
-		{
-			++client.joinRequiredStubs;
-			if (client.joinRequiredStubs == 1)
-				Msg(PROJECT_NAME " - luapack: client slot %i is using required map base %s with per-path native deltas; stubbing unchanged files without waiting for READY\n",
-					slot, client.generation.c_str());
-		}
+		RecordPinnedRequiredStubForClient(slot);
 		return {DeliveryAction::Stub, generation->second.compressedRequiredStub.get(), nullptr};
 	}
 

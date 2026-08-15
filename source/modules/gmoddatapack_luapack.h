@@ -99,7 +99,9 @@ namespace HolyLib::LuaPack
 	bool ConsumeBootstrapRefresh();
 	BaselineDecision DecideBaselineForClient(int slot);
 	BaselineDecision DecideFileBaselineForClient(int slot, const std::string& virtualPath);
+	const Bootil::AutoBuffer* RequiredStubPayloadForClient(int slot);
 	std::size_t RequiredStubCompressedBytesForClient(int slot);
+	bool RecordPinnedRequiredStubForClient(int slot);
 	bool NeedsNativeHashUpdate(int slot);
 	DeliveryDecision DecideDeliveryForClient(int slot, const std::string& virtualPath, size_t nativeSourceBytes);
 	void DisconnectRequiredClient(int slot, const char* failure);

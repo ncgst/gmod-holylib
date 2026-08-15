@@ -71,14 +71,26 @@ extern CBaseClient* Gameserver_GetClientBySlot(int slot);
 using ClientLuaHash = std::array<unsigned char, 32>;
 static std::array<std::unordered_map<int, ClientLuaHash>, ABSOLUTE_PLAYER_LIMIT> g_clientNativeLuaHashes;
 static std::array<std::unordered_map<int, ClientLuaHash>, ABSOLUTE_PLAYER_LIMIT> g_clientHashUpdatesPending;
+static constexpr std::size_t MAX_TRACKED_LUA_FILES = 1u << 13u;
+using PinnedCanonicalFiles = HolyLib::LuaPack::Policy::PinnedCanonicalFileSet<MAX_TRACKED_LUA_FILES>;
+static std::array<PinnedCanonicalFiles, ABSOLUTE_PLAYER_LIMIT> g_clientPinnedCanonicalFiles;
+static std::array<const Bootil::AutoBuffer*, ABSOLUTE_PLAYER_LIMIT> g_clientPinnedCanonicalPayloads{};
 
-static void ClearClientNativeLuaHashes(int slot)
+static void ClearClientLuaDeliveryState(int slot)
 {
 	if (slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT)
 	{
 		g_clientNativeLuaHashes[slot].clear();
 		g_clientHashUpdatesPending[slot].clear();
+		g_clientPinnedCanonicalFiles[slot].Reset();
+		g_clientPinnedCanonicalPayloads[slot] = nullptr;
 	}
+}
+
+static void InvalidatePinnedCanonicalFileForAllClients(int fileID)
+{
+	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
+		g_clientPinnedCanonicalFiles[slot].Invalidate(fileID);
 }
 
 static void ClearClientNativeLuaHashForAllClients(int fileID, const ClientLuaHash* publishedHash = nullptr)
@@ -969,6 +981,11 @@ public:
 			return;
 		}
 
+		// The baseline plan is keyed by file ID and the exact immutable-base identity.
+		// Any source or registration-mode transition must leave the O(1) request path
+		// before LuaPack can decide whether this client now needs a native delta or an
+		// ordered canonical restoration.
+		InvalidatePinnedCanonicalFileForAllClients(fileID);
 		pEntry.compressed.Clear();
 		pEntry.hasSourceContent = true;
 		pEntry.sourceContent = content;
@@ -1160,7 +1177,7 @@ public:
 	};
 
 public:
-	static constexpr int MAX_LUA_FILES = 1 << 13;
+	static constexpr int MAX_LUA_FILES = static_cast<int>(MAX_TRACKED_LUA_FILES);
 	LuaPackEntry m_pLuaFileCache[MAX_LUA_FILES];
 
 	PlayerQueue m_pPlayerQueue[ABSOLUTE_PLAYER_LIMIT];
@@ -1309,6 +1326,12 @@ public:
 	explicit ScopedClientLuaBaseline(int slot, HolyLib::LuaPack::BaselineAction action)
 	{
 		VPROF_BUDGET("HolyLib - LuaPack baseline preparation", VPROF_BUDGETGROUP_HOLYLIB);
+		const bool validSlot = slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT;
+		if (validSlot)
+		{
+			g_clientPinnedCanonicalFiles[slot].Reset();
+			g_clientPinnedCanonicalPayloads[slot] = nullptr;
+		}
 		if (action != HolyLib::LuaPack::BaselineAction::BasePlusDelta &&
 			action != HolyLib::LuaPack::BaselineAction::CanonicalStub &&
 			action != HolyLib::LuaPack::BaselineAction::NativeSource)
@@ -1322,7 +1345,7 @@ public:
 			failure = "client_lua_files is unavailable";
 			return;
 		}
-		const bool trackNativeBaseline = slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT &&
+		const bool trackNativeBaseline = validSlot &&
 			(action == HolyLib::LuaPack::BaselineAction::BasePlusDelta ||
 				(action == HolyLib::LuaPack::BaselineAction::NativeSource &&
 					HolyLib::LuaPack::NeedsNativeHashUpdate(slot)));
@@ -1369,6 +1392,7 @@ public:
 				// non-init entry. It does not depend on the ordinary per-file compression
 				// worker having reached this file yet.
 				baselineSource = HolyLib::LuaPack::PrepareVanillaFile(fileName, "");
+				pinnedCanonicalFiles.Mark(fileID);
 			}
 			else
 			{
@@ -1436,10 +1460,26 @@ public:
 			}
 		}
 
+		const Bootil::AutoBuffer* requiredPayload = nullptr;
+		if (validSlot && action == HolyLib::LuaPack::BaselineAction::BasePlusDelta)
+		{
+			requiredPayload = HolyLib::LuaPack::RequiredStubPayloadForClient(slot);
+			if (!requiredPayload || requiredPayload->GetWritten() < 32)
+			{
+				failure = "the pinned canonical placeholder payload is unavailable";
+				Restore();
+				return;
+			}
+		}
 		if (trackNativeBaseline)
 		{
 			auto& nativeHashes = g_clientNativeLuaHashes[slot];
 			nativeHashes.insert(nativeBaselineHashes.begin(), nativeBaselineHashes.end());
+		}
+		if (requiredPayload)
+		{
+			g_clientPinnedCanonicalFiles[slot] = pinnedCanonicalFiles;
+			g_clientPinnedCanonicalPayloads[slot] = requiredPayload;
 		}
 		valid = true;
 	}
@@ -1469,6 +1509,7 @@ private:
 
 	std::vector<ClientLuaBaselineHashOverride> overrides;
 	std::unordered_map<int, ClientLuaHash> nativeBaselineHashes;
+	PinnedCanonicalFiles pinnedCanonicalFiles;
 	std::string failure;
 	bool valid = false;
 };
@@ -1925,6 +1966,43 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 		return;
 	}
 
+	// SendServerInfo already resolved every required base/delta decision against the
+	// exact string-table baseline advertised to this connection. Most cold joins then
+	// request all canonical IDs in one CNetChan::ProcessMessages call. Repeating the Lua
+	// cache lookup, path normalization, registry lock, and base/current identity lookup
+	// for each unchanged ID makes that one packet scale linearly into a frame stall.
+	// Source or registration-mode changes invalidate the affected bit before publication,
+	// so only the unchanged baseline-owned IDs may take this O(1) body path.
+	if (clientIdx >= 0 && clientIdx < ABSOLUTE_PLAYER_LIMIT)
+	{
+		const bool enabled = HolyLib::LuaPack::IsEnabled();
+		const bool canonicalRegistration = HolyLib::LuaPack::SupportsCanonicalRegistration();
+		const bool filePinned = g_clientPinnedCanonicalFiles[clientIdx].Contains(fileID);
+		if (enabled && canonicalRegistration && filePinned)
+		{
+			const Bootil::AutoBuffer* pinnedPayload = g_clientPinnedCanonicalPayloads[clientIdx];
+			const std::size_t compressedBytes = pinnedPayload ? pinnedPayload->GetWritten() : 0u;
+			if (HolyLib::LuaPack::Policy::CanUsePinnedRequiredStub(
+				enabled, canonicalRegistration, filePinned,
+				pinnedPayload != nullptr, compressedBytes))
+			{
+				if (!HolyLib::LuaPack::RecordPinnedRequiredStubForClient(clientIdx))
+				{
+					g_clientPinnedCanonicalFiles[clientIdx].Invalidate(fileID);
+				}
+				else
+				{
+					if (!AppendCanonicalLuaStub(clientIdx, fileID, *pinnedPayload))
+					{
+						DisconnectLuaHashFailure(clientIdx, clientFiles->GetString(fileID),
+							"the pinned canonical placeholder could not be appended to the reserved reliable buffer");
+					}
+					return;
+				}
+			}
+		}
+	}
+
 	std::string fileName = clientFiles->GetString(fileID);
 	GarrysMod::Lua::LuaFile* luaFile = Lua::GetShared()->GetCache(fileName);
 	bool registrationReady = false;
@@ -2236,7 +2314,7 @@ void CGModDataPackModule::OnClientDisconnect(CBaseClient* pClient)
 		? pClient->m_SteamID.ConvertToUint64() : 0;
 
 	g_pLuaDataPack.m_pPlayerQueue[slot].Clear();
-	ClearClientNativeLuaHashes(slot);
+	ClearClientLuaDeliveryState(slot);
 	HolyLib::LuaPack::PhysicalClientDisconnect(slot, steamID64);
 }
 
@@ -2467,7 +2545,7 @@ MODULE_RESULT CGModDataPackModule::ClientConnect(bool* bAllowConnect, edict_t* p
 
 	const int slot = ClientSlotFromEdict(pClient);
 	if (!HolyLib::LuaPack::ClientConnect(slot))
-		ClearClientNativeLuaHashes(slot);
+		ClearClientLuaDeliveryState(slot);
 
 	const HolyLib::LuaPack::Config& config = HolyLib::LuaPack::GetConfig();
 	if (HolyLib::LuaPack::Policy::RejectUnavailableRequiredAdmission(
@@ -2494,7 +2572,7 @@ void CGModDataPackModule::ClientDisconnect(edict_t* pClient)
 {
 	const int slot = ClientSlotFromEdict(pClient);
 	if (!HolyLib::LuaPack::ClientDisconnect(slot, true))
-		ClearClientNativeLuaHashes(slot);
+		ClearClientLuaDeliveryState(slot);
 }
 
 MODULE_RESULT CGModDataPackModule::ClientCommand(edict_t* pClient, const CCommand* args)
@@ -2560,11 +2638,15 @@ void CGModDataPackModule::LuaShutdown(GarrysMod::Lua::ILuaInterface* pLua)
 
 void CGModDataPackModule::LevelShutdown()
 {
+	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
+		ClearClientLuaDeliveryState(slot);
 	HolyLib::LuaPack::LevelShutdown();
 	g_pLuaDataPack.Shutdown();
 }
 
 void CGModDataPackModule::Shutdown()
 {
+	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
+		ClearClientLuaDeliveryState(slot);
 	HolyLib::LuaPack::Shutdown();
 }

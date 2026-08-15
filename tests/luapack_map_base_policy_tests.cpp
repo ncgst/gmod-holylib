@@ -245,6 +245,41 @@ int main()
 		assert(NeedsOrderedCanonicalHash(false, true, false));
 		assert(NeedsOrderedCanonicalHash(false, false, true));
 		assert(!NeedsOrderedCanonicalHash(false, false, false));
+
+		// A required connection may reuse the exact per-file decision made while its
+		// string-table baseline was serialized. File/source transitions invalidate only
+		// the affected ID, and the kill switch, hook loss, or incomplete payload always
+		// leaves the slower identity-aware path in control.
+		PinnedCanonicalFileSet<8> pinned;
+		assert(!pinned.Contains(3));
+		pinned.Mark(3);
+		pinned.Mark(-1);
+		pinned.Mark(8);
+		assert(pinned.Contains(3));
+		assert(!pinned.Contains(-1));
+		assert(!pinned.Contains(8));
+		assert(CanUsePinnedRequiredStub(true, true, pinned.Contains(3), true, 73));
+		assert(!CanUsePinnedRequiredStub(false, true, pinned.Contains(3), true, 73));
+		assert(!CanUsePinnedRequiredStub(true, false, pinned.Contains(3), true, 73));
+		assert(!CanUsePinnedRequiredStub(true, true, false, true, 73));
+		assert(!CanUsePinnedRequiredStub(true, true, pinned.Contains(3), false, 73));
+		assert(!CanUsePinnedRequiredStub(true, true, pinned.Contains(3), true, 31));
+		pinned.Invalidate(3);
+		assert(!pinned.Contains(3));
+		pinned.Mark(4);
+		pinned.Reset();
+		assert(!pinned.Contains(4));
+
+		std::array<PinnedCanonicalFileSet<8>, 2> clientPlans;
+		clientPlans[0].Mark(2);
+		clientPlans[0].Mark(5);
+		clientPlans[1].Mark(2);
+		for (auto& plan : clientPlans)
+			plan.Invalidate(2);
+		assert(!clientPlans[0].Contains(2));
+		assert(!clientPlans[1].Contains(2));
+		assert(clientPlans[0].Contains(5));
+
 		assert(RequiredStubPayloadBits(73) == 608);
 		assert(RequiredStubWireBits(73) == 634);
 		assert(CanAppendRequiredStub(false, 634, 73));

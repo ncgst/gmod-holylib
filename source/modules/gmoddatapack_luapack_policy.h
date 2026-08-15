@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -10,6 +11,44 @@
 
 namespace HolyLib::LuaPack::Policy
 {
+	template <std::size_t Capacity>
+	class PinnedCanonicalFileSet
+	{
+	public:
+		void Reset()
+		{
+			files.reset();
+		}
+
+		void Mark(int fileID)
+		{
+			if (fileID >= 0 && static_cast<std::size_t>(fileID) < Capacity)
+				files.set(static_cast<std::size_t>(fileID));
+		}
+
+		void Invalidate(int fileID)
+		{
+			if (fileID >= 0 && static_cast<std::size_t>(fileID) < Capacity)
+				files.reset(static_cast<std::size_t>(fileID));
+		}
+
+		bool Contains(int fileID) const
+		{
+			return fileID >= 0 && static_cast<std::size_t>(fileID) < Capacity &&
+				files.test(static_cast<std::size_t>(fileID));
+		}
+
+	private:
+		std::bitset<Capacity> files;
+	};
+
+	constexpr bool CanUsePinnedRequiredStub(bool enabled, bool canonicalRegistration,
+		bool filePinned, bool payloadAvailable, std::size_t compressedBytes)
+	{
+		return enabled && canonicalRegistration && filePinned && payloadAvailable &&
+			compressedBytes >= 32u;
+	}
+
 	enum class Lane
 	{
 		NativeRescue,
