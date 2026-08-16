@@ -69,8 +69,11 @@ namespace HolyLib::LuaPack
 		std::shared_ptr<Bootil::AutoBuffer> compressedRequiredStub;
 		// Immutable SHA-256 identities for the map-base bodies. The live registry
 		// keeps current contents; comparing the two selects canonical base stubs or
-		// native deltas without building another downloadable generation.
+		// native deltas without building another downloadable generation. The delta
+		// index is updated at registration time so a join never locks the full live
+		// registry once per client_lua_files entry.
 		std::unordered_map<std::string, std::string> files;
+		std::unordered_set<std::string> nativeDeltas;
 		unsigned int pins = 0;
 	};
 
@@ -1195,20 +1198,8 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 	{
 		const std::string path = NormalizePath(virtualPath);
 		auto baseFile = base.files.find(path);
-		std::string currentIdentity;
-		bool hasCurrent = false;
-		{
-			std::lock_guard<std::mutex> lock(state.registryMutex);
-			auto current = state.files.find(path);
-			if (current != state.files.end())
-			{
-				currentIdentity = current->second.identity;
-				hasCurrent = true;
-			}
-		}
-
-		return Policy::IsNativeDelta(baseFile != base.files.end() && hasCurrent,
-			baseFile == base.files.end() ? std::string() : baseFile->second, currentIdentity);
+		return baseFile == base.files.end() ||
+			base.nativeDeltas.find(path) != base.nativeDeltas.end();
 	}
 
 	static std::string DataDirectory(const std::string& packDirectory)
@@ -1884,7 +1875,14 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			} else {
 				// The disabled state must not retain a second copy of all registered Lua. Clearing
 				// also prevents a runtime re-enable from publishing a stale pre-refresh snapshot.
+				// Fail safe for every preserved immutable generation until the refresh recaptures
+				// the current identities: files may have changed while capture was disabled.
 				std::lock_guard<std::mutex> lock(state.registryMutex);
+				for (auto& generation : state.generations)
+				{
+					Policy::MarkBasePathsNative(generation.second.nativeDeltas,
+						generation.second.files);
+				}
 				state.files.clear();
 				state.buildRequested = false;
 			}
@@ -1974,6 +1972,23 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 							generation.compressedRequiredStub = generation.compressedStub;
 							for (const FileRecord& file : task->files)
 								generation.files[NormalizePath(file.virtualPath)] = file.identity;
+							{
+								std::lock_guard<std::mutex> lock(state.registryMutex);
+								for (const auto& current : state.files)
+								{
+									const auto baseFile = generation.files.find(current.first);
+									Policy::UpdateNativeDeltaIndex(generation.nativeDeltas,
+										current.first, Policy::IsNativeDelta(
+											baseFile != generation.files.end(),
+											baseFile == generation.files.end() ? std::string() : baseFile->second,
+											current.second.identity));
+								}
+								for (const auto& baseFile : generation.files)
+								{
+									if (state.files.find(baseFile.first) == state.files.end())
+										generation.nativeDeltas.insert(baseFile.first);
+								}
+							}
 							if (!generation.compressedStub || !generation.compressedRequiredStub)
 							{
 								Warning(PROJECT_NAME " - luapack: Failed to build the canonical map-base stub; required joins remain rejected\n");
@@ -2119,6 +2134,15 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			record.contents = contents;
 			record.identity = identity;
 			record.revision = ++state.revision;
+			for (auto& generation : state.generations)
+			{
+				const auto baseFile = generation.second.files.find(virtualPath);
+				Policy::UpdateNativeDeltaIndex(generation.second.nativeDeltas,
+					virtualPath, Policy::IsNativeDelta(
+						baseFile != generation.second.files.end(),
+						baseFile == generation.second.files.end() ? std::string() : baseFile->second,
+						identity));
+			}
 			if (needsMapBase)
 			{
 				state.buildRequested = true;
@@ -2210,6 +2234,44 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		}
 
 		return {BaselineAction::Reject, "invalid per-file map-base policy result"};
+	}
+
+	BaselineDecision DecidePinnedFileBaselineForClient(int slot, const std::string& virtualPath)
+	{
+		if (!IsEnabled() || !IsValidSlot(slot))
+			return {BaselineAction::Reject, "LuaPack became unavailable during ServerInfo preparation"};
+
+		// This is the immediate continuation of DecideBaselineForClient inside one
+		// SendServerInfo call. That outer decision already verified the exact pinned
+		// object, manifest path, downloadable registration, and local file. Repeating
+		// those ConVar/path checks for every string-table entry made a flood multiply
+		// thousands of identical validations on the main thread.
+		const ClientPin& client = state.clients[slot];
+		if (ClientLane(client) != Policy::Lane::Required)
+		{
+			return {BaselineAction::Reject, "the required baseline lane changed during ServerInfo preparation"};
+		}
+		auto generation = state.generations.find(client.generation);
+		if (generation == state.generations.end() ||
+			!generation->second.engineDownloadable ||
+			!generation->second.compressedRequiredStub)
+		{
+			return {BaselineAction::Reject, "the pinned map base became unavailable during ServerInfo preparation"};
+		}
+
+		switch (Policy::SelectFile(Policy::Lane::Required, true,
+			Policy::BaseAvailability::Ready, IsInitFile(virtualPath),
+			IsNativeDelta(generation->second, virtualPath)))
+		{
+			case Policy::Action::Native:
+				return {BaselineAction::NativeSource, nullptr};
+			case Policy::Action::CanonicalStub:
+				return {BaselineAction::CanonicalStub, nullptr};
+			case Policy::Action::Reject:
+				return {BaselineAction::Reject, "the pinned map-base file decision was rejected"};
+		}
+
+		return {BaselineAction::Reject, "invalid pinned map-base file policy result"};
 	}
 
 	const Bootil::AutoBuffer* RequiredStubPayloadForClient(int slot)

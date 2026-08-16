@@ -176,6 +176,39 @@ namespace HolyLib::LuaPack::Policy
 			compressedBytes >= 32u;
 	}
 
+	template <typename Index, typename Key>
+	void UpdateNativeDeltaIndex(Index& nativeDeltas, const Key& key, bool nativeDelta)
+	{
+		if (nativeDelta)
+			nativeDeltas.insert(key);
+		else
+			nativeDeltas.erase(key);
+	}
+
+	template <typename Index, typename Files>
+	void MarkBasePathsNative(Index& nativeDeltas, const Files& baseFiles)
+	{
+		for (const auto& baseFile : baseFiles)
+			nativeDeltas.insert(baseFile.first);
+	}
+
+	enum class BaselineHashDisposition
+	{
+		ReusePublished,
+		OverrideCached,
+		OverrideComputed,
+	};
+
+	constexpr BaselineHashDisposition SelectBaselineHashDisposition(
+		bool publishedMatches, bool cachedIdentity)
+	{
+		if (publishedMatches)
+			return BaselineHashDisposition::ReusePublished;
+		return cachedIdentity
+			? BaselineHashDisposition::OverrideCached
+			: BaselineHashDisposition::OverrideComputed;
+	}
+
 	// GMod encodes one requested Lua file ID in each 16-bit word. Required delivery
 	// may decode that bounded batch directly only while the exact pinned baseline and
 	// payload remain usable. Empty or malformed messages retain the engine parser.

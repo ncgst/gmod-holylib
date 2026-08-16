@@ -615,6 +615,40 @@ int main()
 	assert(!IsNativeDelta(true, baseIdentity, baseIdentity));
 	assert(IsNativeDelta(false, "", "late-registration-sha256"));
 
+	std::unordered_set<std::string> nativeDeltaIndex;
+	UpdateNativeDeltaIndex(nativeDeltaIndex, std::string("lua/hot.lua"),
+		IsNativeDelta(true, baseIdentity, "hotfix-sha256"));
+	assert(nativeDeltaIndex.count("lua/hot.lua") == 1);
+	UpdateNativeDeltaIndex(nativeDeltaIndex, std::string("lua/hot.lua"),
+		IsNativeDelta(true, baseIdentity, baseIdentity));
+	assert(nativeDeltaIndex.empty());
+	UpdateNativeDeltaIndex(nativeDeltaIndex, std::string("lua/late.lua"),
+		IsNativeDelta(false, "", "late-registration-sha256"));
+	assert(nativeDeltaIndex.count("lua/late.lua") == 1);
+
+	// Disabling capture invalidates every immutable-base identity. Re-enable then
+	// proves each path exact or native as the registration sweep recaptures it.
+	std::unordered_map<std::string, std::string> preservedBase{
+		{"lua/a.lua", "base-a"},
+		{"lua/b.lua", "base-b"},
+	};
+	MarkBasePathsNative(nativeDeltaIndex, preservedBase);
+	assert(nativeDeltaIndex.count("lua/a.lua") == 1);
+	assert(nativeDeltaIndex.count("lua/b.lua") == 1);
+	UpdateNativeDeltaIndex(nativeDeltaIndex, std::string("lua/a.lua"), false);
+	UpdateNativeDeltaIndex(nativeDeltaIndex, std::string("lua/b.lua"), true);
+	assert(nativeDeltaIndex.count("lua/a.lua") == 0);
+	assert(nativeDeltaIndex.count("lua/b.lua") == 1);
+
+	assert(SelectBaselineHashDisposition(true, true) ==
+		BaselineHashDisposition::ReusePublished);
+	assert(SelectBaselineHashDisposition(true, false) ==
+		BaselineHashDisposition::ReusePublished);
+	assert(SelectBaselineHashDisposition(false, true) ==
+		BaselineHashDisposition::OverrideCached);
+	assert(SelectBaselineHashDisposition(false, false) ==
+		BaselineHashDisposition::OverrideComputed);
+
 	// A JIP delta hash is already present in its mixed server-info baseline. Do not
 	// send the same hash again before the body (that can stall signon), but do send
 	// after a global canonical update or when a later hotfix changes the identity.
