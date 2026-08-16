@@ -64,6 +64,10 @@ static ConVar gmoddatapack_luapack_baseline_warn_ms(
 	"holylib_gmoddatapack_luapack_baseline_warn_ms", "10", FCVAR_ARCHIVE,
 	"Log LuaPack SendServerInfo baselines whose preparation plus engine serialization reaches this many milliseconds",
 	true, 0.0f, true, 60000.0f);
+static ConVar gmoddatapack_luapack_serverinfo_budget(
+	"holylib_gmoddatapack_luapack_serverinfo_budget", "1", FCVAR_ARCHIVE,
+	"Maximum LuaPack SendServerInfo baselines executed globally per server frame",
+	true, 1.0f, true, 16.0f);
 
 static CGModDataPackModule g_pGModDataPackModule;
 IModule* pGModDataPackModule = &g_pGModDataPackModule;
@@ -129,6 +133,43 @@ struct ClientRequiredStubQueue
 static std::array<ClientRequiredStubQueue, ABSOLUTE_PLAYER_LIMIT> g_clientRequiredStubQueues;
 static HolyLib::LuaPack::Policy::RequiredStubScheduler<ABSOLUTE_PLAYER_LIMIT>
 	g_requiredStubScheduler;
+
+struct PendingLuaPackServerInfo
+{
+	CBaseClient* client = nullptr;
+	INetChannel* channel = nullptr;
+	int userID = 0;
+	int clientChallenge = 0;
+	double queuedAt = 0.0;
+	unsigned int coalescedPolls = 0;
+
+	void Reset()
+	{
+		client = nullptr;
+		channel = nullptr;
+		userID = 0;
+		clientChallenge = 0;
+		queuedAt = 0.0;
+		coalescedPolls = 0;
+	}
+};
+
+// This is a work scheduler, not another connection-admission queue. The engine's
+// m_bSendServerInfo remains authoritative, while one fixed-capacity slot record
+// prevents a join flood from running every non-preemptible baseline in one frame.
+static std::array<PendingLuaPackServerInfo, ABSOLUTE_PLAYER_LIMIT>
+	g_pendingLuaPackServerInfos;
+static HolyLib::LuaPack::Policy::RoundRobinSlotScheduler<ABSOLUTE_PLAYER_LIMIT>
+	g_luaPackServerInfoScheduler;
+
+static void ClearQueuedLuaPackServerInfo(int slot)
+{
+	if (slot < 0 || slot >= ABSOLUTE_PLAYER_LIMIT)
+		return;
+
+	g_luaPackServerInfoScheduler.Unschedule(slot);
+	g_pendingLuaPackServerInfos[slot].Reset();
+}
 
 static void ClearClientRequiredStubQueue(int slot)
 {
@@ -201,11 +242,15 @@ static void ReportRequiredStubQueue(int slot)
 }
 
 static void DrainRequiredStubQueues();
+#if defined(SYSTEM_LINUX)
+static void DrainQueuedLuaPackServerInfos();
+#endif
 
 static void ClearClientLuaDeliveryState(int slot)
 {
 	if (slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT)
 	{
+		ClearQueuedLuaPackServerInfo(slot);
 		g_clientNativeLuaHashes[slot].clear();
 		g_clientHashUpdatesPending[slot].clear();
 		ClearClientPinnedRequiredDeliveryState(slot);
@@ -1836,7 +1881,53 @@ static bool EnsureRequiredLuaReliableCapacity(CBaseClient* client, int slot,
 	return true;
 }
 
-static bool hook_CBaseClient_SendServerInfo(CBaseClient* client)
+static bool QueueLuaPackServerInfo(CBaseClient* client)
+{
+	if (!client)
+		return false;
+
+	const int slot = client->GetPlayerSlot();
+	INetChannel* channel = client->GetNetChannel();
+	if (!HolyLib::LuaPack::Policy::ShouldScheduleLuaPackServerInfo(
+		HolyLib::LuaPack::IsEnabled(),
+		HolyLib::LuaPack::SupportsCanonicalRegistration(),
+		client->m_bSendServerInfo,
+		client->m_nSignonState == SIGNONSTATE_CONNECTED,
+		slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT, channel != nullptr))
+	{
+		return false;
+	}
+
+	PendingLuaPackServerInfo& pending = g_pendingLuaPackServerInfos[slot];
+	if (g_luaPackServerInfoScheduler.IsScheduled(slot) &&
+		pending.client == client && pending.channel == channel &&
+		pending.userID == client->m_UserID &&
+		pending.clientChallenge == client->m_clientChallenge)
+	{
+		++pending.coalescedPolls;
+		return true;
+	}
+
+	// A slot can be reused before every late callback has run. Cancel the predecessor
+	// and append the successor at the tail so a churned slot cannot inherit priority.
+	if (g_luaPackServerInfoScheduler.IsScheduled(slot))
+		g_luaPackServerInfoScheduler.Unschedule(slot);
+	pending.client = client;
+	pending.channel = channel;
+	pending.userID = client->m_UserID;
+	pending.clientChallenge = client->m_clientChallenge;
+	pending.queuedAt = Plat_FloatTime();
+	pending.coalescedPolls = 0;
+	if (!g_luaPackServerInfoScheduler.Schedule(slot))
+	{
+		pending.Reset();
+		return false;
+	}
+	return true;
+}
+
+static bool SendLuaPackServerInfoNow(CBaseClient* client,
+	double queuedMilliseconds, unsigned int coalescedPolls)
 {
 	VPROF_BUDGET("HolyLib - LuaPack SendServerInfo", VPROF_BUDGETGROUP_HOLYLIB);
 	const double totalStartedAt = Plat_FloatTime();
@@ -1897,13 +1988,78 @@ static bool hook_CBaseClient_SendServerInfo(CBaseClient* client)
 	const double totalMilliseconds = (Plat_FloatTime() - totalStartedAt) * 1000.0;
 	if (totalMilliseconds >= gmoddatapack_luapack_baseline_warn_ms.GetFloat())
 	{
-		Warning(PROJECT_NAME " - luapack: slow SendServerInfo baseline slot %i action %i: %u file(s), %u published + %u cached + %u computed hash(es), %u override(s), %.3f ms prepare / %.3f ms engine / %.3f ms total\n",
+		Warning(PROJECT_NAME " - luapack: slow SendServerInfo baseline slot %i action %i: %u file(s), %u published + %u cached + %u computed hash(es), %u override(s), %.3f ms prepare / %.3f ms engine / %.3f ms total after %.3f ms queued (%u coalesced poll(s))\n",
 			slot, static_cast<int>(baseline.action), clientBaseline.FileCount(),
 			clientBaseline.PublishedHashCount(), clientBaseline.CachedHashCount(),
 			clientBaseline.ComputedHashCount(), clientBaseline.OverrideCount(),
-			preparationMilliseconds, engineMilliseconds, totalMilliseconds);
+			preparationMilliseconds, engineMilliseconds, totalMilliseconds,
+			queuedMilliseconds, coalescedPolls);
 	}
 	return result;
+}
+
+static bool hook_CBaseClient_SendServerInfo(CBaseClient* client)
+{
+	VPROF_BUDGET("HolyLib - LuaPack queue SendServerInfo", VPROF_BUDGETGROUP_HOLYLIB);
+	if (QueueLuaPackServerInfo(client))
+	{
+		// The engine clears m_bSendServerInfo only inside the real call, and all known
+		// callers ignore this return or interpret false as terminal failure. Report the
+		// deferred request as accepted while leaving its authoritative flag untouched.
+		return true;
+	}
+	return SendLuaPackServerInfoNow(client, 0.0, 0);
+}
+
+static CBaseClient* ResolveQueuedLuaPackServerInfoClient(int slot)
+{
+#if MODULE_EXISTS_GAMESERVER
+	return Gameserver_GetClientBySlot(slot);
+#else
+	return Util::server ? Util::GetClientByIndex(slot) : nullptr;
+#endif
+}
+
+static void DrainQueuedLuaPackServerInfos()
+{
+	const unsigned int budget = static_cast<unsigned int>(
+		(std::max)(1, gmoddatapack_luapack_serverinfo_budget.GetInt()));
+	const std::size_t queuedAtFrameStart = g_luaPackServerInfoScheduler.Size();
+	std::size_t inspected = 0;
+	unsigned int serviced = 0;
+
+	while (serviced < budget && inspected < queuedAtFrameStart &&
+		!g_luaPackServerInfoScheduler.Empty())
+	{
+		const int slot = g_luaPackServerInfoScheduler.TakeNext();
+		++inspected;
+		if (slot < 0 || slot >= ABSOLUTE_PLAYER_LIMIT)
+			continue;
+
+		const PendingLuaPackServerInfo pending = g_pendingLuaPackServerInfos[slot];
+		g_pendingLuaPackServerInfos[slot].Reset();
+		CBaseClient* current = ResolveQueuedLuaPackServerInfoClient(slot);
+		if (!current ||
+			!HolyLib::LuaPack::Policy::QueuedServerInfoIdentityMatches(
+				current == pending.client,
+				current->GetNetChannel() == pending.channel,
+				current->GetPlayerSlot() == slot,
+				current->m_UserID == pending.userID,
+				current->m_clientChallenge == pending.clientChallenge,
+				current->m_nSignonState == SIGNONSTATE_CONNECTED,
+				current->m_bSendServerInfo))
+		{
+			continue;
+		}
+
+		++serviced;
+		const double queuedMilliseconds = pending.queuedAt > 0.0
+			? (Plat_FloatTime() - pending.queuedAt) * 1000.0 : 0.0;
+		// The token was removed before execution. A false result disconnects inside
+		// the engine/current LuaPack path and is deliberately terminal, not retried.
+		(void)SendLuaPackServerInfoNow(current, queuedMilliseconds,
+			pending.coalescedPolls);
+	}
 }
 #endif
 
@@ -2912,6 +3068,13 @@ void CGModDataPackModule::Think(bool bSimulating)
 			pEntry->hashPublished = true;
 		}
 	}
+
+	// ServerInfo serializes the complete Lua string-table baseline atomically. Admit
+	// only the configured number of already-accepted physical/parked clients here,
+	// after registration publication and before any requested bodies are drained.
+#if defined(SYSTEM_LINUX)
+	DrainQueuedLuaPackServerInfos();
+#endif
 
 	// Required placeholders use the engine's reliable stream, but never all from
 	// inside one inbound CNetChan::ProcessMessages call. This global fair drain is

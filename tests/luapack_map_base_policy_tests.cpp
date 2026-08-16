@@ -142,6 +142,29 @@ int main()
 		assert(recovery.Consume(accountA, 102, 13.0) == RecoveryConsumeResult::RetryExhausted);
 	}
 
+	// A late authenticated reconnect gets one full but finite scheduler window after
+	// its exact ServerInfo request is claimed; it cannot become an immortal slot token.
+	{
+		RequiredRecoveryHandoff delayed;
+		assert(delayed.Queue(accountA, 103, 0.0, 15.0));
+		assert(delayed.TryInvoke(accountA, 103, true, true, 1.0) ==
+			RecoveryHandoffResult::Invoke);
+		assert(delayed.TryDispatchServerInfo(accountA, true, true, true, 14.0) ==
+			RecoveryHandoffResult::DispatchServerInfo);
+		assert(delayed.BeginBaseline(accountA, true, 28.9) ==
+			RecoveryHandoffResult::BeginBaseline);
+
+		RequiredRecoveryHandoff expired;
+		assert(expired.Queue(accountA, 104, 0.0, 15.0));
+		assert(expired.TryInvoke(accountA, 104, true, true, 1.0) ==
+			RecoveryHandoffResult::Invoke);
+		assert(expired.TryDispatchServerInfo(accountA, true, true, true, 14.0) ==
+			RecoveryHandoffResult::DispatchServerInfo);
+		assert(expired.BeginBaseline(accountA, true, 29.0) ==
+			RecoveryHandoffResult::Expired);
+		assert(!expired.Pending());
+	}
+
 	// CGameClient::Reconnect can begin the native ServerInfo baseline before the old
 	// game-layer disconnect/connect callbacks finish. Those late callbacks and commands
 	// must preserve the consumed native epoch; the lower-level physical disconnect still
@@ -390,6 +413,71 @@ int main()
 		requiredScheduler.Schedule(0);
 		requiredScheduler.Reset();
 		assert(requiredScheduler.Empty());
+
+		// SendServerInfo admission uses the same fixed-capacity FIFO but one global
+		// budget across physical and parked slots. Repeated polls never move an older
+		// request, and finite mixed floods drain without starvation.
+		RoundRobinSlotScheduler<256> serverInfoScheduler;
+		for (int slot = 0; slot < 60; ++slot)
+			assert(serverInfoScheduler.Schedule(slot));
+		for (int slot = 128; slot < 188; ++slot)
+			assert(serverInfoScheduler.Schedule(slot));
+		assert(!serverInfoScheduler.Schedule(0));
+		std::array<bool, 256> serviced{};
+		unsigned int frames = 0;
+		while (!serverInfoScheduler.Empty())
+		{
+			unsigned int servicedThisFrame = 0;
+			while (servicedThisFrame < 1 && !serverInfoScheduler.Empty())
+			{
+				const int slot = serverInfoScheduler.TakeNext();
+				assert(slot >= 0 && slot < 256);
+				assert(!serviced[static_cast<std::size_t>(slot)]);
+				serviced[static_cast<std::size_t>(slot)] = true;
+				++servicedThisFrame;
+			}
+			assert(servicedThisFrame <= 1);
+			++frames;
+		}
+		assert(frames == 120);
+		for (int slot = 0; slot < 60; ++slot)
+			assert(serviced[static_cast<std::size_t>(slot)]);
+		for (int slot = 128; slot < 188; ++slot)
+			assert(serviced[static_cast<std::size_t>(slot)]);
+
+		// A stale head can be discarded without consuming the execution budget; the
+		// next exact token remains serviceable in that same frame.
+		assert(serverInfoScheduler.Schedule(7));
+		assert(serverInfoScheduler.Schedule(9));
+		serverInfoScheduler.Unschedule(7);
+		assert(serverInfoScheduler.Schedule(7));
+		assert(serverInfoScheduler.TakeNext() == 9);
+		assert(serverInfoScheduler.TakeNext() == 7);
+		assert(serverInfoScheduler.Schedule(7));
+		assert(serverInfoScheduler.Schedule(9));
+		assert(serverInfoScheduler.TakeNext() == 7);
+		assert(serverInfoScheduler.TakeNext() == 9);
+		assert(serverInfoScheduler.Empty());
+		assert(serverInfoScheduler.Schedule(7));
+		assert(serverInfoScheduler.TakeNext() == 7);
+		serverInfoScheduler.Reset();
+		assert(serverInfoScheduler.Empty());
+
+		assert(ShouldScheduleLuaPackServerInfo(true, true, true, true, true, true));
+		assert(!ShouldScheduleLuaPackServerInfo(false, true, true, true, true, true));
+		assert(!ShouldScheduleLuaPackServerInfo(true, false, true, true, true, true));
+		assert(!ShouldScheduleLuaPackServerInfo(true, true, false, true, true, true));
+		assert(!ShouldScheduleLuaPackServerInfo(true, true, true, false, true, true));
+		assert(!ShouldScheduleLuaPackServerInfo(true, true, true, true, false, true));
+		assert(!ShouldScheduleLuaPackServerInfo(true, true, true, true, true, false));
+		assert(QueuedServerInfoIdentityMatches(true, true, true, true, true, true, true));
+		assert(!QueuedServerInfoIdentityMatches(false, true, true, true, true, true, true));
+		assert(!QueuedServerInfoIdentityMatches(true, false, true, true, true, true, true));
+		assert(!QueuedServerInfoIdentityMatches(true, true, false, true, true, true, true));
+		assert(!QueuedServerInfoIdentityMatches(true, true, true, false, true, true, true));
+		assert(!QueuedServerInfoIdentityMatches(true, true, true, true, false, true, true));
+		assert(!QueuedServerInfoIdentityMatches(true, true, true, true, true, false, true));
+		assert(!QueuedServerInfoIdentityMatches(true, true, true, true, true, true, false));
 
 		// A global budget advances clients in round-robin order instead of letting the
 		// first cold join monopolize a frame.

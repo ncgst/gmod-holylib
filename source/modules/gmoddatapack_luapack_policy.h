@@ -105,8 +105,11 @@ namespace HolyLib::LuaPack::Policy
 		PinnedCanonicalFileSet<Capacity> queued;
 	};
 
+	// Fixed-capacity, allocation-bounded FIFO for per-slot work. A slot can be
+	// scheduled only once, so repeated engine polls coalesce without moving an
+	// older client behind newly arriving work.
 	template <std::size_t SlotCount>
-	class RequiredStubScheduler
+	class RoundRobinSlotScheduler
 	{
 	public:
 		bool Schedule(int slot)
@@ -168,6 +171,25 @@ namespace HolyLib::LuaPack::Policy
 		std::deque<int> active;
 		std::bitset<SlotCount> scheduled;
 	};
+
+	template <std::size_t SlotCount>
+	using RequiredStubScheduler = RoundRobinSlotScheduler<SlotCount>;
+
+	constexpr bool ShouldScheduleLuaPackServerInfo(bool enabled,
+		bool canonicalRegistration, bool sendServerInfoPending,
+		bool connectedState, bool validSlot, bool channelReady)
+	{
+		return enabled && canonicalRegistration && sendServerInfoPending &&
+			connectedState && validSlot && channelReady;
+	}
+
+	constexpr bool QueuedServerInfoIdentityMatches(bool sameClient,
+		bool sameChannel, bool sameSlot, bool sameUserID,
+		bool sameChallenge, bool connectedState, bool sendServerInfoPending)
+	{
+		return sameClient && sameChannel && sameSlot && sameUserID &&
+			sameChallenge && connectedState && sendServerInfoPending;
+	}
 
 	constexpr bool CanUsePinnedRequiredStub(bool enabled, bool canonicalRegistration,
 		bool filePinned, bool payloadAvailable, std::size_t compressedBytes)
@@ -452,6 +474,7 @@ namespace HolyLib::LuaPack::Policy
 				return false;
 			account = inputAccount;
 			failedConnection = inputConnection;
+			windowSeconds = window;
 			expiresAt = now + window;
 			phase = RecoveryHandoffPhase::Queued;
 			return true;
@@ -509,6 +532,9 @@ namespace HolyLib::LuaPack::Policy
 			if (!signonRestarted)
 				return RecoveryHandoffResult::NotReady;
 			phase = RecoveryHandoffPhase::ServerInfoClaimed;
+			// Authentication/reconnect may have consumed most of the dispatch window.
+			// Give the accepted baseline work one full, still-finite scheduler window.
+			expiresAt = now + windowSeconds;
 			return RecoveryHandoffResult::DispatchServerInfo;
 		}
 
@@ -538,6 +564,7 @@ namespace HolyLib::LuaPack::Policy
 			phase = RecoveryHandoffPhase::Empty;
 			account = 0;
 			failedConnection = 0;
+			windowSeconds = 0.0;
 			expiresAt = 0.0;
 		}
 
@@ -575,6 +602,7 @@ namespace HolyLib::LuaPack::Policy
 		RecoveryHandoffPhase phase = RecoveryHandoffPhase::Empty;
 		std::uint64_t account = 0;
 		std::uint64_t failedConnection = 0;
+		double windowSeconds = 0.0;
 		double expiresAt = 0.0;
 	};
 
