@@ -190,8 +190,9 @@ struct LuaPackRegistrationRefresh
 	{
 		active = true;
 		captureForMapBase = capture;
-		nextFileID = 0;
 		targetFileCount = (std::max)(0, fileCount);
+		nextFileID = static_cast<int>(HolyLib::LuaPack::Policy::FirstClientLuaRegistration(
+			static_cast<std::size_t>(targetFileCount)));
 		registeredInitName.clear();
 		initRefreshed = false;
 		initialPassComplete = false;
@@ -3189,7 +3190,9 @@ void CGModDataPackModule::Think(bool bSimulating)
 			refresh.pendingSourceHashFileIDs.size()))
 		{
 			Msg(PROJECT_NAME " - luapack: registration refresh published %u/%u file(s) over %u frame(s) in %.3f ms wall time\n",
-				refresh.refreshed, static_cast<unsigned int>(refresh.targetFileCount),
+				refresh.refreshed, static_cast<unsigned int>(
+					HolyLib::LuaPack::Policy::ClientLuaRegistrationCount(
+						static_cast<std::size_t>(refresh.targetFileCount))),
 				refresh.frames, (Plat_FloatTime() - refresh.startedAt) * 1000.0);
 			refresh.Reset();
 			HolyLib::LuaPack::CompleteRegistrationRefresh();

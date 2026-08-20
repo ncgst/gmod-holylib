@@ -193,6 +193,19 @@ namespace HolyLib::LuaPack::Policy
 		return budget >= total - next ? total : next + budget;
 	}
 
+	// client_lua_files reserves string-table index 0 for the engine's "paths"
+	// sentinel. It has no Lua source and must never participate in a registration
+	// refresh or its retry set.
+	constexpr std::size_t FirstClientLuaRegistration(std::size_t registeredStrings)
+	{
+		return registeredStrings == 0 ? 0 : 1;
+	}
+
+	constexpr std::size_t ClientLuaRegistrationCount(std::size_t registeredStrings)
+	{
+		return registeredStrings == 0 ? 0 : registeredStrings - 1;
+	}
+
 	constexpr bool CanCompleteRegistrationRefresh(bool initialPassComplete,
 		bool initRefreshed, std::size_t unresolvedFiles,
 		std::size_t pendingSourceHashes)

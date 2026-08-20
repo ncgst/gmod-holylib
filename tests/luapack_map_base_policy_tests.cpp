@@ -479,19 +479,31 @@ int main()
 		assert(BoundedRegistrationRefreshEnd(7, 20, 0) == 7);
 		assert(BoundedRegistrationRefreshEnd(0, 20, 64) == 20);
 		assert(BoundedRegistrationRefreshEnd(128, 5048, 64) == 192);
-		std::size_t refreshNext = 0;
+		assert(FirstClientLuaRegistration(0) == 0);
+		assert(FirstClientLuaRegistration(1) == 1);
+		assert(FirstClientLuaRegistration(5050) == 1);
+		assert(ClientLuaRegistrationCount(0) == 0);
+		assert(ClientLuaRegistrationCount(1) == 0);
+		assert(ClientLuaRegistrationCount(5050) == 5049);
+		// Production client_lua_files includes the non-file "paths" sentinel at ID 0.
+		// It must not consume refresh work or become an immortal unresolved source.
+		constexpr std::size_t registeredStrings = 5050;
+		std::size_t refreshNext = FirstClientLuaRegistration(registeredStrings);
 		std::size_t refreshFrames = 0;
 		std::size_t refreshPeakBatch = 0;
-		while (refreshNext < 5048)
+		std::size_t refreshedFiles = 0;
+		while (refreshNext < registeredStrings)
 		{
 			const std::size_t refreshEnd = BoundedRegistrationRefreshEnd(
-				refreshNext, 5048, 64);
+				refreshNext, registeredStrings, 64);
 			assert(refreshEnd > refreshNext);
 			refreshPeakBatch = (std::max)(refreshPeakBatch, refreshEnd - refreshNext);
+			refreshedFiles += refreshEnd - refreshNext;
 			refreshNext = refreshEnd;
 			++refreshFrames;
 		}
-		assert(refreshNext == 5048);
+		assert(refreshNext == registeredStrings);
+		assert(refreshedFiles == ClientLuaRegistrationCount(registeredStrings));
 		assert(refreshFrames == 79);
 		assert(refreshPeakBatch == 64);
 		assert(CanCompleteRegistrationRefresh(true, true, 0, 0));
