@@ -176,11 +176,35 @@ namespace HolyLib::LuaPack::Policy
 	using RequiredStubScheduler = RoundRobinSlotScheduler<SlotCount>;
 
 	constexpr bool ShouldScheduleLuaPackServerInfo(bool enabled,
-		bool canonicalRegistration, bool sendServerInfoPending,
+		bool canonicalRegistration, bool registrationRefreshPending,
+		bool sendServerInfoPending,
 		bool connectedState, bool validSlot, bool channelReady)
 	{
-		return enabled && canonicalRegistration && sendServerInfoPending &&
+		return (registrationRefreshPending || (enabled && canonicalRegistration)) &&
+			sendServerInfoPending &&
 			connectedState && validSlot && channelReady;
+	}
+
+	constexpr std::size_t BoundedRegistrationRefreshEnd(std::size_t next,
+		std::size_t total, std::size_t budget)
+	{
+		if (next >= total || budget == 0)
+			return (std::min)(next, total);
+		return budget >= total - next ? total : next + budget;
+	}
+
+	constexpr bool CanCompleteRegistrationRefresh(bool initialPassComplete,
+		bool initRefreshed, std::size_t unresolvedFiles,
+		std::size_t pendingSourceHashes)
+	{
+		return initialPassComplete && initRefreshed && unresolvedFiles == 0 &&
+			pendingSourceHashes == 0;
+	}
+
+	constexpr bool InitialMapBasePending(bool enabled, bool required,
+		bool currentBaseAvailable, bool baseWorkPending)
+	{
+		return enabled && required && !currentBaseAvailable && baseWorkPending;
 	}
 
 	constexpr bool QueuedServerInfoIdentityMatches(bool sameClient,

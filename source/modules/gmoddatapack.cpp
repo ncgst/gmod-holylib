@@ -68,6 +68,10 @@ static ConVar gmoddatapack_luapack_serverinfo_budget(
 	"holylib_gmoddatapack_luapack_serverinfo_budget", "1", FCVAR_ARCHIVE,
 	"Maximum LuaPack SendServerInfo baselines executed globally per server frame",
 	true, 1.0f, true, 16.0f);
+static ConVar gmoddatapack_luapack_registration_refresh_budget(
+	"holylib_gmoddatapack_luapack_registration_refresh_budget", "64", FCVAR_ARCHIVE,
+	"Maximum Lua registrations reprocessed per server frame after a LuaPack mode transition",
+	true, 1.0f, true, 1024.0f);
 
 static CGModDataPackModule g_pGModDataPackModule;
 IModule* pGModDataPackModule = &g_pGModDataPackModule;
@@ -161,6 +165,71 @@ static std::array<PendingLuaPackServerInfo, ABSOLUTE_PLAYER_LIMIT>
 	g_pendingLuaPackServerInfos;
 static HolyLib::LuaPack::Policy::RoundRobinSlotScheduler<ABSOLUTE_PLAYER_LIMIT>
 	g_luaPackServerInfoScheduler;
+
+struct LuaPackRegistrationRefresh
+{
+	bool active = false;
+	bool captureForMapBase = false;
+	int nextFileID = 0;
+	int targetFileCount = 0;
+	std::string registeredInitName;
+	bool initRefreshed = false;
+	bool initialPassComplete = false;
+	bool waitingWarningEmitted = false;
+	std::vector<int> unresolvedFileIDs;
+	std::vector<int> retryFileIDs;
+	std::size_t nextUnresolved = 0;
+	std::vector<int> pendingSourceHashFileIDs;
+	std::vector<int> retrySourceHashFileIDs;
+	std::size_t nextSourceHash = 0;
+	unsigned int refreshed = 0;
+	unsigned int frames = 0;
+	double startedAt = 0.0;
+
+	void Begin(int fileCount, bool capture)
+	{
+		active = true;
+		captureForMapBase = capture;
+		nextFileID = 0;
+		targetFileCount = (std::max)(0, fileCount);
+		registeredInitName.clear();
+		initRefreshed = false;
+		initialPassComplete = false;
+		waitingWarningEmitted = false;
+		unresolvedFileIDs.clear();
+		retryFileIDs.clear();
+		nextUnresolved = 0;
+		pendingSourceHashFileIDs.clear();
+		retrySourceHashFileIDs.clear();
+		nextSourceHash = 0;
+		refreshed = 0;
+		frames = 0;
+		startedAt = Plat_FloatTime();
+	}
+
+	void Reset()
+	{
+		active = false;
+		captureForMapBase = false;
+		nextFileID = 0;
+		targetFileCount = 0;
+		registeredInitName.clear();
+		initRefreshed = false;
+		initialPassComplete = false;
+		waitingWarningEmitted = false;
+		unresolvedFileIDs.clear();
+		retryFileIDs.clear();
+		nextUnresolved = 0;
+		pendingSourceHashFileIDs.clear();
+		retrySourceHashFileIDs.clear();
+		nextSourceHash = 0;
+		refreshed = 0;
+		frames = 0;
+		startedAt = 0.0;
+	}
+};
+
+static LuaPackRegistrationRefresh g_luaPackRegistrationRefresh;
 
 static void ClearQueuedLuaPackServerInfo(int slot)
 {
@@ -1180,11 +1249,11 @@ public:
 		pEntry.content = HolyLib::LuaPack::PrepareVanillaFile(fileName, content);
 		if (bLuaPackEnabled)
 		{
-			// LuaPack baseline selection needs both identities without hashing the full
-			// corpus per join. Its passthrough mode cannot mutate either byte stream.
+			// Publish the small canonical body immediately, but leave full native-source
+			// hashing to the compression worker. Hashing an entire large registration set
+			// inside one transition frame can trip the server freeze watchdog.
 			pEntry.contentHash = HashClientLuaString(pEntry.content);
-			pEntry.sourceHash = HashClientLuaString(pEntry.sourceContent);
-			pEntry.sourceHashReady = true;
+			pEntry.sourceHashReady = false;
 			pEntry.contentHashReady = true;
 		}
 		else
@@ -1283,6 +1352,12 @@ public:
 
 	bool CompressFile(LuaPackEntry* pEntry, int fileID)
 	{
+		if (pEntry->luapackPassthrough && pEntry->hasSourceContent &&
+			!pEntry->sourceHashReady)
+		{
+			pEntry->sourceHash = HashClientLuaString(pEntry->sourceContent);
+			pEntry->sourceHashReady = true;
+		}
 		bool bSuccess = pEntry->Compress();
 		if (!bSuccess)
 			Warning(PROJECT_NAME " - gmoddatapack: Failed to compress lua file %i\n", fileID);
@@ -1891,6 +1966,7 @@ static bool QueueLuaPackServerInfo(CBaseClient* client)
 	if (!HolyLib::LuaPack::Policy::ShouldScheduleLuaPackServerInfo(
 		HolyLib::LuaPack::IsEnabled(),
 		HolyLib::LuaPack::SupportsCanonicalRegistration(),
+		HolyLib::LuaPack::RegistrationRefreshPending(),
 		client->m_bSendServerInfo,
 		client->m_nSignonState == SIGNONSTATE_CONNECTED,
 		slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT, channel != nullptr))
@@ -2022,6 +2098,9 @@ static CBaseClient* ResolveQueuedLuaPackServerInfoClient(int slot)
 
 static void DrainQueuedLuaPackServerInfos()
 {
+	if (HolyLib::LuaPack::BaselinePreparationPending())
+		return;
+
 	const unsigned int budget = static_cast<unsigned int>(
 		(std::max)(1, gmoddatapack_luapack_serverinfo_budget.GetInt()));
 	const std::size_t queuedAtFrameStart = g_luaPackServerInfoScheduler.Size();
@@ -2952,62 +3031,103 @@ void CGModDataPackModule::Think(bool bSimulating)
 	if (g_pDataPack && g_pDataPack->m_pClientLuaFiles && Lua::GetShared() &&
 		HolyLib::LuaPack::ConsumeBootstrapRefresh())
 	{
-		// A feature or hook-capability transition changes the registered byte identity.
-		// Re-feed every path in both directions: AddFileContents keeps exact source/mode
-		// matches ready, but invalidates stale native/canonical compressed bodies. A request
-		// that arrives before the worker catches up takes the existing synchronous path.
-		const bool captureForMapBase = HolyLib::LuaPack::IsEnabled();
-		std::string registeredInitName;
-		bool initRefreshed = false;
-		unsigned int missingSources = 0;
-		if (g_pDataPack && g_pDataPack->m_pClientLuaFiles)
-		{
-			for (int fileID = 0; fileID < g_pDataPack->m_pClientLuaFiles->GetNumStrings(); ++fileID)
-			{
-				const char* fileName = g_pDataPack->m_pClientLuaFiles->GetString(fileID);
-				if (!fileName || fileName[0] == '\0')
-					continue;
-				const bool initFile = HolyLib::LuaPack::IsInitFile(fileName);
-				if (initFile)
-					registeredInitName = fileName;
+		// A feature or hook-capability transition changes every registered byte identity.
+		// Keep that work out of one non-preemptible frame: the 5k-file DarkRP corpus can
+		// otherwise exceed the server's freeze-watchdog threshold during cold boot.
+		g_luaPackRegistrationRefresh.Begin(
+			g_pDataPack->m_pClientLuaFiles->GetNumStrings(),
+			HolyLib::LuaPack::IsEnabled());
+	}
 
-				GarrysMod::Lua::LuaFile* file = Lua::GetShared()->GetCache(fileName);
-				std::string source;
-				bool hasSource = false;
-				if (file)
+	if (g_luaPackRegistrationRefresh.active && g_pDataPack &&
+		g_pDataPack->m_pClientLuaFiles && Lua::GetShared())
+	{
+		LuaPackRegistrationRefresh& refresh = g_luaPackRegistrationRefresh;
+		++refresh.frames;
+		const std::size_t budget = static_cast<std::size_t>((std::max)(1,
+			gmoddatapack_luapack_registration_refresh_budget.GetInt()));
+		auto refreshFile = [&](int fileID) -> bool
+		{
+			const char* fileName = g_pDataPack->m_pClientLuaFiles->GetString(fileID);
+			if (!fileName || fileName[0] == '\0')
+				return true;
+			const bool initFile = HolyLib::LuaPack::IsInitFile(fileName);
+			if (initFile)
+				refresh.registeredInitName = fileName;
+
+			GarrysMod::Lua::LuaFile* file = Lua::GetShared()->GetCache(fileName);
+			std::string source;
+			bool hasSource = false;
+			if (file)
+			{
+				source = file->contents;
+				hasSource = true;
+			}
+			else if (LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID))
+			{
+				std::shared_lock<std::shared_mutex> lock(entry->mutex);
+				if (entry->hasSourceContent)
 				{
-					source = file->contents;
+					source = entry->sourceContent;
 					hasSource = true;
 				}
-				else if (LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID))
+			}
+
+			if (!hasSource)
+				return false;
+			if (refresh.captureForMapBase)
+				HolyLib::LuaPack::CaptureFileContents(fileName, source);
+			g_pLuaDataPack.AddFileContents(fileName, source);
+			if (!g_pLuaDataPack.PublishRegistrationHash(fileID))
+				return false;
+			if (refresh.captureForMapBase)
+			{
+				LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID);
+				if (entry)
 				{
 					std::shared_lock<std::shared_mutex> lock(entry->mutex);
-					if (entry->hasSourceContent)
-					{
-						source = entry->sourceContent;
-						hasSource = true;
-					}
+					if (entry->hasSourceContent && !entry->sourceHashReady)
+						refresh.pendingSourceHashFileIDs.push_back(fileID);
 				}
+			}
+			++refresh.refreshed;
+			if (initFile)
+				refresh.initRefreshed = true;
+			return true;
+		};
 
-				if (!hasSource)
-				{
-					++missingSources;
-					continue;
-				}
-				if (captureForMapBase)
-					HolyLib::LuaPack::CaptureFileContents(fileName, source);
-				g_pLuaDataPack.AddFileContents(fileName, source);
-				if (!g_pLuaDataPack.PublishRegistrationHash(fileID))
-				{
-					++missingSources;
-					continue;
-				}
-				if (initFile)
-					initRefreshed = true;
+		if (!refresh.initialPassComplete)
+		{
+			const std::size_t end = HolyLib::LuaPack::Policy::BoundedRegistrationRefreshEnd(
+				static_cast<std::size_t>(refresh.nextFileID),
+				static_cast<std::size_t>(refresh.targetFileCount), budget);
+			while (static_cast<std::size_t>(refresh.nextFileID) < end)
+			{
+				const int fileID = refresh.nextFileID++;
+				if (!refreshFile(fileID))
+					refresh.unresolvedFileIDs.push_back(fileID);
+			}
+			refresh.initialPassComplete = refresh.nextFileID >= refresh.targetFileCount;
+		}
+		else if (!refresh.unresolvedFileIDs.empty())
+		{
+			const std::size_t end = HolyLib::LuaPack::Policy::BoundedRegistrationRefreshEnd(
+				refresh.nextUnresolved, refresh.unresolvedFileIDs.size(), budget);
+			while (refresh.nextUnresolved < end)
+			{
+				const int fileID = refresh.unresolvedFileIDs[refresh.nextUnresolved++];
+				if (!refreshFile(fileID))
+					refresh.retryFileIDs.push_back(fileID);
+			}
+			if (refresh.nextUnresolved >= refresh.unresolvedFileIDs.size())
+			{
+				refresh.unresolvedFileIDs = std::move(refresh.retryFileIDs);
+				refresh.retryFileIDs.clear();
+				refresh.nextUnresolved = 0;
 			}
 		}
 
-		if (!initRefreshed)
+		if (refresh.initialPassComplete && !refresh.initRefreshed)
 		{
 			// The registered init entry may carry an addon path while the shared cache exposes
 			// only the canonical alias. Preserve the string-table path when using that fallback.
@@ -3016,25 +3136,64 @@ void CGModDataPackModule::Think(bool bSimulating)
 				initFile = Lua::GetShared()->GetCache("lua/includes/init.lua");
 			if (initFile)
 			{
-				const std::string initPath = registeredInitName.empty()
-					? initFile->GetName() : registeredInitName;
-				if (captureForMapBase)
+				const std::string initPath = refresh.registeredInitName.empty()
+					? initFile->GetName() : refresh.registeredInitName;
+				if (refresh.captureForMapBase)
 					HolyLib::LuaPack::CaptureFileContents(initPath, initFile->contents);
 				g_pLuaDataPack.AddFileContents(initPath, initFile->contents);
-				const int initID = g_pDataPack && g_pDataPack->m_pClientLuaFiles
-					? g_pDataPack->m_pClientLuaFiles->FindStringIndex(initPath.c_str())
-					: INVALID_STRING_INDEX;
-				initRefreshed = initID != INVALID_STRING_INDEX &&
+				const int initID = g_pDataPack->m_pClientLuaFiles->FindStringIndex(initPath.c_str());
+				refresh.initRefreshed = initID != INVALID_STRING_INDEX &&
 					g_pLuaDataPack.PublishRegistrationHash(initID);
-				if (initRefreshed && !registeredInitName.empty() && missingSources > 0)
-					--missingSources;
 			}
 		}
-		if (!initRefreshed)
-			Warning(PROJECT_NAME " - luapack: the init file is not cached; registration refresh will wait for AddOrUpdateFile\n");
-		if (missingSources > 0)
-			Warning(PROJECT_NAME " - luapack: registration refresh could not recover %u source file(s); their next AddOrUpdateFile will repair them\n",
-				missingSources);
+
+		if (refresh.initialPassComplete &&
+			(!refresh.initRefreshed || !refresh.unresolvedFileIDs.empty()) &&
+			!refresh.waitingWarningEmitted)
+		{
+			Warning(PROJECT_NAME " - luapack: registration refresh is waiting for the init file and/or %u unavailable source file(s); pending baselines remain queued\n",
+				static_cast<unsigned int>(refresh.unresolvedFileIDs.size()));
+			refresh.waitingWarningEmitted = true;
+		}
+
+		if (refresh.initialPassComplete && refresh.initRefreshed &&
+			refresh.unresolvedFileIDs.empty() &&
+			!refresh.pendingSourceHashFileIDs.empty())
+		{
+			const std::size_t end = HolyLib::LuaPack::Policy::BoundedRegistrationRefreshEnd(
+				refresh.nextSourceHash, refresh.pendingSourceHashFileIDs.size(), budget);
+			while (refresh.nextSourceHash < end)
+			{
+				const int fileID = refresh.pendingSourceHashFileIDs[refresh.nextSourceHash++];
+				LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID);
+				bool ready = false;
+				if (entry)
+				{
+					std::shared_lock<std::shared_mutex> lock(entry->mutex);
+					ready = entry->hasSourceContent && entry->sourceHashReady;
+				}
+				if (!ready)
+					refresh.retrySourceHashFileIDs.push_back(fileID);
+			}
+			if (refresh.nextSourceHash >= refresh.pendingSourceHashFileIDs.size())
+			{
+				refresh.pendingSourceHashFileIDs = std::move(refresh.retrySourceHashFileIDs);
+				refresh.retrySourceHashFileIDs.clear();
+				refresh.nextSourceHash = 0;
+			}
+		}
+
+		if (HolyLib::LuaPack::Policy::CanCompleteRegistrationRefresh(
+			refresh.initialPassComplete, refresh.initRefreshed,
+			refresh.unresolvedFileIDs.size(),
+			refresh.pendingSourceHashFileIDs.size()))
+		{
+			Msg(PROJECT_NAME " - luapack: registration refresh published %u/%u file(s) over %u frame(s) in %.3f ms wall time\n",
+				refresh.refreshed, static_cast<unsigned int>(refresh.targetFileCount),
+				refresh.frames, (Plat_FloatTime() - refresh.startedAt) * 1000.0);
+			refresh.Reset();
+			HolyLib::LuaPack::CompleteRegistrationRefresh();
+		}
 	}
 
 	std::vector<int> stringTableUpdates;
@@ -3307,6 +3466,8 @@ void CGModDataPackModule::LevelShutdown()
 	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
 		ClearClientLuaDeliveryState(slot);
 	g_requiredStubScheduler.Reset();
+	g_luaPackServerInfoScheduler.Reset();
+	g_luaPackRegistrationRefresh.Reset();
 	HolyLib::LuaPack::LevelShutdown();
 	g_pLuaDataPack.Shutdown();
 }
@@ -3316,5 +3477,7 @@ void CGModDataPackModule::Shutdown()
 	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
 		ClearClientLuaDeliveryState(slot);
 	g_requiredStubScheduler.Reset();
+	g_luaPackServerInfoScheduler.Reset();
+	g_luaPackRegistrationRefresh.Reset();
 	HolyLib::LuaPack::Shutdown();
 }

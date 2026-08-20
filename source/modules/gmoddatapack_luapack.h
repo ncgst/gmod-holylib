@@ -97,6 +97,9 @@ namespace HolyLib::LuaPack
 	void CaptureFileContents(const std::string& virtualPath, const std::string& contents);
 	std::string PrepareVanillaFile(const std::string& virtualPath, const std::string& contents);
 	bool ConsumeBootstrapRefresh();
+	bool RegistrationRefreshPending();
+	bool BaselinePreparationPending();
+	void CompleteRegistrationRefresh();
 	BaselineDecision DecideBaselineForClient(int slot);
 	BaselineDecision DecideFileBaselineForClient(int slot, const std::string& virtualPath);
 	BaselineDecision DecidePinnedFileBaselineForClient(int slot, const std::string& virtualPath);

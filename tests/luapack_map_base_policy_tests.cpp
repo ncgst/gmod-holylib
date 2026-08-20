@@ -463,13 +463,47 @@ int main()
 		serverInfoScheduler.Reset();
 		assert(serverInfoScheduler.Empty());
 
-		assert(ShouldScheduleLuaPackServerInfo(true, true, true, true, true, true));
-		assert(!ShouldScheduleLuaPackServerInfo(false, true, true, true, true, true));
-		assert(!ShouldScheduleLuaPackServerInfo(true, false, true, true, true, true));
-		assert(!ShouldScheduleLuaPackServerInfo(true, true, false, true, true, true));
-		assert(!ShouldScheduleLuaPackServerInfo(true, true, true, false, true, true));
-		assert(!ShouldScheduleLuaPackServerInfo(true, true, true, true, false, true));
-		assert(!ShouldScheduleLuaPackServerInfo(true, true, true, true, true, false));
+		assert(ShouldScheduleLuaPackServerInfo(true, true, false, true, true, true, true));
+		assert(!ShouldScheduleLuaPackServerInfo(false, true, false, true, true, true, true));
+		assert(!ShouldScheduleLuaPackServerInfo(true, false, false, true, true, true, true));
+		// A native-mode transition still queues the engine baseline until every stale
+		// canonical registration has been restored to its native identity.
+		assert(ShouldScheduleLuaPackServerInfo(false, false, true, true, true, true, true));
+		assert(!ShouldScheduleLuaPackServerInfo(false, false, true, false, true, true, true));
+		assert(!ShouldScheduleLuaPackServerInfo(true, true, false, true, false, true, true));
+		assert(!ShouldScheduleLuaPackServerInfo(true, true, false, true, true, false, true));
+		assert(!ShouldScheduleLuaPackServerInfo(true, true, false, true, true, true, false));
+
+		assert(BoundedRegistrationRefreshEnd(0, 0, 64) == 0);
+		assert(BoundedRegistrationRefreshEnd(5, 3, 64) == 3);
+		assert(BoundedRegistrationRefreshEnd(7, 20, 0) == 7);
+		assert(BoundedRegistrationRefreshEnd(0, 20, 64) == 20);
+		assert(BoundedRegistrationRefreshEnd(128, 5048, 64) == 192);
+		std::size_t refreshNext = 0;
+		std::size_t refreshFrames = 0;
+		std::size_t refreshPeakBatch = 0;
+		while (refreshNext < 5048)
+		{
+			const std::size_t refreshEnd = BoundedRegistrationRefreshEnd(
+				refreshNext, 5048, 64);
+			assert(refreshEnd > refreshNext);
+			refreshPeakBatch = (std::max)(refreshPeakBatch, refreshEnd - refreshNext);
+			refreshNext = refreshEnd;
+			++refreshFrames;
+		}
+		assert(refreshNext == 5048);
+		assert(refreshFrames == 79);
+		assert(refreshPeakBatch == 64);
+		assert(CanCompleteRegistrationRefresh(true, true, 0, 0));
+		assert(!CanCompleteRegistrationRefresh(false, true, 0, 0));
+		assert(!CanCompleteRegistrationRefresh(true, false, 0, 0));
+		assert(!CanCompleteRegistrationRefresh(true, true, 1, 0));
+		assert(!CanCompleteRegistrationRefresh(true, true, 0, 1));
+		assert(InitialMapBasePending(true, true, false, true));
+		assert(!InitialMapBasePending(true, true, true, true));
+		assert(!InitialMapBasePending(true, false, false, true));
+		assert(!InitialMapBasePending(false, true, false, true));
+		assert(!InitialMapBasePending(true, true, false, false));
 		assert(QueuedServerInfoIdentityMatches(true, true, true, true, true, true, true));
 		assert(!QueuedServerInfoIdentityMatches(false, true, true, true, true, true, true));
 		assert(!QueuedServerInfoIdentityMatches(true, false, true, true, true, true, true));

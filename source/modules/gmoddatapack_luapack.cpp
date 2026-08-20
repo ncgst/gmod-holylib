@@ -165,6 +165,7 @@ namespace HolyLib::LuaPack
 		bool featureEnabledLastFrame = false;
 		bool canonicalRegistrationAvailableLastFrame = false;
 		bool bootstrapRefresh = false;
+		bool registrationRefreshPending = false;
 		double lastCaptureAt = 0.0; // guarded by registryMutex
 		double nextBuildAllowed = 0.0;
 	};
@@ -1839,6 +1840,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		state.featureEnabledLastFrame = false;
 		state.canonicalRegistrationAvailableLastFrame = false;
 		state.bootstrapRefresh = false;
+		state.registrationRefreshPending = false;
 		state.lastCaptureAt = 0.0;
 		state.nextBuildAllowed = 0.0;
 		for (ClientPin& client : state.clients)
@@ -1868,6 +1870,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		{
 			state.featureEnabledLastFrame = enabled;
 			state.bootstrapRefresh = true;
+			state.registrationRefreshPending = true;
 			if (enabled)
 			{
 				std::lock_guard<std::mutex> lock(state.registryMutex);
@@ -1893,6 +1896,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			// A hook-set change alters the byte identity stored in every non-init entry,
 			// just like the master switch. The module refresh loop re-feeds all registrations.
 			state.bootstrapRefresh = true;
+			state.registrationRefreshPending = true;
 		}
 
 		for (auto upload = state.uploads.begin(); upload != state.uploads.end();)
@@ -2085,7 +2089,8 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			std::lock_guard<std::mutex> lock(state.registryMutex);
 			// The quiesce window captures the level's initial registration burst as one
 			// map base; nextBuildAllowed backs off failed initial publication retries.
-			shouldBuild = Policy::ShouldBuildMapBase(!state.currentGeneration.empty(), state.buildRequested) &&
+			shouldBuild = !state.registrationRefreshPending &&
+				Policy::ShouldBuildMapBase(!state.currentGeneration.empty(), state.buildRequested) &&
 				now >= state.nextBuildAllowed &&
 				now - state.lastCaptureAt >= 2.0;
 		}
@@ -2116,7 +2121,6 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		const std::string virtualPath = NormalizePath(inputPath);
 		if (virtualPath.empty())
 			return;
-		const std::string identity = ContentIdentity(contents);
 		const bool needsMapBase = state.currentGeneration.empty();
 
 		{
@@ -2128,6 +2132,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			const std::string sourcePath = virtualPath;
 			if (record.contents == contents && record.sourcePath == sourcePath)
 				return;
+			const std::string identity = ContentIdentity(contents);
 
 			record.virtualPath = virtualPath;
 			record.sourcePath = sourcePath;
@@ -2172,9 +2177,42 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		return refresh;
 	}
 
+	bool RegistrationRefreshPending()
+	{
+		const bool enabled = IsEnabled();
+		const bool canonicalRegistrationAvailable =
+			Policy::UsesCanonicalRegistration(enabled, SupportsCanonicalRegistration());
+		return state.registrationRefreshPending ||
+			enabled != state.featureEnabledLastFrame ||
+			canonicalRegistrationAvailable != state.canonicalRegistrationAvailableLastFrame;
+	}
+
+	bool BaselinePreparationPending()
+	{
+		bool baseWorkPending = false;
+		{
+			std::lock_guard<std::mutex> lock(state.registryMutex);
+			baseWorkPending = state.buildRequested || state.activeBuild != nullptr;
+		}
+		return RegistrationRefreshPending() || Policy::InitialMapBasePending(
+			IsEnabled(), GetConfig().requiredStubbing,
+			!state.currentGeneration.empty(), baseWorkPending);
+	}
+
+	void CompleteRegistrationRefresh()
+	{
+		// If another transition was requested while the current sweep completed, retain
+		// the gate until that replacement sweep is consumed and published too.
+		state.registrationRefreshPending = state.bootstrapRefresh;
+	}
+
 	BaselineDecision DecideBaselineForClient(int slot)
 	{
-		if (!IsEnabled() || !IsValidSlot(slot))
+		if (!IsValidSlot(slot))
+			return BaselineDecision();
+		if (BaselinePreparationPending())
+			return {BaselineAction::Reject, "Lua registration identities or the immutable map base are still being prepared"};
+		if (!IsEnabled())
 			return BaselineDecision();
 		if (const char* recoveryFailure = BeginPendingRecoveryBaseline(slot))
 			return {BaselineAction::Reject, recoveryFailure};
