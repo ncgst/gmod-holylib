@@ -461,8 +461,9 @@ do
 			installResolver()
 		end
 
-		-- Boot mount pass. Acknowledge whatever is already on disk; stub delivery is gated
-		-- server-side on this exact ACK and must not depend on anything loaded later in init.
+		-- Boot mount pass. Acknowledge whatever is already on disk so the server can record
+		-- mounted-object health; required initial stubs are baseline-pinned and do not wait
+		-- for this ACK.
 		-- Map-base mode publishes one generation per level. Keep the table loop for manifest
 		-- parser compatibility, but only the current base is expected.
 		local pendingManifests = {}
@@ -482,8 +483,8 @@ do
 			end
 		end
 
-		-- The resolver installs even when nothing mounted: the server may speculate with
-		-- stubs before this client has acknowledged anything, and __holypack must then
+		-- The resolver installs even when nothing mounted: required or speculative stubs may
+		-- arrive before this client has acknowledged anything, and __holypack must then
 		-- lazily mount a download that completed after the pass above — or recover —
 		-- instead of hitting a nil global.
 		activate()
