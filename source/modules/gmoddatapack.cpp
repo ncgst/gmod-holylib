@@ -2369,10 +2369,11 @@ static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned ch
 	CNetworkStringTable* concreteTable = static_cast<CNetworkStringTable*>(table);
 	if (fileID <= 0 || fileID >= table->GetNumStrings())
 		return false;
-
-	int entryBits = 0;
-	for (int maxEntries = table->GetMaxStrings(); maxEntries > 1; maxEntries >>= 1)
-		++entryBits;
+	if (!concreteTable->m_bUserDataFixedSize ||
+		concreteTable->m_nUserDataSizeBits != static_cast<int>(hashLength * 8))
+	{
+		return false;
+	}
 
 	char updateBuffer[64];
 	SVC_UpdateStringTable update;
@@ -2380,25 +2381,38 @@ static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned ch
 	update.m_nTableID = table->GetTableId();
 	update.m_nChangedEntries = 1;
 
-	// One existing entry, encoded exactly like CNetworkStringTable::WriteUpdate:
-	// explicit index, no string body, then the replacement userdata.
-	update.m_DataOut.WriteOneBit(0);
-	update.m_DataOut.WriteUBitLong(fileID, entryBits);
-	update.m_DataOut.WriteOneBit(0);
-	update.m_DataOut.WriteOneBit(1);
-	if (concreteTable->m_bUserDataFixedSize)
+	if (!HolyLib::LuaPack::Policy::AppendClientLuaHashUpdate(update.m_DataOut,
+		static_cast<std::uint32_t>(fileID), table->GetEntryBits(), hash, hashLength))
 	{
-		if (concreteTable->m_nUserDataSizeBits != static_cast<int>(hashLength * 8))
-			return false;
-		update.m_DataOut.WriteBits(hash, concreteTable->m_nUserDataSizeBits);
-	}
-	else
-	{
-		update.m_DataOut.WriteUBitLong(static_cast<unsigned int>(hashLength), CNetworkStringTableItem::MAX_USERDATA_BITS);
-		update.m_DataOut.WriteBits(hash, static_cast<int>(hashLength * 8));
+		return false;
 	}
 
 	return !update.m_DataOut.IsOverflowed() && client->SendNetMsg(update, true);
+}
+
+static bool RequestActiveClientLuaFiles(int clientIdx)
+{
+	CBaseClient* client = nullptr;
+#if MODULE_EXISTS_GAMESERVER
+	client = Gameserver_GetClientBySlot(clientIdx);
+#else
+	client = Util::server ? Util::GetClientByIndex(clientIdx) : nullptr;
+#endif
+	if (!Util::engineserver || !client || !client->IsActive() || !client->GetNetChannel())
+		return false;
+
+	unsigned char requestBuffer[1]{};
+	bf_write request(requestBuffer, sizeof(requestBuffer));
+	request.WriteByte(GarrysMod::NetworkMessage::RequestLuaFiles);
+	if (request.IsOverflowed())
+		return false;
+
+	// A string-table update changes the advertised identity, but active GMod clients
+	// do not rescan client_lua_files until this message asks them to compare the table.
+	// It shares the reliable stream with the preceding hash updates, preserving order.
+	Util::engineserver->GMOD_SendToClient(clientIdx, request.GetData(),
+		request.GetNumBitsWritten());
+	return true;
 }
 
 static void DrainActiveLuaHashRefreshes()
@@ -2426,8 +2440,10 @@ static void DrainActiveLuaHashRefreshes()
 	unsigned int nativeUpdates = 0;
 	unsigned int canonicalUpdates = 0;
 	unsigned int updatedFiles = 0;
+	unsigned int requestedScans = 0;
 	std::size_t sentUpdates = 0;
 	std::size_t processed = 0;
+	std::array<std::size_t, ABSOLUTE_PLAYER_LIMIT> stagedUpdatesBySlot{};
 	for (std::size_t index = 0; index < pending.size(); ++index)
 	{
 		if (processed >= budget || sentUpdates >= budget)
@@ -2483,11 +2499,24 @@ static void DrainActiveLuaHashRefreshes()
 				fileAction = HolyLib::LuaPack::Policy::Action::CanonicalStub;
 
 			auto& nativeHashes = g_clientNativeLuaHashes[slot];
+			auto& pendingHashes = g_clientHashUpdatesPending[slot];
 			const bool nativeHashKnown = nativeHashes.find(fileID) != nativeHashes.end();
 			const bool nativeHashMatches = HolyLib::LuaPack::Policy::NativeHashMatches(
 				nativeHashes, fileID, sourceHash);
 			const auto refresh = HolyLib::LuaPack::Policy::SelectActiveHashRefresh(
 				true, fileAction, nativeHashKnown, nativeHashMatches);
+			const ClientLuaHash* targetHash = nullptr;
+			if (refresh == HolyLib::LuaPack::Policy::ActiveHashRefreshAction::Native)
+				targetHash = &sourceHash;
+			else if (refresh == HolyLib::LuaPack::Policy::ActiveHashRefreshAction::Canonical)
+				targetHash = &canonicalHash;
+			const bool targetHashAlreadyPending = targetHash &&
+				HolyLib::LuaPack::Policy::NativeHashMatches(pendingHashes, fileID, *targetHash);
+			if (!HolyLib::LuaPack::Policy::ShouldStageActiveHashRefresh(
+				refresh, targetHashAlreadyPending))
+			{
+				continue;
+			}
 			if (refresh != HolyLib::LuaPack::Policy::ActiveHashRefreshAction::None &&
 				sentUpdates >= budget)
 			{
@@ -2501,10 +2530,10 @@ static void DrainActiveLuaHashRefreshes()
 					retryFile = true;
 					continue;
 				}
-				HolyLib::LuaPack::Policy::RememberNativeHash(nativeHashes, fileID, sourceHash);
-				g_clientHashUpdatesPending[slot].erase(fileID);
+				HolyLib::LuaPack::Policy::RememberNativeHash(pendingHashes, fileID, sourceHash);
 				++nativeUpdates;
 				++sentUpdates;
+				++stagedUpdatesBySlot[slot];
 				updatedFile = true;
 			}
 			else if (refresh == HolyLib::LuaPack::Policy::ActiveHashRefreshAction::Canonical)
@@ -2515,10 +2544,10 @@ static void DrainActiveLuaHashRefreshes()
 					retryFile = true;
 					continue;
 				}
-				HolyLib::LuaPack::Policy::RestoreCanonicalHash(nativeHashes, fileID);
-				g_clientHashUpdatesPending[slot].erase(fileID);
+				HolyLib::LuaPack::Policy::RememberNativeHash(pendingHashes, fileID, canonicalHash);
 				++canonicalUpdates;
 				++sentUpdates;
+				++stagedUpdatesBySlot[slot];
 				updatedFile = true;
 			}
 		}
@@ -2526,6 +2555,14 @@ static void DrainActiveLuaHashRefreshes()
 			retry.push_back(fileID);
 		if (updatedFile)
 			++updatedFiles;
+	}
+	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
+	{
+		if (HolyLib::LuaPack::Policy::ShouldRequestActiveLuaScan(
+			stagedUpdatesBySlot[slot]) && RequestActiveClientLuaFiles(slot))
+		{
+			++requestedScans;
+		}
 	}
 
 	if (!retry.empty())
@@ -2536,8 +2573,8 @@ static void DrainActiveLuaHashRefreshes()
 	}
 	if (nativeUpdates != 0 || canonicalUpdates != 0)
 	{
-		Msg(PROJECT_NAME " - luapack: active hot refresh notified %u native and %u canonical per-client hash update(s) across %u file(s)\n",
-			nativeUpdates, canonicalUpdates, updatedFiles);
+		Msg(PROJECT_NAME " - luapack: active hot refresh staged %u native and %u canonical per-client hash update(s) across %u file(s), then requested %u client Lua rescan(s)\n",
+			nativeUpdates, canonicalUpdates, updatedFiles, requestedScans);
 	}
 }
 
@@ -2716,8 +2753,6 @@ static bool RefreshRegistrationModeForRequest(int fileID, const std::string& fil
 static bool SendNativeLuaFile(GModDataPack* pDataPack, int clientIdx, int fileID,
 	const std::string& fileName, GarrysMod::Lua::LuaFile* luaFile)
 {
-	if (clientIdx >= 0 && clientIdx < ABSOLUTE_PLAYER_LIMIT)
-		g_clientHashUpdatesPending[clientIdx].erase(fileID);
 	if (HolyLib::LuaPack::NeedsNativeHashUpdate(clientIdx) && !HolyLib::LuaPack::IsInitFile(fileName))
 	{
 		std::array<unsigned char, 32> nativeHash{};
@@ -2728,15 +2763,29 @@ static bool SendNativeLuaFile(GModDataPack* pDataPack, int clientIdx, int fileID
 		}
 
 		auto& nativeHashes = g_clientNativeLuaHashes[clientIdx];
+		auto& pendingHashes = g_clientHashUpdatesPending[clientIdx];
+		auto pendingHash = pendingHashes.find(fileID);
+		const bool requestedHashMatchesNative = pendingHash != pendingHashes.end() &&
+			pendingHash->second == nativeHash;
 		if (!HolyLib::LuaPack::Policy::NativeHashMatches(nativeHashes, fileID, nativeHash))
 		{
-			if (!SendClientLuaHashUpdate(clientIdx, fileID, nativeHash.data(), nativeHash.size()))
+			// Receipt of this body request proves the client processed the staged hash
+			// and rescan. Only send another ordered update when the requested identity
+			// is stale or came from another publication path.
+			if (!requestedHashMatchesNative &&
+				!SendClientLuaHashUpdate(clientIdx, fileID, nativeHash.data(), nativeHash.size()))
 			{
 				DisconnectLuaHashFailure(clientIdx, fileName.c_str(), "the native hash update could not be sent");
 				return false;
 			}
 			HolyLib::LuaPack::Policy::RememberNativeHash(nativeHashes, fileID, nativeHash);
 		}
+		if (pendingHash != pendingHashes.end())
+			pendingHashes.erase(pendingHash);
+	}
+	else if (clientIdx >= 0 && clientIdx < ABSOLUTE_PLAYER_LIMIT)
+	{
+		g_clientHashUpdatesPending[clientIdx].erase(fileID);
 	}
 
 	SendOriginalLuaFile(pDataPack, clientIdx, fileID);

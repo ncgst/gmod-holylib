@@ -766,6 +766,62 @@ namespace HolyLib::LuaPack::Policy
 		return ActiveHashRefreshAction::None;
 	}
 
+	constexpr bool ShouldStageActiveHashRefresh(ActiveHashRefreshAction action,
+		bool targetHashAlreadyPending)
+	{
+		return action != ActiveHashRefreshAction::None && !targetHashAlreadyPending;
+	}
+
+	constexpr bool ShouldRequestActiveLuaScan(std::size_t stagedHashUpdates)
+	{
+		return stagedHashUpdates != 0;
+	}
+
+	constexpr std::size_t ClientLuaHashBytes = 32u;
+	constexpr std::size_t ClientLuaHashBits = ClientLuaHashBytes * 8u;
+
+	constexpr std::size_t ClientLuaHashUpdateBits(int entryBits)
+	{
+		return entryBits > 0
+			? 1u + static_cast<std::size_t>(entryBits) + 1u + 1u + ClientLuaHashBits
+			: 0u;
+	}
+
+	// Encode one existing fixed-size client_lua_files entry exactly as
+	// CNetworkStringTable::WriteUpdate: explicit index, no string body, and one
+	// 32-byte SHA-256 userdata value. The surrounding SVC_UpdateStringTable owns
+	// the table ID, changed-entry count, and payload length.
+	template <typename BitWriter>
+	bool AppendClientLuaHashUpdate(BitWriter& output, std::uint32_t fileID,
+		int entryBits, const void* hash, std::size_t hashBytes)
+	{
+		const std::size_t updateBits = ClientLuaHashUpdateBits(entryBits);
+		if (!hash || hashBytes != ClientLuaHashBytes || entryBits <= 0 ||
+			entryBits >= static_cast<int>(sizeof(std::uint32_t) * 8u) ||
+			fileID == 0 || fileID >= (1u << entryBits) || updateBits == 0)
+		{
+			return false;
+		}
+
+		const int bitsBefore = output.GetNumBitsWritten();
+		const int bitsLeft = output.GetNumBitsLeft();
+		if (bitsBefore < 0 || bitsLeft < 0 || output.IsOverflowed() ||
+			updateBits > static_cast<std::size_t>(bitsLeft) ||
+			updateBits > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
+		{
+			return false;
+		}
+
+		output.WriteOneBit(0);
+		output.WriteUBitLong(fileID, entryBits);
+		output.WriteOneBit(0);
+		output.WriteOneBit(1);
+		output.WriteBits(hash, static_cast<int>(ClientLuaHashBits));
+
+		return !output.IsOverflowed() && output.GetNumBitsWritten() - bitsBefore ==
+			static_cast<int>(updateBits);
+	}
+
 	// GMod asks for every missing Lua ID in one request. Required delivery retains that
 	// ownership boundary but stages a bounded number of canonical placeholders per frame.
 	// This math reserves reliable scratch space for one bounded batch plus unrelated

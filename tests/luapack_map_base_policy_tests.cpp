@@ -25,6 +25,7 @@ public:
 			? static_cast<int>(maximumBits - bits.size()) : 0;
 	}
 	bool IsOverflowed() const { return overflowed; }
+	void WriteOneBit(int value) { WriteBit(value != 0); }
 
 	void WriteUBitLong(std::uint32_t value, int bitCount)
 	{
@@ -37,6 +38,13 @@ public:
 		const auto* bytes = static_cast<const unsigned char*>(data);
 		for (int byte = 0; byte < byteCount; ++byte)
 			WriteUBitLong(bytes[byte], 8);
+	}
+
+	void WriteBits(const void* data, int bitCount)
+	{
+		const auto* bytes = static_cast<const unsigned char*>(data);
+		for (int bit = 0; bit < bitCount; ++bit)
+			WriteBit((bytes[bit / 8] >> (bit % 8)) & 1u);
 	}
 
 	std::uint32_t ReadUBitLong(std::size_t start, int bitCount) const
@@ -837,6 +845,53 @@ int main()
 		ActiveHashRefreshAction::None);
 	assert(SelectActiveHashRefresh(true, Action::Reject, true, false) ==
 		ActiveHashRefreshAction::None);
+	assert(ShouldStageActiveHashRefresh(ActiveHashRefreshAction::Native, false));
+	assert(!ShouldStageActiveHashRefresh(ActiveHashRefreshAction::Native, true));
+	assert(!ShouldStageActiveHashRefresh(ActiveHashRefreshAction::None, false));
+	assert(!ShouldRequestActiveLuaScan(0));
+	assert(ShouldRequestActiveLuaScan(1));
+	assert(ShouldRequestActiveLuaScan(64));
+
+	// The production helper emits the exact fixed-size payload parsed by
+	// CNetworkStringTable::ParseUpdate. An active rescan is a separate GMod message;
+	// the string-table record alone is deliberately not treated as execution proof.
+	std::array<unsigned char, ClientLuaHashBytes> clientLuaHash{};
+	for (std::size_t index = 0; index < clientLuaHash.size(); ++index)
+		clientLuaHash[index] = static_cast<unsigned char>(index);
+	constexpr int clientLuaEntryBits = 13;
+	const std::size_t clientLuaUpdateBits = ClientLuaHashUpdateBits(clientLuaEntryBits);
+	TestBitWriter clientLuaUpdate(3 + clientLuaUpdateBits);
+	clientLuaUpdate.WriteUBitLong(5, 3);
+	std::size_t clientLuaStart = clientLuaUpdate.bits.size();
+	assert(AppendClientLuaHashUpdate(clientLuaUpdate, 0x1234,
+		clientLuaEntryBits, clientLuaHash.data(), clientLuaHash.size()));
+	assert(clientLuaUpdate.bits.size() - clientLuaStart == clientLuaUpdateBits);
+	assert(clientLuaUpdate.ReadUBitLong(clientLuaStart, 1) == 0);
+	++clientLuaStart;
+	assert(clientLuaUpdate.ReadUBitLong(clientLuaStart, clientLuaEntryBits) == 0x1234);
+	clientLuaStart += clientLuaEntryBits;
+	assert(clientLuaUpdate.ReadUBitLong(clientLuaStart, 1) == 0);
+	++clientLuaStart;
+	assert(clientLuaUpdate.ReadUBitLong(clientLuaStart, 1) == 1);
+	++clientLuaStart;
+	for (std::size_t index = 0; index < clientLuaHash.size(); ++index)
+		assert(clientLuaUpdate.ReadUBitLong(clientLuaStart + index * 8u, 8) == clientLuaHash[index]);
+	TestBitWriter shortClientLuaUpdate(clientLuaUpdateBits - 1u);
+	assert(!AppendClientLuaHashUpdate(shortClientLuaUpdate, 1,
+		clientLuaEntryBits, clientLuaHash.data(), clientLuaHash.size()));
+	assert(shortClientLuaUpdate.bits.empty());
+	TestBitWriter invalidClientLuaUpdate(clientLuaUpdateBits);
+	assert(!AppendClientLuaHashUpdate(invalidClientLuaUpdate, 0,
+		clientLuaEntryBits, clientLuaHash.data(), clientLuaHash.size()));
+	assert(!AppendClientLuaHashUpdate(invalidClientLuaUpdate, 8192,
+		clientLuaEntryBits, clientLuaHash.data(), clientLuaHash.size()));
+	assert(!AppendClientLuaHashUpdate(invalidClientLuaUpdate, 1,
+		0, clientLuaHash.data(), clientLuaHash.size()));
+	assert(!AppendClientLuaHashUpdate(invalidClientLuaUpdate, 1,
+		clientLuaEntryBits, nullptr, clientLuaHash.size()));
+	assert(!AppendClientLuaHashUpdate(invalidClientLuaUpdate, 1,
+		clientLuaEntryBits, clientLuaHash.data(), clientLuaHash.size() - 1u));
+	assert(invalidClientLuaUpdate.bits.empty());
 
 	// Exact-key duplicates are rejected by the same registry used by pack validation.
 	std::unordered_set<std::string> exactKeys;
