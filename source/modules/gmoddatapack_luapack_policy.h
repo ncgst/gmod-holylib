@@ -731,6 +731,41 @@ namespace HolyLib::LuaPack::Policy
 		return clientActive || nativeHashKnown || publishedHashMatchesCanonical;
 	}
 
+	enum class ActiveHashRefreshAction
+	{
+		None,
+		Native,
+		Canonical,
+	};
+
+	// The global Lua registration remains the generation-independent canonical stub.
+	// An existing path hotfix therefore republishes byte-identical userdata and Source
+	// emits no string-table change. Queue an explicit per-client identity only for that
+	// no-op transition; ordinary changed registrations retain the engine broadcast.
+	constexpr bool ShouldQueueActiveHashRefresh(bool enabled,
+		bool canonicalRegistration, bool registrationTransition,
+		bool publishedHashChanged, bool initFile)
+	{
+		return enabled && canonicalRegistration && registrationTransition &&
+			!publishedHashChanged && !initFile;
+	}
+
+	constexpr ActiveHashRefreshAction SelectActiveHashRefresh(bool clientActive,
+		Action fileAction, bool nativeHashKnown, bool nativeHashMatchesCurrent)
+	{
+		if (!clientActive)
+			return ActiveHashRefreshAction::None;
+		if (fileAction == Action::Native)
+		{
+			return nativeHashMatchesCurrent
+				? ActiveHashRefreshAction::None
+				: ActiveHashRefreshAction::Native;
+		}
+		if (fileAction == Action::CanonicalStub && nativeHashKnown)
+			return ActiveHashRefreshAction::Canonical;
+		return ActiveHashRefreshAction::None;
+	}
+
 	// GMod asks for every missing Lua ID in one request. Required delivery retains that
 	// ownership boundary but stages a bounded number of canonical placeholders per frame.
 	// This math reserves reliable scratch space for one bounded batch plus unrelated

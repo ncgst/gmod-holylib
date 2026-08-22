@@ -814,6 +814,30 @@ int main()
 	RememberNativeHash(nativeLaneHashes, 84, hotfixTwo);
 	assert(NativeHashMatches(nativeLaneHashes, 84, hotfixTwo));
 
+	// Source suppresses a string-table update when LuaPack republishes the same
+	// generation-independent canonical hash. Existing-path hotfixes must explicitly
+	// notify active clients, while a genuinely changed registration (including the
+	// first publication of a late path) stays on the engine broadcast.
+	assert(ShouldQueueActiveHashRefresh(true, true, true, false, false));
+	assert(!ShouldQueueActiveHashRefresh(true, true, true, true, false));
+	assert(!ShouldQueueActiveHashRefresh(true, true, true, false, true));
+	assert(!ShouldQueueActiveHashRefresh(true, true, false, false, false));
+	assert(!ShouldQueueActiveHashRefresh(false, true, true, false, false));
+	assert(SelectActiveHashRefresh(true, Action::Native, false, false) ==
+		ActiveHashRefreshAction::Native);
+	assert(SelectActiveHashRefresh(true, Action::Native, true, false) ==
+		ActiveHashRefreshAction::Native);
+	assert(SelectActiveHashRefresh(true, Action::Native, true, true) ==
+		ActiveHashRefreshAction::None);
+	assert(SelectActiveHashRefresh(true, Action::CanonicalStub, true, false) ==
+		ActiveHashRefreshAction::Canonical);
+	assert(SelectActiveHashRefresh(true, Action::CanonicalStub, false, false) ==
+		ActiveHashRefreshAction::None);
+	assert(SelectActiveHashRefresh(false, Action::Native, false, false) ==
+		ActiveHashRefreshAction::None);
+	assert(SelectActiveHashRefresh(true, Action::Reject, true, false) ==
+		ActiveHashRefreshAction::None);
+
 	// Exact-key duplicates are rejected by the same registry used by pack validation.
 	std::unordered_set<std::string> exactKeys;
 	assert(RegisterExactKey(exactKeys, "0123456789abcdef"));

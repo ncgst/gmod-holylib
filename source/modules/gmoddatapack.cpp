@@ -70,7 +70,7 @@ static ConVar gmoddatapack_luapack_serverinfo_budget(
 	true, 1.0f, true, 16.0f);
 static ConVar gmoddatapack_luapack_registration_refresh_budget(
 	"holylib_gmoddatapack_luapack_registration_refresh_budget", "64", FCVAR_ARCHIVE,
-	"Maximum Lua registrations reprocessed per server frame after a LuaPack mode transition",
+	"Maximum Lua registration entries or active-client hot-refresh hash updates processed per server frame",
 	true, 1.0f, true, 1024.0f);
 
 static CGModDataPackModule g_pGModDataPackModule;
@@ -1130,6 +1130,7 @@ public:
 			removeComments = false;
 			luapackCanonical = false;
 			luapackPassthrough = false;
+			activeHashRefreshPending = false;
 		}
 
 		std::string sourceContent = "";
@@ -1147,7 +1148,42 @@ public:
 		bool removeComments = false;
 		bool luapackCanonical = false;
 		bool luapackPassthrough = false;
+		bool activeHashRefreshPending = false;
 	};
+
+	void QueueActiveHashRefresh(int fileID)
+	{
+		std::lock_guard<std::mutex> lock(m_pActiveHashRefreshQueueMutex);
+		m_pActiveHashRefreshQueue.push_back(fileID);
+	}
+
+	void PublishEntryHash(int fileID, LuaPackEntry& entry)
+	{
+		INetworkStringTable* table = g_pDataPack->m_pClientLuaFiles;
+		int publishedLength = 0;
+		const void* publishedData = table->GetStringUserData(fileID, &publishedLength);
+		const bool publishedHashChanged = publishedLength != static_cast<int>(entry.contentHash.size()) ||
+			!publishedData || !std::equal(entry.contentHash.begin(), entry.contentHash.end(),
+				static_cast<const unsigned char*>(publishedData));
+
+		// Source only marks a string-table entry changed when its userdata bytes differ.
+		// Clear per-client native identities only when that real global notification will
+		// happen. A byte-identical canonical publication is repaired explicitly below.
+		if (publishedHashChanged)
+			ClearClientNativeLuaHashForAllClients(fileID, &entry.contentHash);
+		table->SetStringUserData(fileID, entry.contentHash.size(), entry.contentHash.data());
+		entry.hashPublished = true;
+
+		const char* fileName = table->GetString(fileID);
+		if (HolyLib::LuaPack::Policy::ShouldQueueActiveHashRefresh(
+			HolyLib::LuaPack::IsEnabled(), HolyLib::LuaPack::SupportsCanonicalRegistration(),
+			entry.activeHashRefreshPending, publishedHashChanged,
+			HolyLib::LuaPack::IsInitFile(fileName ? fileName : "")))
+		{
+			QueueActiveHashRefresh(fileID);
+		}
+		entry.activeHashRefreshPending = false;
+	}
 
 	void Initialize();
 	void Shutdown();
@@ -1173,10 +1209,7 @@ public:
 				entry->contentHash = HashClientLuaString(entry->content);
 				entry->contentHashReady = true;
 			}
-			ClearClientNativeLuaHashForAllClients(fileID, &entry->contentHash);
-			g_pDataPack->m_pClientLuaFiles->SetStringUserData(fileID,
-				entry->contentHash.size(), entry->contentHash.data());
-			entry->hashPublished = true;
+			PublishEntryHash(fileID, *entry);
 		}
 		return entry->IsContentReady() && entry->hashPublished;
 	}
@@ -1231,10 +1264,7 @@ public:
 				pEntry.contentHash = HashClientLuaString(pEntry.content);
 				pEntry.contentHashReady = true;
 			}
-			ClearClientNativeLuaHashForAllClients(fileID, &pEntry.contentHash);
-			g_pDataPack->m_pClientLuaFiles->SetStringUserData(fileID,
-				pEntry.contentHash.size(), pEntry.contentHash.data());
-			pEntry.hashPublished = true;
+			PublishEntryHash(fileID, pEntry);
 
 			return;
 		}
@@ -1268,6 +1298,7 @@ public:
 		pEntry.removeComments = bRemoveComments;
 		pEntry.luapackCanonical = bLuaPackCanonical;
 		pEntry.luapackPassthrough = HolyLib::LuaPack::Policy::UsesPassthroughProcessing(bLuaPackEnabled);
+		pEntry.activeHashRefreshPending = true;
 		pEntry.processed = false;
 		pEntry.hashPublished = false;
 
@@ -1340,10 +1371,7 @@ public:
 
 		if (ThreadInMainThread()) // SetStringUserData is NOT thread safe!
 		{
-			ClearClientNativeLuaHashForAllClients(fileID, &pEntry->contentHash);
-			g_pDataPack->m_pClientLuaFiles->SetStringUserData(fileID,
-				pEntry->contentHash.size(), pEntry->contentHash.data());
-			pEntry->hashPublished = true;
+			PublishEntryHash(fileID, *pEntry);
 		} else {
 			pEntry->hashPublished = false;
 			std::lock_guard<std::mutex> lock(m_pStringTableUpdateQueueMutex);
@@ -1468,6 +1496,8 @@ public:
 
 	std::vector<int> m_pStringTableUpdateQueue;
 	std::mutex m_pStringTableUpdateQueueMutex;
+	std::vector<int> m_pActiveHashRefreshQueue;
+	std::mutex m_pActiveHashRefreshQueueMutex;
 
 	std::atomic<ThreadState> m_pWorkerThreadState;
 	ThreadHandle_t m_pWorkerThread = nullptr;
@@ -1585,6 +1615,15 @@ void LuaDataPack::Shutdown()
 
 		ReleaseThreadHandle(m_pWorkerThread);
 		m_pWorkerThread = nullptr;
+	}
+	{
+		std::lock_guard<std::mutex> lock(m_pActiveHashRefreshQueueMutex);
+		m_pActiveHashRefreshQueue.clear();
+	}
+	for (LuaPackEntry& entry : m_pLuaFileCache)
+	{
+		std::lock_guard<std::shared_mutex> lock(entry.mutex);
+		entry.activeHashRefreshPending = false;
 	}
 
 	// We keep it, simply because then we can re-use stuff
@@ -2360,6 +2399,146 @@ static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned ch
 	}
 
 	return !update.m_DataOut.IsOverflowed() && client->SendNetMsg(update, true);
+}
+
+static void DrainActiveLuaHashRefreshes()
+{
+	std::vector<int> pending;
+	{
+		std::lock_guard<std::mutex> lock(g_pLuaDataPack.m_pActiveHashRefreshQueueMutex);
+		pending = std::move(g_pLuaDataPack.m_pActiveHashRefreshQueue);
+		g_pLuaDataPack.m_pActiveHashRefreshQueue.clear();
+	}
+	if (pending.empty())
+		return;
+
+	std::sort(pending.begin(), pending.end());
+	pending.erase(std::unique(pending.begin(), pending.end()), pending.end());
+	if (!HolyLib::LuaPack::IsEnabled() || !HolyLib::LuaPack::SupportsCanonicalRegistration() ||
+		!g_pDataPack || !g_pDataPack->m_pClientLuaFiles)
+	{
+		return;
+	}
+
+	const std::size_t budget = static_cast<std::size_t>((std::max)(1,
+		gmoddatapack_luapack_registration_refresh_budget.GetInt()));
+	std::vector<int> retry;
+	unsigned int nativeUpdates = 0;
+	unsigned int canonicalUpdates = 0;
+	unsigned int updatedFiles = 0;
+	std::size_t sentUpdates = 0;
+	std::size_t processed = 0;
+	for (std::size_t index = 0; index < pending.size(); ++index)
+	{
+		if (processed >= budget || sentUpdates >= budget)
+		{
+			retry.insert(retry.end(), pending.begin() + index, pending.end());
+			break;
+		}
+		++processed;
+
+		const int fileID = pending[index];
+		LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID);
+		if (!entry || fileID <= 0 || fileID >= g_pDataPack->m_pClientLuaFiles->GetNumStrings())
+			continue;
+
+		const char* registeredName = g_pDataPack->m_pClientLuaFiles->GetString(fileID);
+		const std::string fileName = registeredName ? registeredName : "";
+		if (fileName.empty() || HolyLib::LuaPack::IsInitFile(fileName))
+			continue;
+
+		ClientLuaHash sourceHash{};
+		ClientLuaHash canonicalHash{};
+		{
+			std::shared_lock<std::shared_mutex> lock(entry->mutex);
+			if (!entry->hasSourceContent || !entry->sourceHashReady ||
+				!entry->contentHashReady || !entry->hashPublished)
+			{
+				retry.push_back(fileID);
+				continue;
+			}
+			sourceHash = entry->sourceHash;
+			canonicalHash = entry->contentHash;
+		}
+
+		bool retryFile = false;
+		bool updatedFile = false;
+		for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
+		{
+			CBaseClient* client = nullptr;
+#if MODULE_EXISTS_GAMESERVER
+			client = Gameserver_GetClientBySlot(slot);
+#else
+			client = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+#endif
+			if (!client || !client->IsActive() || !client->GetNetChannel())
+				continue;
+
+			const HolyLib::LuaPack::BaselineDecision baseline =
+				HolyLib::LuaPack::DecideFileBaselineForClient(slot, fileName);
+			HolyLib::LuaPack::Policy::Action fileAction = HolyLib::LuaPack::Policy::Action::Reject;
+			if (baseline.action == HolyLib::LuaPack::BaselineAction::NativeSource)
+				fileAction = HolyLib::LuaPack::Policy::Action::Native;
+			else if (baseline.action == HolyLib::LuaPack::BaselineAction::CanonicalStub)
+				fileAction = HolyLib::LuaPack::Policy::Action::CanonicalStub;
+
+			auto& nativeHashes = g_clientNativeLuaHashes[slot];
+			const bool nativeHashKnown = nativeHashes.find(fileID) != nativeHashes.end();
+			const bool nativeHashMatches = HolyLib::LuaPack::Policy::NativeHashMatches(
+				nativeHashes, fileID, sourceHash);
+			const auto refresh = HolyLib::LuaPack::Policy::SelectActiveHashRefresh(
+				true, fileAction, nativeHashKnown, nativeHashMatches);
+			if (refresh != HolyLib::LuaPack::Policy::ActiveHashRefreshAction::None &&
+				sentUpdates >= budget)
+			{
+				retryFile = true;
+				break;
+			}
+			if (refresh == HolyLib::LuaPack::Policy::ActiveHashRefreshAction::Native)
+			{
+				if (!SendClientLuaHashUpdate(slot, fileID, sourceHash.data(), sourceHash.size()))
+				{
+					retryFile = true;
+					continue;
+				}
+				HolyLib::LuaPack::Policy::RememberNativeHash(nativeHashes, fileID, sourceHash);
+				g_clientHashUpdatesPending[slot].erase(fileID);
+				++nativeUpdates;
+				++sentUpdates;
+				updatedFile = true;
+			}
+			else if (refresh == HolyLib::LuaPack::Policy::ActiveHashRefreshAction::Canonical)
+			{
+				if (!SendClientLuaHashUpdate(slot, fileID,
+					canonicalHash.data(), canonicalHash.size()))
+				{
+					retryFile = true;
+					continue;
+				}
+				HolyLib::LuaPack::Policy::RestoreCanonicalHash(nativeHashes, fileID);
+				g_clientHashUpdatesPending[slot].erase(fileID);
+				++canonicalUpdates;
+				++sentUpdates;
+				updatedFile = true;
+			}
+		}
+		if (retryFile)
+			retry.push_back(fileID);
+		if (updatedFile)
+			++updatedFiles;
+	}
+
+	if (!retry.empty())
+	{
+		std::lock_guard<std::mutex> lock(g_pLuaDataPack.m_pActiveHashRefreshQueueMutex);
+		g_pLuaDataPack.m_pActiveHashRefreshQueue.insert(
+			g_pLuaDataPack.m_pActiveHashRefreshQueue.end(), retry.begin(), retry.end());
+	}
+	if (nativeUpdates != 0 || canonicalUpdates != 0)
+	{
+		Msg(PROJECT_NAME " - luapack: active hot refresh notified %u native and %u canonical per-client hash update(s) across %u file(s)\n",
+			nativeUpdates, canonicalUpdates, updatedFiles);
+	}
 }
 
 static bool GetNativeLuaHash(int fileID, GarrysMod::Lua::LuaFile* luaFile, std::array<unsigned char, 32>& output)
@@ -3222,14 +3401,10 @@ void CGModDataPackModule::Think(bool bSimulating)
 				pEntry->contentHash = HashClientLuaString(pEntry->content);
 				pEntry->contentHashReady = true;
 			}
-			// SetStringUserData broadcasts the canonical hash to every active client.
-			// Forget any per-client native identity before a later body decision.
-			ClearClientNativeLuaHashForAllClients(fileID, &pEntry->contentHash);
-			g_pDataPack->m_pClientLuaFiles->SetStringUserData(fileID,
-				pEntry->contentHash.size(), pEntry->contentHash.data());
-			pEntry->hashPublished = true;
+			g_pLuaDataPack.PublishEntryHash(fileID, *pEntry);
 		}
 	}
+	DrainActiveLuaHashRefreshes();
 
 	// ServerInfo serializes the complete Lua string-table baseline atomically. Admit
 	// only the configured number of already-accepted physical/parked clients here,
