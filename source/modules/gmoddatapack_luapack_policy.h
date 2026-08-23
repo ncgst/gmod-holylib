@@ -768,7 +768,8 @@ namespace HolyLib::LuaPack::Policy
 	// ("lua/foo/bar.lua"), or an addon source path
 	// ("addons/name/lua/foo/bar.lua"). Resolve those spellings without ever
 	// accepting an absolute/traversing path or manufacturing a registration.
-	inline bool NormalizeExistingLuaRefreshPath(std::string path, std::string& output)
+	inline bool NormalizeExistingLuaRefreshRegistrationPath(std::string path,
+		std::string& output)
 	{
 		output.clear();
 		std::replace(path.begin(), path.end(), '\\', '/');
@@ -777,16 +778,9 @@ namespace HolyLib::LuaPack::Policy
 
 		if (path.empty() || path.front() == '/' || path.find(':') != std::string::npos)
 			return false;
-
-		if (path.compare(0, 4, "lua/") == 0)
-		{
-			path.erase(0, 4);
-		} else if (path.compare(0, 7, "addons/") == 0) {
-			const std::size_t luaRoot = path.find("/lua/");
-			if (luaRoot == std::string::npos)
-				return false;
-			path.erase(0, luaRoot + 5);
-		}
+		if (path.compare(0, 7, "addons/") == 0 &&
+			path.find("/lua/") == std::string::npos)
+			return false;
 
 		if (path.empty() || path.size() < 5 ||
 			path.compare(path.size() - 4, 4, ".lua") != 0)
@@ -814,6 +808,26 @@ namespace HolyLib::LuaPack::Policy
 		return true;
 	}
 
+	inline bool NormalizeExistingLuaRefreshPath(std::string path, std::string& output)
+	{
+		std::string registrationPath;
+		if (!NormalizeExistingLuaRefreshRegistrationPath(path, registrationPath))
+			return false;
+		path = registrationPath;
+
+		if (path.compare(0, 4, "lua/") == 0)
+		{
+			path.erase(0, 4);
+		} else if (path.compare(0, 7, "addons/") == 0) {
+			const std::size_t luaRoot = path.find("/lua/");
+			if (luaRoot == std::string::npos)
+				return false;
+			path.erase(0, luaRoot + 5);
+		}
+
+		return NormalizeExistingLuaRefreshRegistrationPath(path, output);
+	}
+
 	enum class LuaRefreshPathResolution
 	{
 		InvalidPath,
@@ -828,20 +842,32 @@ namespace HolyLib::LuaPack::Policy
 	{
 		output.clear();
 		bool normalizedAny = false;
-		std::string lastNormalized;
+		std::unordered_set<std::string> tried;
+		auto trySpelling = [&](const std::string& spelling) -> bool
+		{
+			if (!tried.insert(spelling).second)
+				return false;
+			if (!exists(spelling))
+				return false;
+			output = spelling;
+			return true;
+		};
 		auto tryCandidate = [&](const std::string& candidate) -> bool
 		{
+			std::string registrationPath;
+			if (NormalizeExistingLuaRefreshRegistrationPath(candidate,
+				registrationPath))
+			{
+				normalizedAny = true;
+				if (trySpelling(registrationPath))
+					return true;
+			}
+
 			std::string normalized;
 			if (!NormalizeExistingLuaRefreshPath(candidate, normalized))
 				return false;
 			normalizedAny = true;
-			if (normalized == lastNormalized)
-				return false;
-			lastNormalized = normalized;
-			if (!exists(normalized))
-				return false;
-			output = normalized;
-			return true;
+			return trySpelling(normalized);
 		};
 
 		if (tryCandidate(fileName) || tryCandidate(fileRelPath))
