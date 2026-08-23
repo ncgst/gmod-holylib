@@ -750,6 +750,19 @@ namespace HolyLib::LuaPack::Policy
 			!publishedHashChanged && !initFile;
 	}
 
+	// Some filesystem autorefresh paths bypass GModDataPack::AddOrUpdateFile.
+	// Capture only changed existing registrations; unknown paths must never become
+	// client registrations. Every captured change needs LuaPack's active rescan:
+	// vanilla's post-refresh server cache does not prove delivery or execution on a
+	// connected client.
+	constexpr bool ShouldCaptureAutoRefresh(bool enabled,
+		bool canonicalRegistration,
+		bool existingRegistration, bool sourceReadable, bool sourceChanged)
+	{
+		return enabled && canonicalRegistration &&
+			existingRegistration && sourceReadable && sourceChanged;
+	}
+
 	constexpr ActiveHashRefreshAction SelectActiveHashRefresh(bool clientActive,
 		Action fileAction, bool nativeHashKnown, bool nativeHashMatchesCurrent)
 	{

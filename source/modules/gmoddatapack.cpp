@@ -11,6 +11,7 @@
 #include "sourcesdk/netmessages.h"
 #include "modules/gmoddatapack_luapack.h"
 #include "modules/gmoddatapack_luapack_policy.h"
+#include "modules/autorefresh_shared.h"
 #include "networkstringtable.h"
 #include "networkstringtableitem.h"
 #include "picosha2/picosha2.h"
@@ -87,6 +88,8 @@ extern CBaseClient* Gameserver_GetClientBySlot(int slot);
 using ClientLuaHash = std::array<unsigned char, 32>;
 static std::array<std::unordered_map<int, ClientLuaHash>, ABSOLUTE_PLAYER_LIMIT> g_clientNativeLuaHashes;
 static std::array<std::unordered_map<int, ClientLuaHash>, ABSOLUTE_PLAYER_LIMIT> g_clientHashUpdatesPending;
+static unsigned int g_activeHashRefreshNativeAcknowledgements = 0;
+static unsigned int g_activeHashRefreshCanonicalAcknowledgements = 0;
 static constexpr std::size_t MAX_TRACKED_LUA_FILES = 1u << 13u;
 using PinnedCanonicalFiles = HolyLib::LuaPack::Policy::PinnedCanonicalFileSet<MAX_TRACKED_LUA_FILES>;
 static std::array<PinnedCanonicalFiles, ABSOLUTE_PLAYER_LIMIT> g_clientPinnedCanonicalFiles;
@@ -2184,11 +2187,136 @@ static void DrainQueuedLuaPackServerInfos()
 
 static Detouring::Hook detour_GModDataPack_AddOrUpdateFile;
 static Detouring::Hook detour_GModDataPack_SendFileToClient;
+static Detouring::Hook detour_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack;
 #if defined(SYSTEM_LINUX)
 static Detouring::Hook detour_GModDataPack_OnFilesRequested;
 static thread_local int g_requiredRequestProbeSlot = -1;
 static thread_local bool g_requiredRequestProbeAccepted = false;
 #endif
+
+static bool IsGModDataPackModuleEnabled()
+{
+	IModuleWrapper* module = g_pModuleManager.GetModuleByID(HOLYLIB_MODULEID_GMODDATAPACK);
+	return module && module->IsEnabled();
+}
+
+static bool ReadLuaAutoRefreshSource(const std::string& fileRelPath,
+	const std::string& fileName, std::string& output)
+{
+	auto readPath = [&](const std::string& path, const char* pathID) -> bool
+	{
+		FileHandle_t handle = g_pFullFileSystem->Open(path.c_str(), "rb", pathID);
+		if (handle == FILESYSTEM_INVALID_HANDLE)
+			return false;
+
+		const unsigned int size = g_pFullFileSystem->Size(handle);
+		if (size > static_cast<unsigned int>((std::numeric_limits<int>::max)()))
+		{
+			g_pFullFileSystem->Close(handle);
+			return false;
+		}
+
+		output.assign(size, '\0');
+		const int read = size == 0 ? 0 :
+			g_pFullFileSystem->Read(output.data(), static_cast<int>(size), handle);
+		g_pFullFileSystem->Close(handle);
+		return read == static_cast<int>(size);
+	};
+
+	if (!fileRelPath.empty() && readPath(fileRelPath, "MOD"))
+		return true;
+	return !fileName.empty() && readPath("lua/" + fileName, "GAME");
+}
+
+static bool CaptureExistingLuaPackAutoRefresh(const std::string* fileRelPath,
+	const std::string* fileName, const std::string* fileExt)
+{
+	if (!IsGModDataPackModuleEnabled() || !fileRelPath || !fileName || !fileExt ||
+		fileExt->compare(0, 3, "lua") != 0 || !g_pFullFileSystem || !g_pDataPack ||
+		!g_pDataPack->m_pClientLuaFiles)
+	{
+		return false;
+	}
+
+	const bool enabled = HolyLib::LuaPack::IsEnabled();
+	const bool canonicalRegistration = HolyLib::LuaPack::SupportsCanonicalRegistration();
+	const int fileID = g_pDataPack->m_pClientLuaFiles->FindStringIndex(fileName->c_str());
+	const bool existingRegistration = fileID > 0 && fileID != INVALID_STRING_INDEX;
+	if (!enabled || !canonicalRegistration || !existingRegistration)
+		return false;
+
+	std::string source;
+	const bool sourceReadable = ReadLuaAutoRefreshSource(*fileRelPath, *fileName, source);
+	bool sourceChanged = true;
+	if (sourceReadable)
+	{
+		if (LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID))
+		{
+			std::shared_lock<std::shared_mutex> lock(entry->mutex);
+			sourceChanged = !entry->hasSourceContent || entry->sourceContent != source;
+		}
+	}
+	const bool captureAndRescan = HolyLib::LuaPack::Policy::ShouldCaptureAutoRefresh(
+		enabled, canonicalRegistration,
+		existingRegistration, sourceReadable, sourceChanged);
+	if (!captureAndRescan)
+	{
+		if (!sourceReadable)
+		{
+			Warning(PROJECT_NAME " - luapack: could not read unhandled auto refresh for existing client Lua registration \"%s\"\n",
+				fileName->c_str());
+			return false;
+		}
+		return true;
+	}
+
+	HolyLib::LuaPack::CaptureFileContents(*fileName, source);
+	// A current server-side shared cache does not prove that a connected client
+	// received or executed the changed bytes. If the trampoline already reached
+	// AddOrUpdateFile, sourceChanged above is false because that hook updated the
+	// LuaPack entry; otherwise this bypass path must always stage an active rescan.
+	g_pLuaDataPack.AddFileContents(*fileName, source);
+	Msg(PROJECT_NAME " - luapack: captured auto refresh for existing client Lua registration \"%s\"\n",
+		fileName->c_str());
+	return true;
+}
+
+static bool hook_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack(
+	const std::string* fileRelPath, const std::string* fileName,
+	const std::string* fileExt)
+{
+	auto trampoline = detour_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack.GetTrampoline<
+		Symbols::GarrysMod_AutoRefresh_HandleChange_Lua>();
+#if defined(MODULE_EXISTS_AUTOREFRESH)
+	if (HolyLib::AutoRefresh::RunPreLuaChange(fileRelPath, fileName, fileExt))
+		return true;
+#endif
+
+	const bool originalHandled = trampoline(fileRelPath, fileName, fileExt);
+	const bool luaPackHandled = CaptureExistingLuaPackAutoRefresh(
+		fileRelPath, fileName, fileExt);
+
+#if defined(MODULE_EXISTS_AUTOREFRESH)
+	HolyLib::AutoRefresh::RunPostLuaChange(fileRelPath, fileName, fileExt);
+#endif
+	return originalHandled || luaPackHandled;
+}
+
+void HolyLib::GModDataPack::InstallLuaAutoRefreshDetour()
+{
+	if (DETOUR_ISVALID(detour_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack))
+		return;
+
+	SourceSDK::FactoryLoader serverLoader("server");
+	// Category zero is deliberate: this is a shared ingress used by two optional
+	// modules and must not disappear when either module alone is toggled off.
+	Detour::Create(
+		&detour_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack,
+		"GarrysMod::AutoRefresh::HandleChange_Lua (shared)",
+		serverLoader.GetModule(), Symbols::GarrysMod_AutoRefresh_HandleChange_LuaSym,
+		(void*)hook_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack, 0
+	);
+}
 
 bool HolyLib::LuaPack::SupportsCanonicalRegistration()
 {
@@ -2205,6 +2333,8 @@ bool HolyLib::LuaPack::SupportsCanonicalRegistration()
 		DETOUR_ISENABLED(detour_GModDataPack_AddOrUpdateFile) &&
 		DETOUR_ISVALID(detour_GModDataPack_SendFileToClient) &&
 		DETOUR_ISENABLED(detour_GModDataPack_SendFileToClient) &&
+		DETOUR_ISVALID(detour_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack) &&
+		DETOUR_ISENABLED(detour_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack) &&
 		Gameserver_HasExactGModSender();
 #else
 	return false;
@@ -2578,6 +2708,21 @@ static void DrainActiveLuaHashRefreshes()
 	}
 }
 
+static void ReportActiveLuaHashRefreshAcknowledgements()
+{
+	if (g_activeHashRefreshNativeAcknowledgements == 0 &&
+		g_activeHashRefreshCanonicalAcknowledgements == 0)
+	{
+		return;
+	}
+
+	Msg(PROJECT_NAME " - luapack: active hot refresh acknowledged %u native and %u canonical file request(s)\n",
+		g_activeHashRefreshNativeAcknowledgements,
+		g_activeHashRefreshCanonicalAcknowledgements);
+	g_activeHashRefreshNativeAcknowledgements = 0;
+	g_activeHashRefreshCanonicalAcknowledgements = 0;
+}
+
 static bool GetNativeLuaHash(int fileID, GarrysMod::Lua::LuaFile* luaFile, std::array<unsigned char, 32>& output)
 {
 	LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID);
@@ -2767,6 +2912,8 @@ static bool SendNativeLuaFile(GModDataPack* pDataPack, int clientIdx, int fileID
 		auto pendingHash = pendingHashes.find(fileID);
 		const bool requestedHashMatchesNative = pendingHash != pendingHashes.end() &&
 			pendingHash->second == nativeHash;
+		if (requestedHashMatchesNative)
+			++g_activeHashRefreshNativeAcknowledgements;
 		if (!HolyLib::LuaPack::Policy::NativeHashMatches(nativeHashes, fileID, nativeHash))
 		{
 			// Receipt of this body request proves the client processed the staged hash
@@ -2897,6 +3044,8 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 			const bool publishedHashMatchesCanonical = pendingHash != pendingHashes.end() &&
 				std::equal(pendingHash->second.begin(), pendingHash->second.end(),
 					static_cast<const unsigned char*>(delivery.compressed->GetBase()));
+			if (publishedHashMatchesCanonical)
+				++g_activeHashRefreshCanonicalAcknowledgements;
 			if (HolyLib::LuaPack::Policy::NeedsOrderedCanonicalHash(clientActive,
 				nativeHash != nativeHashes.end(), publishedHashMatchesCanonical))
 			{
@@ -3454,6 +3603,7 @@ void CGModDataPackModule::Think(bool bSimulating)
 		}
 	}
 	DrainActiveLuaHashRefreshes();
+	ReportActiveLuaHashRefreshAcknowledgements();
 
 	// ServerInfo serializes the complete Lua string-table baseline atomically. Admit
 	// only the configured number of already-accepted physical/parked clients here,
@@ -3629,6 +3779,8 @@ void CGModDataPackModule::InitDetour(bool bPreServer)
 	if (bPreServer)
 		return;
 
+	HolyLib::GModDataPack::InstallLuaAutoRefreshDetour();
+
 	DETOUR_PREPARE_THISCALL();
 #if defined(SYSTEM_LINUX)
 	SourceSDK::FactoryLoader engine_loader("engine");
@@ -3695,6 +3847,8 @@ void CGModDataPackModule::LevelShutdown()
 	g_requiredStubScheduler.Reset();
 	g_luaPackServerInfoScheduler.Reset();
 	g_luaPackRegistrationRefresh.Reset();
+	g_activeHashRefreshNativeAcknowledgements = 0;
+	g_activeHashRefreshCanonicalAcknowledgements = 0;
 	HolyLib::LuaPack::LevelShutdown();
 	g_pLuaDataPack.Shutdown();
 }
@@ -3706,5 +3860,7 @@ void CGModDataPackModule::Shutdown()
 	g_requiredStubScheduler.Reset();
 	g_luaPackServerInfoScheduler.Reset();
 	g_luaPackRegistrationRefresh.Reset();
+	g_activeHashRefreshNativeAcknowledgements = 0;
+	g_activeHashRefreshCanonicalAcknowledgements = 0;
 	HolyLib::LuaPack::Shutdown();
 }

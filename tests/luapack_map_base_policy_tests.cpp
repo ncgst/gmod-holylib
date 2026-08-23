@@ -831,6 +831,12 @@ int main()
 	assert(!ShouldQueueActiveHashRefresh(true, true, true, false, true));
 	assert(!ShouldQueueActiveHashRefresh(true, true, false, false, false));
 	assert(!ShouldQueueActiveHashRefresh(false, true, true, false, false));
+	assert(ShouldCaptureAutoRefresh(true, true, true, true, true));
+	assert(!ShouldCaptureAutoRefresh(true, true, false, true, true));
+	assert(!ShouldCaptureAutoRefresh(true, true, true, false, true));
+	assert(!ShouldCaptureAutoRefresh(true, true, true, true, false));
+	assert(!ShouldCaptureAutoRefresh(true, false, true, true, true));
+	assert(!ShouldCaptureAutoRefresh(false, true, true, true, true));
 	assert(SelectActiveHashRefresh(true, Action::Native, false, false) ==
 		ActiveHashRefreshAction::Native);
 	assert(SelectActiveHashRefresh(true, Action::Native, true, false) ==
