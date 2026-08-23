@@ -1217,7 +1217,8 @@ public:
 		return entry->IsContentReady() && entry->hashPublished;
 	}
 
-	void AddFileContents(std::string fileName, std::string content)
+	void AddFileContents(std::string fileName, std::string content,
+		bool forceActiveHashRefresh = false)
 	{
 		if (!g_pDataPack)
 			return;
@@ -1262,6 +1263,8 @@ public:
 				bLuaPackEnabled, bCanonicalRegistration);
 		if (bSameSource && pEntry.IsContentReady() && bSameProcessConfig) // Nothing changed
 		{
+			if (forceActiveHashRefresh)
+				pEntry.activeHashRefreshPending = true;
 			if (!pEntry.contentHashReady)
 			{
 				pEntry.contentHash = HashClientLuaString(pEntry.content);
@@ -2236,6 +2239,7 @@ enum class LuaPackDiskRefreshResult
 	Resolved,
 	Unreadable,
 	Unchanged,
+	RescanQueued,
 	Captured,
 };
 
@@ -2268,7 +2272,7 @@ static LuaPackDiskRefreshResult ResolveExistingLuaRegistration(
 
 static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
 	const std::string& fileRelPath, const std::string& fileName,
-	const char* telemetryKind)
+	const char* telemetryKind, bool recoverUnchanged)
 {
 	if (!IsGModDataPackModuleEnabled() || !g_pFullFileSystem || !g_pDataPack ||
 		!g_pDataPack->m_pClientLuaFiles || !HolyLib::LuaPack::IsEnabled() ||
@@ -2306,6 +2310,14 @@ static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
 				telemetryKind ? telemetryKind : "disk", registeredName.c_str());
 			return LuaPackDiskRefreshResult::Unreadable;
 		}
+		if (HolyLib::LuaPack::Policy::ShouldQueueExplicitRefreshRecovery(
+			recoverUnchanged, true, true, true, sourceReadable, sourceChanged))
+		{
+			g_pLuaDataPack.AddFileContents(registeredName, source, true);
+			Msg(PROJECT_NAME " - luapack: queued explicit refresh recovery for existing client Lua registration \"%s\"\n",
+				registeredName.c_str());
+			return LuaPackDiskRefreshResult::RescanQueued;
+		}
 		return LuaPackDiskRefreshResult::Unchanged;
 	}
 
@@ -2336,7 +2348,7 @@ static bool hook_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack(
 	if (fileRelPath && fileName && fileExt && fileExt->compare(0, 3, "lua") == 0)
 	{
 		luaPackResult = CaptureExistingLuaPackDiskRefresh(
-			*fileRelPath, *fileName, "auto");
+			*fileRelPath, *fileName, "auto", false);
 	}
 	const bool luaPackHandled = luaPackResult == LuaPackDiskRefreshResult::Unchanged ||
 		luaPackResult == LuaPackDiskRefreshResult::Captured;
@@ -3376,7 +3388,7 @@ LUA_FUNCTION_STATIC(gmoddatapack_RefreshExistingLuaFile)
 	const char* requestedPath = LUA->CheckString(1);
 	const LuaPackDiskRefreshResult result = CaptureExistingLuaPackDiskRefresh(
 		requestedPath ? requestedPath : "", requestedPath ? requestedPath : "",
-		"explicit");
+		"explicit", true);
 
 	const char* status = "not_eligible";
 	switch (result)
@@ -3393,6 +3405,9 @@ LUA_FUNCTION_STATIC(gmoddatapack_RefreshExistingLuaFile)
 		case LuaPackDiskRefreshResult::Unchanged:
 			status = "unchanged";
 			break;
+		case LuaPackDiskRefreshResult::RescanQueued:
+			status = "rescan_queued";
+			break;
 		case LuaPackDiskRefreshResult::Captured:
 			status = "captured";
 			break;
@@ -3400,7 +3415,8 @@ LUA_FUNCTION_STATIC(gmoddatapack_RefreshExistingLuaFile)
 			break;
 	}
 
-	LUA->PushBool(result == LuaPackDiskRefreshResult::Captured);
+	LUA->PushBool(result == LuaPackDiskRefreshResult::Captured ||
+		result == LuaPackDiskRefreshResult::RescanQueued);
 	LUA->PushString(status);
 	return 2;
 }

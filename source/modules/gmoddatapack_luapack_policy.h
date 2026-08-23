@@ -763,6 +763,17 @@ namespace HolyLib::LuaPack::Policy
 			existingRegistration && sourceReadable && sourceChanged;
 	}
 
+	// An explicit recovery may run after GMod has already refreshed HolyLib's
+	// server-side source cache without proving that an active client received the
+	// new identity. Requeue that existing identity only for the explicit path.
+	constexpr bool ShouldQueueExplicitRefreshRecovery(bool explicitRecovery,
+		bool enabled, bool canonicalRegistration, bool existingRegistration,
+		bool sourceReadable, bool sourceChanged)
+	{
+		return explicitRecovery && enabled && canonicalRegistration &&
+			existingRegistration && sourceReadable && !sourceChanged;
+	}
+
 	// Auto-refresh callbacks and volume-backed hotfix tools may identify the same
 	// Lua file as a canonical registration ("foo/bar.lua"), a GAME path
 	// ("lua/foo/bar.lua"), or an addon source path

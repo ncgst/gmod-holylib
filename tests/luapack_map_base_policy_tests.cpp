@@ -837,6 +837,20 @@ int main()
 	assert(!ShouldCaptureAutoRefresh(true, true, true, true, false));
 	assert(!ShouldCaptureAutoRefresh(true, false, true, true, true));
 	assert(!ShouldCaptureAutoRefresh(false, true, true, true, true));
+	assert(ShouldQueueExplicitRefreshRecovery(
+		true, true, true, true, true, false));
+	assert(!ShouldQueueExplicitRefreshRecovery(
+		false, true, true, true, true, false));
+	assert(!ShouldQueueExplicitRefreshRecovery(
+		true, true, true, true, true, true));
+	assert(!ShouldQueueExplicitRefreshRecovery(
+		true, true, true, false, true, false));
+	assert(!ShouldQueueExplicitRefreshRecovery(
+		true, true, true, true, false, false));
+	assert(!ShouldQueueExplicitRefreshRecovery(
+		true, false, true, true, true, false));
+	assert(!ShouldQueueExplicitRefreshRecovery(
+		true, true, false, true, true, false));
 	std::string refreshPath;
 	assert(NormalizeExistingLuaRefreshPath("ncg/modules/patchs/cl_init.lua", refreshPath));
 	assert(refreshPath == "ncg/modules/patchs/cl_init.lua");
