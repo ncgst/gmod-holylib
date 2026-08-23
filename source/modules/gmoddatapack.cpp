@@ -2228,25 +2228,65 @@ static bool ReadLuaAutoRefreshSource(const std::string& fileRelPath,
 	return !fileName.empty() && readPath("lua/" + fileName, "GAME");
 }
 
-static bool CaptureExistingLuaPackAutoRefresh(const std::string* fileRelPath,
-	const std::string* fileName, const std::string* fileExt)
+enum class LuaPackDiskRefreshResult
 {
-	if (!IsGModDataPackModuleEnabled() || !fileRelPath || !fileName || !fileExt ||
-		fileExt->compare(0, 3, "lua") != 0 || !g_pFullFileSystem || !g_pDataPack ||
-		!g_pDataPack->m_pClientLuaFiles)
+	NotEligible,
+	InvalidPath,
+	UnknownRegistration,
+	Resolved,
+	Unreadable,
+	Unchanged,
+	Captured,
+};
+
+static LuaPackDiskRefreshResult ResolveExistingLuaRegistration(
+	const std::string& fileRelPath, const std::string& fileName,
+	int& fileID, std::string& registeredName)
+{
+	if (!g_pDataPack || !g_pDataPack->m_pClientLuaFiles)
+		return LuaPackDiskRefreshResult::NotEligible;
+
+	const HolyLib::LuaPack::Policy::LuaRefreshPathResolution resolution =
+		HolyLib::LuaPack::Policy::ResolveExistingLuaRefreshPath(
+			fileRelPath, fileName,
+			[&](const std::string& candidate) -> bool
+			{
+				const int candidateID = g_pDataPack->m_pClientLuaFiles->FindStringIndex(
+					candidate.c_str());
+				if (candidateID <= 0 || candidateID == INVALID_STRING_INDEX)
+					return false;
+				fileID = candidateID;
+				return true;
+			},
+			registeredName);
+	if (resolution == HolyLib::LuaPack::Policy::LuaRefreshPathResolution::ExistingRegistration)
+		return LuaPackDiskRefreshResult::Resolved;
+	if (resolution == HolyLib::LuaPack::Policy::LuaRefreshPathResolution::UnknownRegistration)
+		return LuaPackDiskRefreshResult::UnknownRegistration;
+	return LuaPackDiskRefreshResult::InvalidPath;
+}
+
+static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
+	const std::string& fileRelPath, const std::string& fileName,
+	const char* telemetryKind)
+{
+	if (!IsGModDataPackModuleEnabled() || !g_pFullFileSystem || !g_pDataPack ||
+		!g_pDataPack->m_pClientLuaFiles || !HolyLib::LuaPack::IsEnabled() ||
+		!HolyLib::LuaPack::SupportsCanonicalRegistration())
 	{
-		return false;
+		return LuaPackDiskRefreshResult::NotEligible;
 	}
 
-	const bool enabled = HolyLib::LuaPack::IsEnabled();
-	const bool canonicalRegistration = HolyLib::LuaPack::SupportsCanonicalRegistration();
-	const int fileID = g_pDataPack->m_pClientLuaFiles->FindStringIndex(fileName->c_str());
-	const bool existingRegistration = fileID > 0 && fileID != INVALID_STRING_INDEX;
-	if (!enabled || !canonicalRegistration || !existingRegistration)
-		return false;
+	int fileID = INVALID_STRING_INDEX;
+	std::string registeredName;
+	const LuaPackDiskRefreshResult resolved = ResolveExistingLuaRegistration(
+		fileRelPath, fileName, fileID, registeredName);
+	if (resolved != LuaPackDiskRefreshResult::Resolved)
+		return resolved;
 
 	std::string source;
-	const bool sourceReadable = ReadLuaAutoRefreshSource(*fileRelPath, *fileName, source);
+	const bool sourceReadable = ReadLuaAutoRefreshSource(
+		fileRelPath, registeredName, source);
 	bool sourceChanged = true;
 	if (sourceReadable)
 	{
@@ -2257,28 +2297,27 @@ static bool CaptureExistingLuaPackAutoRefresh(const std::string* fileRelPath,
 		}
 	}
 	const bool captureAndRescan = HolyLib::LuaPack::Policy::ShouldCaptureAutoRefresh(
-		enabled, canonicalRegistration,
-		existingRegistration, sourceReadable, sourceChanged);
+		true, true, true, sourceReadable, sourceChanged);
 	if (!captureAndRescan)
 	{
 		if (!sourceReadable)
 		{
-			Warning(PROJECT_NAME " - luapack: could not read unhandled auto refresh for existing client Lua registration \"%s\"\n",
-				fileName->c_str());
-			return false;
+			Warning(PROJECT_NAME " - luapack: could not read %s refresh for existing client Lua registration \"%s\"\n",
+				telemetryKind ? telemetryKind : "disk", registeredName.c_str());
+			return LuaPackDiskRefreshResult::Unreadable;
 		}
-		return true;
+		return LuaPackDiskRefreshResult::Unchanged;
 	}
 
-	HolyLib::LuaPack::CaptureFileContents(*fileName, source);
+	HolyLib::LuaPack::CaptureFileContents(registeredName, source);
 	// A current server-side shared cache does not prove that a connected client
 	// received or executed the changed bytes. If the trampoline already reached
 	// AddOrUpdateFile, sourceChanged above is false because that hook updated the
 	// LuaPack entry; otherwise this bypass path must always stage an active rescan.
-	g_pLuaDataPack.AddFileContents(*fileName, source);
-	Msg(PROJECT_NAME " - luapack: captured auto refresh for existing client Lua registration \"%s\"\n",
-		fileName->c_str());
-	return true;
+	g_pLuaDataPack.AddFileContents(registeredName, source);
+	Msg(PROJECT_NAME " - luapack: captured %s refresh for existing client Lua registration \"%s\"\n",
+		telemetryKind ? telemetryKind : "disk", registeredName.c_str());
+	return LuaPackDiskRefreshResult::Captured;
 }
 
 static bool hook_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack(
@@ -2293,8 +2332,14 @@ static bool hook_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack(
 #endif
 
 	const bool originalHandled = trampoline(fileRelPath, fileName, fileExt);
-	const bool luaPackHandled = CaptureExistingLuaPackAutoRefresh(
-		fileRelPath, fileName, fileExt);
+	LuaPackDiskRefreshResult luaPackResult = LuaPackDiskRefreshResult::NotEligible;
+	if (fileRelPath && fileName && fileExt && fileExt->compare(0, 3, "lua") == 0)
+	{
+		luaPackResult = CaptureExistingLuaPackDiskRefresh(
+			*fileRelPath, *fileName, "auto");
+	}
+	const bool luaPackHandled = luaPackResult == LuaPackDiskRefreshResult::Unchanged ||
+		luaPackResult == LuaPackDiskRefreshResult::Captured;
 
 #if defined(MODULE_EXISTS_AUTOREFRESH)
 	HolyLib::AutoRefresh::RunPostLuaChange(fileRelPath, fileName, fileExt);
@@ -3326,6 +3371,40 @@ LUA_FUNCTION_STATIC(gmoddatapack_GetCompressedSize)
 	return 1;
 }
 
+LUA_FUNCTION_STATIC(gmoddatapack_RefreshExistingLuaFile)
+{
+	const char* requestedPath = LUA->CheckString(1);
+	const LuaPackDiskRefreshResult result = CaptureExistingLuaPackDiskRefresh(
+		requestedPath ? requestedPath : "", requestedPath ? requestedPath : "",
+		"explicit");
+
+	const char* status = "not_eligible";
+	switch (result)
+	{
+		case LuaPackDiskRefreshResult::InvalidPath:
+			status = "invalid_path";
+			break;
+		case LuaPackDiskRefreshResult::UnknownRegistration:
+			status = "unknown_registration";
+			break;
+		case LuaPackDiskRefreshResult::Unreadable:
+			status = "unreadable";
+			break;
+		case LuaPackDiskRefreshResult::Unchanged:
+			status = "unchanged";
+			break;
+		case LuaPackDiskRefreshResult::Captured:
+			status = "captured";
+			break;
+		default:
+			break;
+	}
+
+	LUA->PushBool(result == LuaPackDiskRefreshResult::Captured);
+	LUA->PushString(status);
+	return 2;
+}
+
 LUA_FUNCTION_STATIC(gmoddatapack_MarkAsTokenizeThread)
 {
 	Lua::ScopedThreadAccess pThreadScope;
@@ -3827,6 +3906,7 @@ void CGModDataPackModule::LuaInit(GarrysMod::Lua::ILuaInterface* pLua, bool bSer
 		Util::AddFunc(pLua, gmoddatapack_StripCode, "StripCode");
 		Util::AddFunc(pLua, gmoddatapack_GetStoredCode, "GetStoredCode");
 		Util::AddFunc(pLua, gmoddatapack_GetCompressedSize, "GetCompressedSize");
+		Util::AddFunc(pLua, gmoddatapack_RefreshExistingLuaFile, "RefreshExistingLuaFile");
 		Util::AddFunc(pLua, gmoddatapack_MarkAsTokenizeThread, "MarkAsTokenizeThread");
 
 		for (size_t i=0; i<(size_t)TK_EOF; ++i)

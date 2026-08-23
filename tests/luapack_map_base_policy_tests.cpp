@@ -837,6 +837,43 @@ int main()
 	assert(!ShouldCaptureAutoRefresh(true, true, true, true, false));
 	assert(!ShouldCaptureAutoRefresh(true, false, true, true, true));
 	assert(!ShouldCaptureAutoRefresh(false, true, true, true, true));
+	std::string refreshPath;
+	assert(NormalizeExistingLuaRefreshPath("ncg/modules/patchs/cl_init.lua", refreshPath));
+	assert(refreshPath == "ncg/modules/patchs/cl_init.lua");
+	assert(NormalizeExistingLuaRefreshPath("lua/ncg/modules/patchs/cl_init.lua", refreshPath));
+	assert(refreshPath == "ncg/modules/patchs/cl_init.lua");
+	assert(NormalizeExistingLuaRefreshPath(
+		"addons/ncg/lua/ncg/modules/patchs/cl_init.lua", refreshPath));
+	assert(refreshPath == "ncg/modules/patchs/cl_init.lua");
+	assert(NormalizeExistingLuaRefreshPath(
+		"addons\\ncg\\lua\\ncg\\modules\\patchs\\cl_init.lua", refreshPath));
+	assert(refreshPath == "ncg/modules/patchs/cl_init.lua");
+	assert(!NormalizeExistingLuaRefreshPath("/lua/ncg/cl_init.lua", refreshPath));
+	assert(!NormalizeExistingLuaRefreshPath("C:/lua/ncg/cl_init.lua", refreshPath));
+	assert(!NormalizeExistingLuaRefreshPath("lua/ncg/../cl_init.lua", refreshPath));
+	assert(!NormalizeExistingLuaRefreshPath("addons/ncg/cl_init.lua", refreshPath));
+	assert(!NormalizeExistingLuaRefreshPath("lua/ncg/cl_init.txt", refreshPath));
+	const std::unordered_set<std::string> existingRefreshRegistrations = {
+		"ncg/modules/patchs/cl_init.lua",
+	};
+	auto registrationExists = [&](const std::string& candidate)
+	{
+		return existingRefreshRegistrations.find(candidate) !=
+			existingRefreshRegistrations.end();
+	};
+	assert(ResolveExistingLuaRefreshPath(
+		"addons/ncg/lua/ncg/modules/patchs/cl_init.lua", "cl_init.lua",
+		registrationExists, refreshPath) == LuaRefreshPathResolution::ExistingRegistration);
+	assert(refreshPath == "ncg/modules/patchs/cl_init.lua");
+	assert(ResolveExistingLuaRefreshPath(
+		"addons/ncg/lua/ncg/modules/new/cl_init.lua", "ncg/modules/new/cl_init.lua",
+		registrationExists, refreshPath) == LuaRefreshPathResolution::UnknownRegistration);
+	assert(refreshPath.empty());
+	assert(ResolveExistingLuaRefreshPath(
+		"../outside.lua", "../outside.lua", registrationExists, refreshPath) ==
+		LuaRefreshPathResolution::InvalidPath);
+	assert(refreshPath.empty());
+	assert(existingRefreshRegistrations.size() == 1);
 	assert(SelectActiveHashRefresh(true, Action::Native, false, false) ==
 		ActiveHashRefreshAction::Native);
 	assert(SelectActiveHashRefresh(true, Action::Native, true, false) ==

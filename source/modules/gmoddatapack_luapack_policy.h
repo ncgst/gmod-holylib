@@ -763,6 +763,93 @@ namespace HolyLib::LuaPack::Policy
 			existingRegistration && sourceReadable && sourceChanged;
 	}
 
+	// Auto-refresh callbacks and volume-backed hotfix tools may identify the same
+	// Lua file as a canonical registration ("foo/bar.lua"), a GAME path
+	// ("lua/foo/bar.lua"), or an addon source path
+	// ("addons/name/lua/foo/bar.lua"). Resolve those spellings without ever
+	// accepting an absolute/traversing path or manufacturing a registration.
+	inline bool NormalizeExistingLuaRefreshPath(std::string path, std::string& output)
+	{
+		output.clear();
+		std::replace(path.begin(), path.end(), '\\', '/');
+		while (path.compare(0, 2, "./") == 0)
+			path.erase(0, 2);
+
+		if (path.empty() || path.front() == '/' || path.find(':') != std::string::npos)
+			return false;
+
+		if (path.compare(0, 4, "lua/") == 0)
+		{
+			path.erase(0, 4);
+		} else if (path.compare(0, 7, "addons/") == 0) {
+			const std::size_t luaRoot = path.find("/lua/");
+			if (luaRoot == std::string::npos)
+				return false;
+			path.erase(0, luaRoot + 5);
+		}
+
+		if (path.empty() || path.size() < 5 ||
+			path.compare(path.size() - 4, 4, ".lua") != 0)
+		{
+			return false;
+		}
+
+		std::size_t segmentStart = 0;
+		while (segmentStart <= path.size())
+		{
+			const std::size_t segmentEnd = path.find('/', segmentStart);
+			const std::size_t length = (segmentEnd == std::string::npos
+				? path.size() : segmentEnd) - segmentStart;
+			if (length == 0 || (length == 1 && path[segmentStart] == '.') ||
+				(length == 2 && path[segmentStart] == '.' && path[segmentStart + 1] == '.'))
+			{
+				return false;
+			}
+			if (segmentEnd == std::string::npos)
+				break;
+			segmentStart = segmentEnd + 1;
+		}
+
+		output = path;
+		return true;
+	}
+
+	enum class LuaRefreshPathResolution
+	{
+		InvalidPath,
+		UnknownRegistration,
+		ExistingRegistration,
+	};
+
+	template <typename Exists>
+	LuaRefreshPathResolution ResolveExistingLuaRefreshPath(
+		const std::string& fileRelPath, const std::string& fileName,
+		Exists&& exists, std::string& output)
+	{
+		output.clear();
+		bool normalizedAny = false;
+		std::string lastNormalized;
+		auto tryCandidate = [&](const std::string& candidate) -> bool
+		{
+			std::string normalized;
+			if (!NormalizeExistingLuaRefreshPath(candidate, normalized))
+				return false;
+			normalizedAny = true;
+			if (normalized == lastNormalized)
+				return false;
+			lastNormalized = normalized;
+			if (!exists(normalized))
+				return false;
+			output = normalized;
+			return true;
+		};
+
+		if (tryCandidate(fileName) || tryCandidate(fileRelPath))
+			return LuaRefreshPathResolution::ExistingRegistration;
+		return normalizedAny ? LuaRefreshPathResolution::UnknownRegistration
+			: LuaRefreshPathResolution::InvalidPath;
+	}
+
 	constexpr ActiveHashRefreshAction SelectActiveHashRefresh(bool clientActive,
 		Action fileAction, bool nativeHashKnown, bool nativeHashMatchesCurrent)
 	{
