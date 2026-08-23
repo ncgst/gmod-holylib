@@ -1134,6 +1134,7 @@ public:
 			luapackCanonical = false;
 			luapackPassthrough = false;
 			activeHashRefreshPending = false;
+			forceActiveHashRefreshPending = false;
 		}
 
 		std::string sourceContent = "";
@@ -1152,6 +1153,7 @@ public:
 		bool luapackCanonical = false;
 		bool luapackPassthrough = false;
 		bool activeHashRefreshPending = false;
+		bool forceActiveHashRefreshPending = false;
 	};
 
 	void QueueActiveHashRefresh(int fileID)
@@ -1181,11 +1183,13 @@ public:
 		if (HolyLib::LuaPack::Policy::ShouldQueueActiveHashRefresh(
 			HolyLib::LuaPack::IsEnabled(), HolyLib::LuaPack::SupportsCanonicalRegistration(),
 			entry.activeHashRefreshPending, publishedHashChanged,
-			HolyLib::LuaPack::IsInitFile(fileName ? fileName : "")))
+			HolyLib::LuaPack::IsInitFile(fileName ? fileName : ""),
+			entry.forceActiveHashRefreshPending))
 		{
 			QueueActiveHashRefresh(fileID);
 		}
 		entry.activeHashRefreshPending = false;
+		entry.forceActiveHashRefreshPending = false;
 	}
 
 	void Initialize();
@@ -1264,7 +1268,10 @@ public:
 		if (bSameSource && pEntry.IsContentReady() && bSameProcessConfig) // Nothing changed
 		{
 			if (forceActiveHashRefresh)
+			{
 				pEntry.activeHashRefreshPending = true;
+				pEntry.forceActiveHashRefreshPending = true;
+			}
 			if (!pEntry.contentHashReady)
 			{
 				pEntry.contentHash = HashClientLuaString(pEntry.content);
@@ -1305,6 +1312,7 @@ public:
 		pEntry.luapackCanonical = bLuaPackCanonical;
 		pEntry.luapackPassthrough = HolyLib::LuaPack::Policy::UsesPassthroughProcessing(bLuaPackEnabled);
 		pEntry.activeHashRefreshPending = true;
+		pEntry.forceActiveHashRefreshPending = forceActiveHashRefresh;
 		pEntry.processed = false;
 		pEntry.hashPublished = false;
 

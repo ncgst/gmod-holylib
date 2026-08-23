@@ -828,6 +828,8 @@ int main()
 	// first publication of a late path) stays on the engine broadcast.
 	assert(ShouldQueueActiveHashRefresh(true, true, true, false, false));
 	assert(!ShouldQueueActiveHashRefresh(true, true, true, true, false));
+	assert(ShouldQueueActiveHashRefresh(true, true, true, true, false, true));
+	assert(!ShouldQueueActiveHashRefresh(true, true, true, true, true, true));
 	assert(!ShouldQueueActiveHashRefresh(true, true, true, false, true));
 	assert(!ShouldQueueActiveHashRefresh(true, true, false, false, false));
 	assert(!ShouldQueueActiveHashRefresh(false, true, true, false, false));

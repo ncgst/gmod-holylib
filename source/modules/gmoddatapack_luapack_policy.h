@@ -740,14 +740,15 @@ namespace HolyLib::LuaPack::Policy
 
 	// The global Lua registration remains the generation-independent canonical stub.
 	// An existing path hotfix therefore republishes byte-identical userdata and Source
-	// emits no string-table change. Queue an explicit per-client identity only for that
-	// no-op transition; ordinary changed registrations retain the engine broadcast.
+	// emits no string-table change. Queue an explicit per-client identity for that
+	// no-op transition. An operator-requested recovery may also force the queue after
+	// vanilla changed userdata without proving execution; ordinary changes do not.
 	constexpr bool ShouldQueueActiveHashRefresh(bool enabled,
 		bool canonicalRegistration, bool registrationTransition,
-		bool publishedHashChanged, bool initFile)
+		bool publishedHashChanged, bool initFile, bool forceRefresh = false)
 	{
 		return enabled && canonicalRegistration && registrationTransition &&
-			!publishedHashChanged && !initFile;
+			(!publishedHashChanged || forceRefresh) && !initFile;
 	}
 
 	// Some filesystem autorefresh paths bypass GModDataPack::AddOrUpdateFile.
