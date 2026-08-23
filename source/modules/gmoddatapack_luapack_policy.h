@@ -738,6 +738,32 @@ namespace HolyLib::LuaPack::Policy
 		Canonical,
 	};
 
+	enum class ActiveHashRefreshEntryAction
+	{
+		Retry,
+		RepairForcedSourceHash,
+		Ready,
+	};
+
+	// A forced existing-registration recovery must not wait forever when the
+	// compressed canonical body is already ready but its native source identity is
+	// not. Only that explicit one-file path may repair the source hash synchronously;
+	// ordinary registration work remains on the bounded worker.
+	constexpr ActiveHashRefreshEntryAction SelectActiveHashRefreshEntryAction(
+		bool forceRefresh, bool passthrough, bool hasSource, bool sourceHashReady,
+		bool contentHashReady, bool hashPublished)
+	{
+		if (!hasSource || !contentHashReady || !hashPublished)
+			return ActiveHashRefreshEntryAction::Retry;
+		if (!sourceHashReady)
+		{
+			return forceRefresh && passthrough
+				? ActiveHashRefreshEntryAction::RepairForcedSourceHash
+				: ActiveHashRefreshEntryAction::Retry;
+		}
+		return ActiveHashRefreshEntryAction::Ready;
+	}
+
 	// The global Lua registration remains the generation-independent canonical stub.
 	// An existing path hotfix therefore republishes byte-identical userdata and Source
 	// emits no string-table change. Queue an explicit per-client identity for that

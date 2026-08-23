@@ -1165,6 +1165,18 @@ public:
 			m_pForcedActiveHashRefreshes[fileID].set();
 	}
 
+	bool EnsureSourceHash(LuaPackEntry* entry)
+	{
+		if (!entry || !entry->luapackPassthrough || !entry->hasSourceContent)
+			return entry && entry->sourceHashReady;
+		if (!entry->sourceHashReady)
+		{
+			entry->sourceHash = HashClientLuaString(entry->sourceContent);
+			entry->sourceHashReady = true;
+		}
+		return true;
+	}
+
 	void PublishEntryHash(int fileID, LuaPackEntry& entry)
 	{
 		INetworkStringTable* table = g_pDataPack->m_pClientLuaFiles;
@@ -1272,6 +1284,9 @@ public:
 		{
 			if (forceActiveHashRefresh)
 			{
+				// Explicit recovery is a one-file operation. Make its native identity
+				// drain-ready even if an older ready payload predates source-hash caching.
+				EnsureSourceHash(&pEntry);
 				pEntry.activeHashRefreshPending = true;
 				pEntry.forceActiveHashRefreshPending = true;
 			}
@@ -1398,12 +1413,7 @@ public:
 
 	bool CompressFile(LuaPackEntry* pEntry, int fileID)
 	{
-		if (pEntry->luapackPassthrough && pEntry->hasSourceContent &&
-			!pEntry->sourceHashReady)
-		{
-			pEntry->sourceHash = HashClientLuaString(pEntry->sourceContent);
-			pEntry->sourceHashReady = true;
-		}
+		EnsureSourceHash(pEntry);
 		bool bSuccess = pEntry->Compress();
 		if (!bSuccess)
 			Warning(PROJECT_NAME " - gmoddatapack: Failed to compress lua file %i\n", fileID);
@@ -1585,9 +1595,14 @@ static SIMPLETHREAD_RETURNVALUE WorkerThread(void* pData)
 
 			LuaDataPack::LuaPackEntry* pEntry = &g_pLuaDataPack.m_pLuaFileCache[fileID];
 			std::lock_guard<std::shared_mutex> lock(pEntry->mutex);
-			if (pEntry->IsReady() || !pEntry->IsContentReady()) // Already done? Either we did it, or the main thread.
+			if (!pEntry->IsContentReady())
 				continue;
-				
+			// Source identity readiness is independent from compressed-body readiness.
+			// Repair it before treating an already-compressed entry as terminal.
+			g_pLuaDataPack.EnsureSourceHash(pEntry);
+			if (pEntry->IsReady()) // Already done? Either we did it, or the main thread.
+				continue;
+
 			g_pLuaDataPack.CompressFile(pEntry, fileID);
 		}
 	}
@@ -2559,12 +2574,21 @@ static void SendOriginalLuaFile(GModDataPack* pDataPack, int clientIdx, int file
 	detour_GModDataPack_SendFileToClient.GetTrampoline<Symbols::GModDataPack_SendFileToClient>()(pDataPack, clientIdx, fileID);
 }
 
+static CBaseClient* ResolveLuaPackClientBySlot(int clientIdx)
+{
+#if MODULE_EXISTS_GAMESERVER
+	return Gameserver_GetClientBySlot(clientIdx);
+#else
+	return Util::server ? Util::GetClientByIndex(clientIdx) : nullptr;
+#endif
+}
+
 static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned char* hash, size_t hashLength)
 {
 	if (!g_pDataPack || !g_pDataPack->m_pClientLuaFiles || !hash || hashLength != 32)
 		return false;
 
-	CBaseClient* client = Util::server ? Util::GetClientByIndex(clientIdx) : nullptr;
+	CBaseClient* client = ResolveLuaPackClientBySlot(clientIdx);
 	if (!client || !client->GetNetChannel())
 		return false;
 
@@ -2595,12 +2619,7 @@ static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned ch
 
 static bool RequestActiveClientLuaFiles(int clientIdx)
 {
-	CBaseClient* client = nullptr;
-#if MODULE_EXISTS_GAMESERVER
-	client = Gameserver_GetClientBySlot(clientIdx);
-#else
-	client = Util::server ? Util::GetClientByIndex(clientIdx) : nullptr;
-#endif
+	CBaseClient* client = ResolveLuaPackClientBySlot(clientIdx);
 	if (!Util::engineserver || !client || !client->IsActive() || !client->GetNetChannel())
 		return false;
 
@@ -2655,6 +2674,7 @@ static void DrainActiveLuaHashRefreshes()
 	unsigned int canonicalUpdates = 0;
 	unsigned int updatedFiles = 0;
 	unsigned int requestedScans = 0;
+	unsigned int forcedWithoutRecipient = 0;
 	std::size_t sentUpdates = 0;
 	std::size_t processed = 0;
 	std::array<std::size_t, ABSOLUTE_PLAYER_LIMIT> stagedUpdatesBySlot{};
@@ -2683,10 +2703,30 @@ static void DrainActiveLuaHashRefreshes()
 
 		ClientLuaHash sourceHash{};
 		ClientLuaHash canonicalHash{};
+		bool repairForcedSourceHash = false;
 		{
 			std::shared_lock<std::shared_mutex> lock(entry->mutex);
-			if (!entry->hasSourceContent || !entry->sourceHashReady ||
-				!entry->contentHashReady || !entry->hashPublished)
+			const auto entryAction = HolyLib::LuaPack::Policy::SelectActiveHashRefreshEntryAction(
+				forcedSlots.any(), entry->luapackPassthrough, entry->hasSourceContent,
+				entry->sourceHashReady, entry->contentHashReady, entry->hashPublished);
+			if (entryAction == HolyLib::LuaPack::Policy::ActiveHashRefreshEntryAction::Retry)
+			{
+				queueRetry(fileID);
+				continue;
+			}
+			repairForcedSourceHash = entryAction ==
+				HolyLib::LuaPack::Policy::ActiveHashRefreshEntryAction::RepairForcedSourceHash;
+			if (!repairForcedSourceHash)
+			{
+				sourceHash = entry->sourceHash;
+				canonicalHash = entry->contentHash;
+			}
+		}
+		if (repairForcedSourceHash)
+		{
+			std::lock_guard<std::shared_mutex> lock(entry->mutex);
+			if (!g_pLuaDataPack.EnsureSourceHash(entry) || !entry->contentHashReady ||
+				!entry->hashPublished)
 			{
 				queueRetry(fileID);
 				continue;
@@ -2697,14 +2737,10 @@ static void DrainActiveLuaHashRefreshes()
 
 		bool retryFile = false;
 		bool updatedFile = false;
+		const bool forcedFile = forcedSlots.any();
 		for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
 		{
-			CBaseClient* client = nullptr;
-#if MODULE_EXISTS_GAMESERVER
-			client = Gameserver_GetClientBySlot(slot);
-#else
-			client = Util::server ? Util::GetClientByIndex(slot) : nullptr;
-#endif
+			CBaseClient* client = ResolveLuaPackClientBySlot(slot);
 			if (!client || !client->IsActive() || !client->GetNetChannel())
 			{
 				forcedSlots.reset(slot);
@@ -2784,6 +2820,8 @@ static void DrainActiveLuaHashRefreshes()
 		}
 		if (updatedFile)
 			++updatedFiles;
+		else if (forcedFile && !retryFile)
+			++forcedWithoutRecipient;
 	}
 	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
 	{
@@ -2806,6 +2844,11 @@ static void DrainActiveLuaHashRefreshes()
 	{
 		Msg(PROJECT_NAME " - luapack: active hot refresh staged %u native and %u canonical per-client hash update(s) across %u file(s), then requested %u client Lua rescan(s)\n",
 			nativeUpdates, canonicalUpdates, updatedFiles, requestedScans);
+	}
+	if (forcedWithoutRecipient != 0)
+	{
+		Warning(PROJECT_NAME " - luapack: explicit hot refresh completed without an eligible active recipient for %u file(s)\n",
+			forcedWithoutRecipient);
 	}
 }
 

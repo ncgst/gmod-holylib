@@ -941,6 +941,20 @@ int main()
 	assert(!ShouldRequestActiveLuaScan(0));
 	assert(ShouldRequestActiveLuaScan(1));
 	assert(ShouldRequestActiveLuaScan(64));
+	assert(SelectActiveHashRefreshEntryAction(false, true, true, true, true, true) ==
+		ActiveHashRefreshEntryAction::Ready);
+	assert(SelectActiveHashRefreshEntryAction(false, true, true, false, true, true) ==
+		ActiveHashRefreshEntryAction::Retry);
+	assert(SelectActiveHashRefreshEntryAction(true, true, true, false, true, true) ==
+		ActiveHashRefreshEntryAction::RepairForcedSourceHash);
+	assert(SelectActiveHashRefreshEntryAction(true, false, true, false, true, true) ==
+		ActiveHashRefreshEntryAction::Retry);
+	assert(SelectActiveHashRefreshEntryAction(true, true, false, false, true, true) ==
+		ActiveHashRefreshEntryAction::Retry);
+	assert(SelectActiveHashRefreshEntryAction(true, true, true, false, false, true) ==
+		ActiveHashRefreshEntryAction::Retry);
+	assert(SelectActiveHashRefreshEntryAction(true, true, true, false, true, false) ==
+		ActiveHashRefreshEntryAction::Retry);
 
 	// The production helper emits the exact fixed-size payload parsed by
 	// CNetworkStringTable::ParseUpdate. An active rescan is a separate GMod message;
