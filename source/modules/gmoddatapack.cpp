@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <limits>
 #include <deque>
 #include <unordered_map>
@@ -1156,10 +1157,12 @@ public:
 		bool forceActiveHashRefreshPending = false;
 	};
 
-	void QueueActiveHashRefresh(int fileID)
+	void QueueActiveHashRefresh(int fileID, bool forceRefresh = false)
 	{
 		std::lock_guard<std::mutex> lock(m_pActiveHashRefreshQueueMutex);
 		m_pActiveHashRefreshQueue.push_back(fileID);
+		if (forceRefresh)
+			m_pForcedActiveHashRefreshes[fileID].set();
 	}
 
 	void PublishEntryHash(int fileID, LuaPackEntry& entry)
@@ -1186,7 +1189,7 @@ public:
 			HolyLib::LuaPack::IsInitFile(fileName ? fileName : ""),
 			entry.forceActiveHashRefreshPending))
 		{
-			QueueActiveHashRefresh(fileID);
+			QueueActiveHashRefresh(fileID, entry.forceActiveHashRefreshPending);
 		}
 		entry.activeHashRefreshPending = false;
 		entry.forceActiveHashRefreshPending = false;
@@ -1511,6 +1514,9 @@ public:
 	std::vector<int> m_pStringTableUpdateQueue;
 	std::mutex m_pStringTableUpdateQueueMutex;
 	std::vector<int> m_pActiveHashRefreshQueue;
+	// Explicit recovery bypasses stale delivery bookkeeping exactly once per slot;
+	// budget or send retries retain only the slots that did not receive an update.
+	std::unordered_map<int, std::bitset<ABSOLUTE_PLAYER_LIMIT>> m_pForcedActiveHashRefreshes;
 	std::mutex m_pActiveHashRefreshQueueMutex;
 
 	std::atomic<ThreadState> m_pWorkerThreadState;
@@ -1633,11 +1639,13 @@ void LuaDataPack::Shutdown()
 	{
 		std::lock_guard<std::mutex> lock(m_pActiveHashRefreshQueueMutex);
 		m_pActiveHashRefreshQueue.clear();
+		m_pForcedActiveHashRefreshes.clear();
 	}
 	for (LuaPackEntry& entry : m_pLuaFileCache)
 	{
 		std::lock_guard<std::shared_mutex> lock(entry.mutex);
 		entry.activeHashRefreshPending = false;
+		entry.forceActiveHashRefreshPending = false;
 	}
 
 	// We keep it, simply because then we can re-use stuff
@@ -2613,10 +2621,13 @@ static bool RequestActiveClientLuaFiles(int clientIdx)
 static void DrainActiveLuaHashRefreshes()
 {
 	std::vector<int> pending;
+	std::unordered_map<int, std::bitset<ABSOLUTE_PLAYER_LIMIT>> forcedPending;
 	{
 		std::lock_guard<std::mutex> lock(g_pLuaDataPack.m_pActiveHashRefreshQueueMutex);
 		pending = std::move(g_pLuaDataPack.m_pActiveHashRefreshQueue);
+		forcedPending = std::move(g_pLuaDataPack.m_pForcedActiveHashRefreshes);
 		g_pLuaDataPack.m_pActiveHashRefreshQueue.clear();
+		g_pLuaDataPack.m_pForcedActiveHashRefreshes.clear();
 	}
 	if (pending.empty())
 		return;
@@ -2632,6 +2643,14 @@ static void DrainActiveLuaHashRefreshes()
 	const std::size_t budget = static_cast<std::size_t>((std::max)(1,
 		gmoddatapack_luapack_registration_refresh_budget.GetInt()));
 	std::vector<int> retry;
+	std::unordered_map<int, std::bitset<ABSOLUTE_PLAYER_LIMIT>> forcedRetry;
+	auto queueRetry = [&](int fileID)
+	{
+		retry.push_back(fileID);
+		auto forced = forcedPending.find(fileID);
+		if (forced != forcedPending.end())
+			forcedRetry[fileID] |= forced->second;
+	};
 	unsigned int nativeUpdates = 0;
 	unsigned int canonicalUpdates = 0;
 	unsigned int updatedFiles = 0;
@@ -2643,12 +2662,16 @@ static void DrainActiveLuaHashRefreshes()
 	{
 		if (processed >= budget || sentUpdates >= budget)
 		{
-			retry.insert(retry.end(), pending.begin() + index, pending.end());
+			for (; index < pending.size(); ++index)
+				queueRetry(pending[index]);
 			break;
 		}
 		++processed;
 
 		const int fileID = pending[index];
+		std::bitset<ABSOLUTE_PLAYER_LIMIT> forcedSlots;
+		if (auto forced = forcedPending.find(fileID); forced != forcedPending.end())
+			forcedSlots = forced->second;
 		LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID);
 		if (!entry || fileID <= 0 || fileID >= g_pDataPack->m_pClientLuaFiles->GetNumStrings())
 			continue;
@@ -2665,7 +2688,7 @@ static void DrainActiveLuaHashRefreshes()
 			if (!entry->hasSourceContent || !entry->sourceHashReady ||
 				!entry->contentHashReady || !entry->hashPublished)
 			{
-				retry.push_back(fileID);
+				queueRetry(fileID);
 				continue;
 			}
 			sourceHash = entry->sourceHash;
@@ -2683,7 +2706,11 @@ static void DrainActiveLuaHashRefreshes()
 			client = Util::server ? Util::GetClientByIndex(slot) : nullptr;
 #endif
 			if (!client || !client->IsActive() || !client->GetNetChannel())
+			{
+				forcedSlots.reset(slot);
 				continue;
+			}
+			const bool forceRefresh = forcedSlots.test(slot);
 
 			const HolyLib::LuaPack::BaselineDecision baseline =
 				HolyLib::LuaPack::DecideFileBaselineForClient(slot, fileName);
@@ -2699,7 +2726,7 @@ static void DrainActiveLuaHashRefreshes()
 			const bool nativeHashMatches = HolyLib::LuaPack::Policy::NativeHashMatches(
 				nativeHashes, fileID, sourceHash);
 			const auto refresh = HolyLib::LuaPack::Policy::SelectActiveHashRefresh(
-				true, fileAction, nativeHashKnown, nativeHashMatches);
+				true, fileAction, nativeHashKnown, nativeHashMatches, forceRefresh);
 			const ClientLuaHash* targetHash = nullptr;
 			if (refresh == HolyLib::LuaPack::Policy::ActiveHashRefreshAction::Native)
 				targetHash = &sourceHash;
@@ -2708,8 +2735,9 @@ static void DrainActiveLuaHashRefreshes()
 			const bool targetHashAlreadyPending = targetHash &&
 				HolyLib::LuaPack::Policy::NativeHashMatches(pendingHashes, fileID, *targetHash);
 			if (!HolyLib::LuaPack::Policy::ShouldStageActiveHashRefresh(
-				refresh, targetHashAlreadyPending))
+				refresh, targetHashAlreadyPending, forceRefresh))
 			{
+				forcedSlots.reset(slot);
 				continue;
 			}
 			if (refresh != HolyLib::LuaPack::Policy::ActiveHashRefreshAction::None &&
@@ -2730,6 +2758,7 @@ static void DrainActiveLuaHashRefreshes()
 				++sentUpdates;
 				++stagedUpdatesBySlot[slot];
 				updatedFile = true;
+				forcedSlots.reset(slot);
 			}
 			else if (refresh == HolyLib::LuaPack::Policy::ActiveHashRefreshAction::Canonical)
 			{
@@ -2744,10 +2773,15 @@ static void DrainActiveLuaHashRefreshes()
 				++sentUpdates;
 				++stagedUpdatesBySlot[slot];
 				updatedFile = true;
+				forcedSlots.reset(slot);
 			}
 		}
 		if (retryFile)
+		{
 			retry.push_back(fileID);
+			if (forcedSlots.any())
+				forcedRetry[fileID] |= forcedSlots;
+		}
 		if (updatedFile)
 			++updatedFiles;
 	}
@@ -2765,6 +2799,8 @@ static void DrainActiveLuaHashRefreshes()
 		std::lock_guard<std::mutex> lock(g_pLuaDataPack.m_pActiveHashRefreshQueueMutex);
 		g_pLuaDataPack.m_pActiveHashRefreshQueue.insert(
 			g_pLuaDataPack.m_pActiveHashRefreshQueue.end(), retry.begin(), retry.end());
+		for (const auto& forced : forcedRetry)
+			g_pLuaDataPack.m_pForcedActiveHashRefreshes[forced.first] |= forced.second;
 	}
 	if (nativeUpdates != 0 || canonicalUpdates != 0)
 	{

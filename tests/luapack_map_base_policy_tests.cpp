@@ -919,17 +919,25 @@ int main()
 		ActiveHashRefreshAction::Native);
 	assert(SelectActiveHashRefresh(true, Action::Native, true, true) ==
 		ActiveHashRefreshAction::None);
+	assert(SelectActiveHashRefresh(true, Action::Native, true, true, true) ==
+		ActiveHashRefreshAction::Native);
 	assert(SelectActiveHashRefresh(true, Action::CanonicalStub, true, false) ==
 		ActiveHashRefreshAction::Canonical);
 	assert(SelectActiveHashRefresh(true, Action::CanonicalStub, false, false) ==
 		ActiveHashRefreshAction::None);
+	assert(SelectActiveHashRefresh(true, Action::CanonicalStub, false, false, true) ==
+		ActiveHashRefreshAction::Canonical);
 	assert(SelectActiveHashRefresh(false, Action::Native, false, false) ==
+		ActiveHashRefreshAction::None);
+	assert(SelectActiveHashRefresh(false, Action::Native, true, true, true) ==
 		ActiveHashRefreshAction::None);
 	assert(SelectActiveHashRefresh(true, Action::Reject, true, false) ==
 		ActiveHashRefreshAction::None);
 	assert(ShouldStageActiveHashRefresh(ActiveHashRefreshAction::Native, false));
 	assert(!ShouldStageActiveHashRefresh(ActiveHashRefreshAction::Native, true));
+	assert(ShouldStageActiveHashRefresh(ActiveHashRefreshAction::Native, true, true));
 	assert(!ShouldStageActiveHashRefresh(ActiveHashRefreshAction::None, false));
+	assert(!ShouldStageActiveHashRefresh(ActiveHashRefreshAction::None, true, true));
 	assert(!ShouldRequestActiveLuaScan(0));
 	assert(ShouldRequestActiveLuaScan(1));
 	assert(ShouldRequestActiveLuaScan(64));

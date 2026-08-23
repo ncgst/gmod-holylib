@@ -889,25 +889,27 @@ namespace HolyLib::LuaPack::Policy
 	}
 
 	constexpr ActiveHashRefreshAction SelectActiveHashRefresh(bool clientActive,
-		Action fileAction, bool nativeHashKnown, bool nativeHashMatchesCurrent)
+		Action fileAction, bool nativeHashKnown, bool nativeHashMatchesCurrent,
+		bool forceRefresh = false)
 	{
 		if (!clientActive)
 			return ActiveHashRefreshAction::None;
 		if (fileAction == Action::Native)
 		{
-			return nativeHashMatchesCurrent
+			return !forceRefresh && nativeHashMatchesCurrent
 				? ActiveHashRefreshAction::None
 				: ActiveHashRefreshAction::Native;
 		}
-		if (fileAction == Action::CanonicalStub && nativeHashKnown)
+		if (fileAction == Action::CanonicalStub && (nativeHashKnown || forceRefresh))
 			return ActiveHashRefreshAction::Canonical;
 		return ActiveHashRefreshAction::None;
 	}
 
 	constexpr bool ShouldStageActiveHashRefresh(ActiveHashRefreshAction action,
-		bool targetHashAlreadyPending)
+		bool targetHashAlreadyPending, bool forceRefresh = false)
 	{
-		return action != ActiveHashRefreshAction::None && !targetHashAlreadyPending;
+		return action != ActiveHashRefreshAction::None &&
+			(forceRefresh || !targetHashAlreadyPending);
 	}
 
 	constexpr bool ShouldRequestActiveLuaScan(std::size_t stagedHashUpdates)
