@@ -955,6 +955,19 @@ int main()
 		ActiveHashRefreshEntryAction::Retry);
 	assert(SelectActiveHashRefreshEntryAction(true, true, true, false, true, false) ==
 		ActiveHashRefreshEntryAction::Retry);
+	ActiveHashRefreshAttemptBudget activeRefreshBudget(1);
+	assert(activeRefreshBudget.TryConsume());
+	// A rejected/backpressured transport attempt is still charged by production.
+	// The next recipient must wait for another frame instead of bypassing the cap.
+	assert(!activeRefreshBudget.TryConsume());
+	assert(activeRefreshBudget.Attempts() == 1);
+	assert(activeRefreshBudget.Exhausted());
+	ActiveHashRefreshAttemptBudget zeroActiveRefreshBudget(0);
+	assert(zeroActiveRefreshBudget.TryConsume());
+	assert(!zeroActiveRefreshBudget.TryConsume());
+	assert(NextActiveHashRefreshSlot(0, 255) == 1);
+	assert(NextActiveHashRefreshSlot(127, 255) == 128);
+	assert(NextActiveHashRefreshSlot(254, 255) == 0);
 
 	// The production helper emits the exact fixed-size payload parsed by
 	// CNetworkStringTable::ParseUpdate. An active rescan is a separate GMod message;

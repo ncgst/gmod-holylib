@@ -745,6 +745,47 @@ namespace HolyLib::LuaPack::Policy
 		Ready,
 	};
 
+	// The active-refresh budget limits transport attempts, not only successful
+	// writes. A full reliable channel must therefore consume one unit just like a
+	// successful hash update; otherwise a failing recipient can be retried without
+	// bound in one server frame.
+	class ActiveHashRefreshAttemptBudget
+	{
+	public:
+		explicit constexpr ActiveHashRefreshAttemptBudget(std::size_t limit) :
+			limit(limit == 0 ? 1 : limit)
+		{
+		}
+
+		constexpr bool TryConsume()
+		{
+			if (attempts >= limit)
+				return false;
+			++attempts;
+			return true;
+		}
+
+		constexpr std::size_t Attempts() const
+		{
+			return attempts;
+		}
+
+		constexpr bool Exhausted() const
+		{
+			return attempts >= limit;
+		}
+
+	private:
+		std::size_t limit;
+		std::size_t attempts = 0;
+	};
+
+	constexpr int NextActiveHashRefreshSlot(int attemptedSlot, int slotCount)
+	{
+		return attemptedSlot >= 0 && attemptedSlot + 1 < slotCount
+			? attemptedSlot + 1 : 0;
+	}
+
 	// A forced existing-registration recovery must not wait forever when the
 	// compressed canonical body is already ready but its native source identity is
 	// not. Only that explicit one-file path may repair the source hash synchronously;

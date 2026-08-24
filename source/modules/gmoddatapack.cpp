@@ -72,7 +72,7 @@ static ConVar gmoddatapack_luapack_serverinfo_budget(
 	true, 1.0f, true, 16.0f);
 static ConVar gmoddatapack_luapack_registration_refresh_budget(
 	"holylib_gmoddatapack_luapack_registration_refresh_budget", "64", FCVAR_ARCHIVE,
-	"Maximum Lua registration entries or active-client hot-refresh hash updates processed per server frame",
+	"Maximum Lua registration entries or active-client hot-refresh hash update attempts processed per server frame",
 	true, 1.0f, true, 1024.0f);
 
 static CGModDataPackModule g_pGModDataPackModule;
@@ -91,6 +91,7 @@ static std::array<std::unordered_map<int, ClientLuaHash>, ABSOLUTE_PLAYER_LIMIT>
 static std::array<std::unordered_map<int, ClientLuaHash>, ABSOLUTE_PLAYER_LIMIT> g_clientHashUpdatesPending;
 static unsigned int g_activeHashRefreshNativeAcknowledgements = 0;
 static unsigned int g_activeHashRefreshCanonicalAcknowledgements = 0;
+static constexpr double ACTIVE_HASH_REFRESH_RETRY_DELAY_SECONDS = 0.25;
 static constexpr std::size_t MAX_TRACKED_LUA_FILES = 1u << 13u;
 using PinnedCanonicalFiles = HolyLib::LuaPack::Policy::PinnedCanonicalFileSet<MAX_TRACKED_LUA_FILES>;
 static std::array<PinnedCanonicalFiles, ABSOLUTE_PLAYER_LIMIT> g_clientPinnedCanonicalFiles;
@@ -1161,6 +1162,12 @@ public:
 	{
 		std::lock_guard<std::mutex> lock(m_pActiveHashRefreshQueueMutex);
 		m_pActiveHashRefreshQueue.push_back(fileID);
+		// A newer publication supersedes any partially drained retry state. Restart
+		// from the first slot so every eligible client is evaluated against the new
+		// source identity.
+		m_pActiveHashRefreshNextSlots[fileID] = 0;
+		m_pActiveHashRefreshFailedSlots[fileID].reset();
+		m_pActiveHashRefreshRetryAfter[fileID] = 0.0;
 		if (forceRefresh)
 			m_pForcedActiveHashRefreshes[fileID].set();
 	}
@@ -1527,6 +1534,12 @@ public:
 	// Explicit recovery bypasses stale delivery bookkeeping exactly once per slot;
 	// budget or send retries retain only the slots that did not receive an update.
 	std::unordered_map<int, std::bitset<ABSOLUTE_PLAYER_LIMIT>> m_pForcedActiveHashRefreshes;
+	// A transport failure is recipient-specific. Keep the scan cursor and failed
+	// slots across frames so budget exhaustion never restarts at slot zero and a
+	// backpressured client cannot make the whole file spin every Think.
+	std::unordered_map<int, int> m_pActiveHashRefreshNextSlots;
+	std::unordered_map<int, std::bitset<ABSOLUTE_PLAYER_LIMIT>> m_pActiveHashRefreshFailedSlots;
+	std::unordered_map<int, double> m_pActiveHashRefreshRetryAfter;
 	std::mutex m_pActiveHashRefreshQueueMutex;
 
 	std::atomic<ThreadState> m_pWorkerThreadState;
@@ -1655,6 +1668,9 @@ void LuaDataPack::Shutdown()
 		std::lock_guard<std::mutex> lock(m_pActiveHashRefreshQueueMutex);
 		m_pActiveHashRefreshQueue.clear();
 		m_pForcedActiveHashRefreshes.clear();
+		m_pActiveHashRefreshNextSlots.clear();
+		m_pActiveHashRefreshFailedSlots.clear();
+		m_pActiveHashRefreshRetryAfter.clear();
 	}
 	for (LuaPackEntry& entry : m_pLuaFileCache)
 	{
@@ -2639,14 +2655,24 @@ static bool RequestActiveClientLuaFiles(int clientIdx)
 
 static void DrainActiveLuaHashRefreshes()
 {
+	using ActiveHashRefreshSlots = std::bitset<ABSOLUTE_PLAYER_LIMIT>;
 	std::vector<int> pending;
-	std::unordered_map<int, std::bitset<ABSOLUTE_PLAYER_LIMIT>> forcedPending;
+	std::unordered_map<int, ActiveHashRefreshSlots> forcedPending;
+	std::unordered_map<int, int> nextSlotsPending;
+	std::unordered_map<int, ActiveHashRefreshSlots> failedSlotsPending;
+	std::unordered_map<int, double> retryAfterPending;
 	{
 		std::lock_guard<std::mutex> lock(g_pLuaDataPack.m_pActiveHashRefreshQueueMutex);
 		pending = std::move(g_pLuaDataPack.m_pActiveHashRefreshQueue);
 		forcedPending = std::move(g_pLuaDataPack.m_pForcedActiveHashRefreshes);
+		nextSlotsPending = std::move(g_pLuaDataPack.m_pActiveHashRefreshNextSlots);
+		failedSlotsPending = std::move(g_pLuaDataPack.m_pActiveHashRefreshFailedSlots);
+		retryAfterPending = std::move(g_pLuaDataPack.m_pActiveHashRefreshRetryAfter);
 		g_pLuaDataPack.m_pActiveHashRefreshQueue.clear();
 		g_pLuaDataPack.m_pForcedActiveHashRefreshes.clear();
+		g_pLuaDataPack.m_pActiveHashRefreshNextSlots.clear();
+		g_pLuaDataPack.m_pActiveHashRefreshFailedSlots.clear();
+		g_pLuaDataPack.m_pActiveHashRefreshRetryAfter.clear();
 	}
 	if (pending.empty())
 		return;
@@ -2661,37 +2687,87 @@ static void DrainActiveLuaHashRefreshes()
 
 	const std::size_t budget = static_cast<std::size_t>((std::max)(1,
 		gmoddatapack_luapack_registration_refresh_budget.GetInt()));
+	HolyLib::LuaPack::Policy::ActiveHashRefreshAttemptBudget attemptBudget(budget);
+	const double now = Plat_FloatTime();
 	std::vector<int> retry;
-	std::unordered_map<int, std::bitset<ABSOLUTE_PLAYER_LIMIT>> forcedRetry;
-	auto queueRetry = [&](int fileID)
+	std::unordered_map<int, ActiveHashRefreshSlots> forcedRetry;
+	std::unordered_map<int, int> nextSlotsRetry;
+	std::unordered_map<int, ActiveHashRefreshSlots> failedSlotsRetry;
+	std::unordered_map<int, double> retryAfterRetry;
+	auto queueRetry = [&](int fileID, int nextSlot,
+		const ActiveHashRefreshSlots& forcedSlots,
+		const ActiveHashRefreshSlots& failedSlots, double retryAfter)
 	{
 		retry.push_back(fileID);
+		forcedRetry[fileID] |= forcedSlots;
+		nextSlotsRetry[fileID] = nextSlot;
+		failedSlotsRetry[fileID] |= failedSlots;
+		retryAfterRetry[fileID] = retryAfter;
+	};
+	auto pendingForcedSlots = [&](int fileID)
+	{
 		auto forced = forcedPending.find(fileID);
-		if (forced != forcedPending.end())
-			forcedRetry[fileID] |= forced->second;
+		return forced != forcedPending.end() ? forced->second : ActiveHashRefreshSlots();
+	};
+	auto pendingFailedSlots = [&](int fileID)
+	{
+		auto failed = failedSlotsPending.find(fileID);
+		return failed != failedSlotsPending.end() ? failed->second : ActiveHashRefreshSlots();
+	};
+	auto pendingNextSlot = [&](int fileID)
+	{
+		auto next = nextSlotsPending.find(fileID);
+		return next != nextSlotsPending.end() && next->second >= 0 &&
+			next->second < ABSOLUTE_PLAYER_LIMIT ? next->second : 0;
+	};
+	auto pendingRetryAfter = [&](int fileID)
+	{
+		auto retryAfter = retryAfterPending.find(fileID);
+		return retryAfter != retryAfterPending.end() ? retryAfter->second : 0.0;
+	};
+	auto firstFailedSlot = [](const ActiveHashRefreshSlots& failedSlots)
+	{
+		for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
+		{
+			if (failedSlots.test(slot))
+				return slot;
+		}
+		return 0;
 	};
 	unsigned int nativeUpdates = 0;
 	unsigned int canonicalUpdates = 0;
 	unsigned int updatedFiles = 0;
 	unsigned int requestedScans = 0;
 	unsigned int forcedWithoutRecipient = 0;
-	std::size_t sentUpdates = 0;
+	unsigned int failedAttempts = 0;
 	std::size_t processed = 0;
 	std::array<std::size_t, ABSOLUTE_PLAYER_LIMIT> stagedUpdatesBySlot{};
 	for (std::size_t index = 0; index < pending.size(); ++index)
 	{
-		if (processed >= budget || sentUpdates >= budget)
+		const int fileID = pending[index];
+		ActiveHashRefreshSlots forcedSlots = pendingForcedSlots(fileID);
+		ActiveHashRefreshSlots failedSlots = pendingFailedSlots(fileID);
+		const int startSlot = pendingNextSlot(fileID);
+		const double retryAfter = pendingRetryAfter(fileID);
+		if (retryAfter > now)
+		{
+			queueRetry(fileID, startSlot, forcedSlots, failedSlots, retryAfter);
+			continue;
+		}
+
+		if (processed >= budget || attemptBudget.Exhausted())
 		{
 			for (; index < pending.size(); ++index)
-				queueRetry(pending[index]);
+			{
+				const int pendingFileID = pending[index];
+				queueRetry(pendingFileID, pendingNextSlot(pendingFileID),
+					pendingForcedSlots(pendingFileID), pendingFailedSlots(pendingFileID),
+					pendingRetryAfter(pendingFileID));
+			}
 			break;
 		}
 		++processed;
 
-		const int fileID = pending[index];
-		std::bitset<ABSOLUTE_PLAYER_LIMIT> forcedSlots;
-		if (auto forced = forcedPending.find(fileID); forced != forcedPending.end())
-			forcedSlots = forced->second;
 		LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID);
 		if (!entry || fileID <= 0 || fileID >= g_pDataPack->m_pClientLuaFiles->GetNumStrings())
 			continue;
@@ -2711,7 +2787,7 @@ static void DrainActiveLuaHashRefreshes()
 				entry->sourceHashReady, entry->contentHashReady, entry->hashPublished);
 			if (entryAction == HolyLib::LuaPack::Policy::ActiveHashRefreshEntryAction::Retry)
 			{
-				queueRetry(fileID);
+				queueRetry(fileID, startSlot, forcedSlots, failedSlots, 0.0);
 				continue;
 			}
 			repairForcedSourceHash = entryAction ==
@@ -2728,22 +2804,24 @@ static void DrainActiveLuaHashRefreshes()
 			if (!g_pLuaDataPack.EnsureSourceHash(entry) || !entry->contentHashReady ||
 				!entry->hashPublished)
 			{
-				queueRetry(fileID);
+				queueRetry(fileID, startSlot, forcedSlots, failedSlots, 0.0);
 				continue;
 			}
 			sourceHash = entry->sourceHash;
 			canonicalHash = entry->contentHash;
 		}
 
-		bool retryFile = false;
 		bool updatedFile = false;
+		bool deferredForBudget = false;
+		int resumeSlot = startSlot;
 		const bool forcedFile = forcedSlots.any();
-		for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
+		for (int slot = startSlot; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
 		{
 			CBaseClient* client = ResolveLuaPackClientBySlot(slot);
 			if (!client || !client->IsActive() || !client->GetNetChannel())
 			{
 				forcedSlots.reset(slot);
+				failedSlots.reset(slot);
 				continue;
 			}
 			const bool forceRefresh = forcedSlots.test(slot);
@@ -2774,53 +2852,60 @@ static void DrainActiveLuaHashRefreshes()
 				refresh, targetHashAlreadyPending, forceRefresh))
 			{
 				forcedSlots.reset(slot);
+				failedSlots.reset(slot);
 				continue;
 			}
-			if (refresh != HolyLib::LuaPack::Policy::ActiveHashRefreshAction::None &&
-				sentUpdates >= budget)
+			if (!attemptBudget.TryConsume())
 			{
-				retryFile = true;
+				deferredForBudget = true;
+				resumeSlot = slot;
 				break;
 			}
+			resumeSlot = HolyLib::LuaPack::Policy::NextActiveHashRefreshSlot(
+				slot, ABSOLUTE_PLAYER_LIMIT);
 			if (refresh == HolyLib::LuaPack::Policy::ActiveHashRefreshAction::Native)
 			{
 				if (!SendClientLuaHashUpdate(slot, fileID, sourceHash.data(), sourceHash.size()))
 				{
-					retryFile = true;
+					failedSlots.set(slot);
+					++failedAttempts;
 					continue;
 				}
 				HolyLib::LuaPack::Policy::RememberNativeHash(pendingHashes, fileID, sourceHash);
 				++nativeUpdates;
-				++sentUpdates;
 				++stagedUpdatesBySlot[slot];
 				updatedFile = true;
 				forcedSlots.reset(slot);
+				failedSlots.reset(slot);
 			}
 			else if (refresh == HolyLib::LuaPack::Policy::ActiveHashRefreshAction::Canonical)
 			{
 				if (!SendClientLuaHashUpdate(slot, fileID,
 					canonicalHash.data(), canonicalHash.size()))
 				{
-					retryFile = true;
+					failedSlots.set(slot);
+					++failedAttempts;
 					continue;
 				}
 				HolyLib::LuaPack::Policy::RememberNativeHash(pendingHashes, fileID, canonicalHash);
 				++canonicalUpdates;
-				++sentUpdates;
 				++stagedUpdatesBySlot[slot];
 				updatedFile = true;
 				forcedSlots.reset(slot);
+				failedSlots.reset(slot);
 			}
 		}
-		if (retryFile)
+		if (deferredForBudget || failedSlots.any())
 		{
-			retry.push_back(fileID);
-			if (forcedSlots.any())
-				forcedRetry[fileID] |= forcedSlots;
+			const bool completedPass = !deferredForBudget;
+			if (completedPass)
+				resumeSlot = firstFailedSlot(failedSlots);
+			queueRetry(fileID, resumeSlot, forcedSlots, failedSlots,
+				completedPass ? now + ACTIVE_HASH_REFRESH_RETRY_DELAY_SECONDS : 0.0);
 		}
 		if (updatedFile)
 			++updatedFiles;
-		else if (forcedFile && !retryFile)
+		else if (forcedFile && !deferredForBudget && !failedSlots.any())
 			++forcedWithoutRecipient;
 	}
 	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
@@ -2839,6 +2924,15 @@ static void DrainActiveLuaHashRefreshes()
 			g_pLuaDataPack.m_pActiveHashRefreshQueue.end(), retry.begin(), retry.end());
 		for (const auto& forced : forcedRetry)
 			g_pLuaDataPack.m_pForcedActiveHashRefreshes[forced.first] |= forced.second;
+		for (const auto& nextSlot : nextSlotsRetry)
+			g_pLuaDataPack.m_pActiveHashRefreshNextSlots.try_emplace(
+				nextSlot.first, nextSlot.second);
+		for (const auto& failed : failedSlotsRetry)
+			g_pLuaDataPack.m_pActiveHashRefreshFailedSlots.try_emplace(
+				failed.first, failed.second);
+		for (const auto& retryAfter : retryAfterRetry)
+			g_pLuaDataPack.m_pActiveHashRefreshRetryAfter.try_emplace(
+				retryAfter.first, retryAfter.second);
 	}
 	if (nativeUpdates != 0 || canonicalUpdates != 0)
 	{
@@ -2849,6 +2943,21 @@ static void DrainActiveLuaHashRefreshes()
 	{
 		Warning(PROJECT_NAME " - luapack: explicit hot refresh completed without an eligible active recipient for %u file(s)\n",
 			forcedWithoutRecipient);
+	}
+	if (failedAttempts != 0)
+	{
+		static unsigned int deferredAttemptReport = 0;
+		static double nextDeferredAttemptReport = 0.0;
+		deferredAttemptReport += failedAttempts;
+		if (now >= nextDeferredAttemptReport)
+		{
+			// Deliberately aggregate this operational signal. File paths and slot IDs
+			// are unnecessary for pacing diagnosis and can identify live workload.
+			Warning(PROJECT_NAME " - luapack: active hot refresh deferred %u reliable hash update attempt(s); retries remain budgeted and paced\n",
+				deferredAttemptReport);
+			deferredAttemptReport = 0;
+			nextDeferredAttemptReport = now + 5.0;
+		}
 	}
 }
 
