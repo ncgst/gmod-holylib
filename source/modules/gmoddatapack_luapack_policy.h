@@ -986,6 +986,7 @@ namespace HolyLib::LuaPack::Policy
 
 	constexpr std::size_t ClientLuaHashBytes = 32u;
 	constexpr std::size_t ClientLuaHashBits = ClientLuaHashBytes * 8u;
+	constexpr int ClientLuaHashUpdateLengthBits = 20;
 
 	constexpr std::size_t ClientLuaHashUpdateBits(int entryBits)
 	{
@@ -1027,6 +1028,66 @@ namespace HolyLib::LuaPack::Policy
 
 		return !output.IsOverflowed() && output.GetNumBitsWritten() - bitsBefore ==
 			static_cast<int>(updateBits);
+	}
+
+	constexpr std::size_t ClientLuaHashUpdateWireBits(int serviceTypeBits,
+		int tableBits, int entryBits)
+	{
+		const std::size_t updateBits = ClientLuaHashUpdateBits(entryBits);
+		return serviceTypeBits > 0 && tableBits > 0 && updateBits != 0
+			? static_cast<std::size_t>(serviceTypeBits) +
+				static_cast<std::size_t>(tableBits) + 1u +
+				static_cast<std::size_t>(ClientLuaHashUpdateLengthBits) + updateBits
+			: 0u;
+	}
+
+	// Append the complete svc_UpdateStringTable record directly to a reliable
+	// stream. The active-refresh path already owns ordering with the following
+	// RequestLuaFiles message; avoiding a temporary INetMessage also avoids
+	// treating engine-side message rejection as reliable-channel backpressure.
+	template <typename BitWriter>
+	bool AppendClientLuaHashUpdateWire(BitWriter& output,
+		std::uint32_t serviceType, int serviceTypeBits,
+		std::uint32_t tableID, int tableBits,
+		std::uint32_t fileID, int entryBits,
+		const void* hash, std::size_t hashBytes)
+	{
+		const std::size_t updateBits = ClientLuaHashUpdateBits(entryBits);
+		const std::size_t wireBits = ClientLuaHashUpdateWireBits(
+			serviceTypeBits, tableBits, entryBits);
+		if (!hash || hashBytes != ClientLuaHashBytes ||
+			serviceTypeBits <= 0 || serviceTypeBits >= static_cast<int>(sizeof(std::uint32_t) * 8u) ||
+			tableBits <= 0 || tableBits >= static_cast<int>(sizeof(std::uint32_t) * 8u) ||
+			entryBits <= 0 || entryBits >= static_cast<int>(sizeof(std::uint32_t) * 8u) ||
+			serviceType >= (1u << serviceTypeBits) || tableID >= (1u << tableBits) ||
+			fileID == 0 || fileID >= (1u << entryBits) || updateBits == 0 || wireBits == 0 ||
+			updateBits >= (1u << ClientLuaHashUpdateLengthBits))
+		{
+			return false;
+		}
+
+		const int bitsBefore = output.GetNumBitsWritten();
+		const int bitsLeft = output.GetNumBitsLeft();
+		if (bitsBefore < 0 || bitsLeft < 0 || output.IsOverflowed() ||
+			wireBits > static_cast<std::size_t>(bitsLeft) ||
+			wireBits > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
+		{
+			return false;
+		}
+
+		output.WriteUBitLong(serviceType, serviceTypeBits);
+		output.WriteUBitLong(tableID, tableBits);
+		output.WriteOneBit(0); // one changed entry
+		output.WriteUBitLong(static_cast<std::uint32_t>(updateBits),
+			ClientLuaHashUpdateLengthBits);
+		output.WriteOneBit(0); // explicit entry index
+		output.WriteUBitLong(fileID, entryBits);
+		output.WriteOneBit(0); // unchanged string body
+		output.WriteOneBit(1); // replacement userdata follows
+		output.WriteBits(hash, static_cast<int>(ClientLuaHashBits));
+
+		return !output.IsOverflowed() && output.GetNumBitsWritten() - bitsBefore ==
+			static_cast<int>(wireBits);
 	}
 
 	// GMod asks for every missing Lua ID in one request. Required delivery retains that

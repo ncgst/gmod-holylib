@@ -2605,32 +2605,30 @@ static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned ch
 		return false;
 
 	CBaseClient* client = ResolveLuaPackClientBySlot(clientIdx);
-	if (!client || !client->GetNetChannel())
+	INetChannel* engineChannel = client ? client->GetNetChannel() : nullptr;
+	CNetChan* channel = static_cast<CNetChan*>(engineChannel);
+	if (!client || !channel)
 		return false;
 
 	INetworkStringTable* table = g_pDataPack->m_pClientLuaFiles;
-	CNetworkStringTable* concreteTable = static_cast<CNetworkStringTable*>(table);
 	if (fileID <= 0 || fileID >= table->GetNumStrings())
 		return false;
-	if (!concreteTable->m_bUserDataFixedSize ||
-		concreteTable->m_nUserDataSizeBits != static_cast<int>(hashLength * 8))
+	CNetworkStringTable* sourceTable = static_cast<CNetworkStringTable*>(table);
+	if (!sourceTable->m_bUserDataFixedSize ||
+		sourceTable->m_nUserDataSizeBits != static_cast<int>(hashLength * 8))
 	{
 		return false;
 	}
 
-	char updateBuffer[64];
-	SVC_UpdateStringTable update;
-	update.m_DataOut.StartWriting(updateBuffer, sizeof(updateBuffer));
-	update.m_nTableID = table->GetTableId();
-	update.m_nChangedEntries = 1;
-
-	if (!HolyLib::LuaPack::Policy::AppendClientLuaHashUpdate(update.m_DataOut,
-		static_cast<std::uint32_t>(fileID), table->GetEntryBits(), hash, hashLength))
-	{
-		return false;
-	}
-
-	return !update.m_DataOut.IsOverflowed() && client->SendNetMsg(update, true);
+	// Append the exact svc_UpdateStringTable wire record to the engine-owned
+	// reliable stream. A live incident showed the temporary INetMessage path
+	// rejecting every update even with an empty, non-overflowed stream; that
+	// deterministic failure was then misreported and retried as backpressure.
+	return HolyLib::LuaPack::Policy::AppendClientLuaHashUpdateWire(
+		channel->m_StreamReliable,
+		static_cast<std::uint32_t>(svc_UpdateStringTable), NETMSG_TYPE_BITS,
+		static_cast<std::uint32_t>(table->GetTableId()), Q_log2(MAX_TABLES),
+		static_cast<std::uint32_t>(fileID), table->GetEntryBits(), hash, hashLength);
 }
 
 static bool RequestActiveClientLuaFiles(int clientIdx)

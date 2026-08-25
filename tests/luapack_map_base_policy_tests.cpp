@@ -1010,6 +1010,59 @@ int main()
 		clientLuaEntryBits, clientLuaHash.data(), clientLuaHash.size() - 1u));
 	assert(invalidClientLuaUpdate.bits.empty());
 
+	// Production appends the complete svc_UpdateStringTable wire record directly
+	// to the reliable stream so a valid update does not depend on a temporary
+	// INetMessage object. Verify the envelope and payload as one exact record.
+	constexpr std::uint32_t updateStringTableType = 13;
+	constexpr int serviceTypeBits = 6;
+	constexpr std::uint32_t clientLuaTableID = 18;
+	constexpr int tableIDBits = 5;
+	const std::size_t clientLuaWireBits = ClientLuaHashUpdateWireBits(
+		serviceTypeBits, tableIDBits, clientLuaEntryBits);
+	TestBitWriter clientLuaWire(clientLuaWireBits);
+	assert(AppendClientLuaHashUpdateWire(clientLuaWire,
+		updateStringTableType, serviceTypeBits,
+		clientLuaTableID, tableIDBits,
+		0x1234, clientLuaEntryBits, clientLuaHash.data(), clientLuaHash.size()));
+	assert(clientLuaWire.bits.size() == clientLuaWireBits);
+	std::size_t clientLuaWireStart = 0;
+	assert(clientLuaWire.ReadUBitLong(clientLuaWireStart, serviceTypeBits) ==
+		updateStringTableType);
+	clientLuaWireStart += serviceTypeBits;
+	assert(clientLuaWire.ReadUBitLong(clientLuaWireStart, tableIDBits) ==
+		clientLuaTableID);
+	clientLuaWireStart += tableIDBits;
+	assert(clientLuaWire.ReadUBitLong(clientLuaWireStart, 1) == 0);
+	++clientLuaWireStart;
+	assert(clientLuaWire.ReadUBitLong(clientLuaWireStart,
+		ClientLuaHashUpdateLengthBits) == clientLuaUpdateBits);
+	clientLuaWireStart += ClientLuaHashUpdateLengthBits;
+	assert(clientLuaWire.ReadUBitLong(clientLuaWireStart, 1) == 0);
+	++clientLuaWireStart;
+	assert(clientLuaWire.ReadUBitLong(clientLuaWireStart, clientLuaEntryBits) == 0x1234);
+	clientLuaWireStart += clientLuaEntryBits;
+	assert(clientLuaWire.ReadUBitLong(clientLuaWireStart, 1) == 0);
+	++clientLuaWireStart;
+	assert(clientLuaWire.ReadUBitLong(clientLuaWireStart, 1) == 1);
+	++clientLuaWireStart;
+	for (std::size_t index = 0; index < clientLuaHash.size(); ++index)
+		assert(clientLuaWire.ReadUBitLong(clientLuaWireStart + index * 8u, 8) ==
+			clientLuaHash[index]);
+	TestBitWriter shortClientLuaWire(clientLuaWireBits - 1u);
+	assert(!AppendClientLuaHashUpdateWire(shortClientLuaWire,
+		updateStringTableType, serviceTypeBits,
+		clientLuaTableID, tableIDBits,
+		0x1234, clientLuaEntryBits, clientLuaHash.data(), clientLuaHash.size()));
+	assert(shortClientLuaWire.bits.empty());
+	TestBitWriter invalidClientLuaWire(clientLuaWireBits);
+	assert(!AppendClientLuaHashUpdateWire(invalidClientLuaWire,
+		64, serviceTypeBits, clientLuaTableID, tableIDBits,
+		0x1234, clientLuaEntryBits, clientLuaHash.data(), clientLuaHash.size()));
+	assert(!AppendClientLuaHashUpdateWire(invalidClientLuaWire,
+		updateStringTableType, serviceTypeBits, 32, tableIDBits,
+		0x1234, clientLuaEntryBits, clientLuaHash.data(), clientLuaHash.size()));
+	assert(invalidClientLuaWire.bits.empty());
+
 	// Exact-key duplicates are rejected by the same registry used by pack validation.
 	std::unordered_set<std::string> exactKeys;
 	assert(RegisterExactKey(exactKeys, "0123456789abcdef"));
