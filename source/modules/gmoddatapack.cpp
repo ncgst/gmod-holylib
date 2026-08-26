@@ -2613,9 +2613,14 @@ static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned ch
 	INetworkStringTable* table = g_pDataPack->m_pClientLuaFiles;
 	if (fileID <= 0 || fileID >= table->GetNumStrings())
 		return false;
-	CNetworkStringTable* sourceTable = static_cast<CNetworkStringTable*>(table);
-	if (!sourceTable->m_bUserDataFixedSize ||
-		sourceTable->m_nUserDataSizeBits != static_cast<int>(hashLength * 8))
+
+	// Validate the published entry through the engine interface. The concrete
+	// CNetworkStringTable layout is engine-build-specific; reading its fixed-size
+	// fields directly can reject a healthy 32-byte client_lua_files entry before
+	// the reliable stream is touched.
+	int publishedLength = 0;
+	if (!table->GetStringUserData(fileID, &publishedLength) ||
+		publishedLength != static_cast<int>(hashLength))
 	{
 		return false;
 	}
