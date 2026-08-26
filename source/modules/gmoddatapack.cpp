@@ -2642,10 +2642,18 @@ static bool RequestActiveClientLuaFiles(int clientIdx)
 	if (!Util::engineserver || !client || !client->IsActive() || !client->GetNetChannel())
 		return false;
 
-	unsigned char requestBuffer[1]{};
-	bf_write request(requestBuffer, sizeof(requestBuffer));
+	// bf_write requires dword-sized, dword-aligned storage and truncates smaller
+	// buffers to zero bytes. Keep the wire payload at one byte while providing
+	// the aligned scratch space its writer requires.
+	std::uint32_t requestBuffer = 0;
+	static_assert(HolyLib::LuaPack::Policy::IsSourceBitWriterStorageSizeValid(
+		sizeof(requestBuffer), HolyLib::LuaPack::Policy::ClientLuaRescanRequestBits),
+		"RequestLuaFiles scratch storage must satisfy Source bf_write alignment");
+	bf_write request(&requestBuffer, static_cast<int>(sizeof(requestBuffer)),
+		static_cast<int>(HolyLib::LuaPack::Policy::ClientLuaRescanRequestBits));
 	request.WriteByte(GarrysMod::NetworkMessage::RequestLuaFiles);
-	if (request.IsOverflowed())
+	if (request.IsOverflowed() || request.GetNumBitsWritten() !=
+		static_cast<int>(HolyLib::LuaPack::Policy::ClientLuaRescanRequestBits))
 		return false;
 
 	// A string-table update changes the advertised identity, but active GMod clients

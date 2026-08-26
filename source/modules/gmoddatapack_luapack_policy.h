@@ -984,6 +984,20 @@ namespace HolyLib::LuaPack::Policy
 		return stagedHashUpdates != 0;
 	}
 
+	// Source's bf_write truncates backing storage to a four-byte boundary.
+	// A smaller buffer therefore has zero writable bits even when the payload
+	// itself is only one byte.
+	constexpr bool IsSourceBitWriterStorageSizeValid(std::size_t storageBytes,
+		std::size_t payloadBits)
+	{
+		const std::size_t payloadBytes = payloadBits / 8u +
+			(payloadBits % 8u != 0 ? 1u : 0u);
+		return storageBytes != 0 && storageBytes % sizeof(std::uint32_t) == 0 &&
+			payloadBits != 0 && payloadBytes <= storageBytes;
+	}
+
+	constexpr std::size_t ClientLuaRescanRequestBits = 8u;
+
 	constexpr std::size_t ClientLuaHashBytes = 32u;
 	constexpr std::size_t ClientLuaHashBits = ClientLuaHashBytes * 8u;
 	constexpr int ClientLuaHashUpdateLengthBits = 20;

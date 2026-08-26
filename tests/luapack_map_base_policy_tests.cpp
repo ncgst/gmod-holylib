@@ -941,6 +941,10 @@ int main()
 	assert(!ShouldRequestActiveLuaScan(0));
 	assert(ShouldRequestActiveLuaScan(1));
 	assert(ShouldRequestActiveLuaScan(64));
+	assert(!IsSourceBitWriterStorageSizeValid(1, ClientLuaRescanRequestBits));
+	assert(IsSourceBitWriterStorageSizeValid(sizeof(std::uint32_t),
+		ClientLuaRescanRequestBits));
+	assert(!IsSourceBitWriterStorageSizeValid(sizeof(std::uint32_t), 33));
 	assert(SelectActiveHashRefreshEntryAction(false, true, true, true, true, true) ==
 		ActiveHashRefreshEntryAction::Ready);
 	assert(SelectActiveHashRefreshEntryAction(false, true, true, false, true, true) ==
