@@ -1,5 +1,6 @@
 #include "httplib.h"
 #include "modules/gmoddatapack_luapack.h"
+#include "modules/gmoddatapack_luapack_policy.h"
 
 #include "LuaInterface.h"
 #include "detours.h"
@@ -36,6 +37,7 @@
 #include <mutex>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // memdbgon must be the last include file in a .cpp file!!!
@@ -43,11 +45,14 @@
 
 namespace HolyLib::LuaPack
 {
+	static constexpr const char* canonicalStubSource = "return __holypack()()";
+
 	struct FileRecord
 	{
 		std::string virtualPath;
 		std::string sourcePath;
 		std::string contents;
+		std::string identity;
 		unsigned long long revision = 0;
 	};
 
@@ -59,10 +64,16 @@ namespace HolyLib::LuaPack
 		std::string resourcePath;
 		unsigned long long sourceRevision = 0;
 		double publishedAt = 0.0;
-		double retireAfter = 0.0;
 		bool engineDownloadable = false;
 		std::shared_ptr<Bootil::AutoBuffer> compressedStub;
-		std::unordered_map<std::string, bool> files;
+		std::shared_ptr<Bootil::AutoBuffer> compressedRequiredStub;
+		// Immutable SHA-256 identities for the map-base bodies. The live registry
+		// keeps current contents; comparing the two selects canonical base stubs or
+		// native deltas without building another downloadable generation. The delta
+		// index is updated at registration time so a join never locks the full live
+		// registry once per client_lua_files entry.
+		std::unordered_map<std::string, std::string> files;
+		std::unordered_set<std::string> nativeDeltas;
 		unsigned int pins = 0;
 	};
 
@@ -70,18 +81,30 @@ namespace HolyLib::LuaPack
 	{
 		std::string generation;
 		double deadline = 0.0;
-		double nextHandoffAt = 0.0;
 		bool ready = false;
+		bool everReady = false;
 		bool active = false;
 		bool fallback = true;
 		bool holdsPin = false;
+		bool deliveryLaneResolved = false;
+		bool requiredLane = false;
+		bool optOut = false;
+		bool nativeLane = false;
+		bool requiredRecovery = false;
+		bool resolvedIdentity = false;
+		bool authenticatedIdentity = false;
+		bool recoveryStateCleared = false;
+		bool disconnectIssued = false;
+		std::uint64_t steamID64 = 0;
+		std::uint64_t connectionSerial = 0;
 
-		// Optimistic join stubbing. All of this is per-connection state; ReleasePin resets it.
+		// Join delivery accounting. All of this is per-connection state; ReleasePin resets it.
 		std::string networkID;
 		bool nativeLatched = false;
 		bool joinSummaryLogged = false;
 		unsigned int joinNativeFiles = 0;
 		unsigned int joinOptimisticStubs = 0;
+		unsigned int joinRequiredStubs = 0;
 		unsigned int joinReadyStubs = 0;
 		unsigned long long joinNativeBytes = 0;
 	};
@@ -96,7 +119,6 @@ namespace HolyLib::LuaPack
 		Bootil::AutoBuffer compressed;
 		std::string md5;
 		std::string error;
-		std::vector<std::string> changedPaths;
 		std::atomic<bool> complete{false};
 		bool success = false;
 	};
@@ -128,7 +150,6 @@ namespace HolyLib::LuaPack
 		std::map<std::string, Generation> generations;
 		std::string currentGeneration;
 		std::string salt;
-		std::unordered_map<std::string, bool> pendingChanges;
 		INetworkStringTableContainer* stringTables = nullptr;
 		INetworkStringTable* downloadables = nullptr;
 		std::string lockedDownloadUrl;
@@ -138,8 +159,13 @@ namespace HolyLib::LuaPack
 		// not be resolved client-side). Keyed by engine network ID, value is the expiry time.
 		// Main thread only, like the generation map.
 		std::unordered_map<std::string, double> nativeLatches;
+		Policy::RequiredRecoveryTracker requiredRecovery;
+		Policy::RequiredRecoveryHandoff recoveryHandoffs[ABSOLUTE_PLAYER_LIMIT];
+		std::uint64_t nextConnectionSerial = 0;
 		bool featureEnabledLastFrame = false;
+		bool canonicalRegistrationAvailableLastFrame = false;
 		bool bootstrapRefresh = false;
+		bool registrationRefreshPending = false;
 		double lastCaptureAt = 0.0; // guarded by registryMutex
 		double nextBuildAllowed = 0.0;
 	};
@@ -156,7 +182,18 @@ namespace HolyLib::LuaPack
 -- wrapper) and net.Receive do NOT exist yet.
 do
 	local getConVar = GetConVar_Internal or GetConVar
-	local installReceiver -- assigned by bootstrap(); installed later once net.Receive exists
+	local mirrorFlags = (FCVAR_REPLICATED or 0) + (FCVAR_PROTECTED or 0) +
+		(FCVAR_DONTRECORD or 0) + (FCVAR_UNLOGGED or 0) + (FCVAR_UNREGISTERED or 0)
+	local function mirroredConVar(name, default)
+		local ok, convar = pcall(CreateConVar, name, default, mirrorFlags)
+		return (ok and convar) or (getConVar and getConVar(name))
+	end
+	local requiredConVar = mirroredConVar("holylib_gmoddatapack_luapack_required", "0")
+	local allowOptOutConVar = mirroredConVar("holylib_gmoddatapack_luapack_allow_optout", "1")
+	local sourceTvConVar = getConVar and getConVar("tv_nochat")
+	local clientOptedOut = allowOptOutConVar and allowOptOutConVar:GetBool() and sourceTvConVar and
+		sourceTvConVar:GetString() == "no_gluapack"
+	local requiredMode = requiredConVar and requiredConVar:GetBool() and not clientOptedOut
 
 	local function warn(message)
 		Msg("[HolyLib luapack] " .. message .. "\n")
@@ -179,8 +216,12 @@ do
 	-- on the wire before the reconnect tears the channel down, hence the timer; the server
 	-- also latches on its own when a speculated connection dies unacknowledged, so a lost
 	-- unready command still converges.
+	-- Required stubs pass a second true argument. They never switch this connection
+	-- or execute retry locally. The exact failure command lets the authenticated server
+	-- queue at most one engine-level reconnect whose new ServerInfo baseline is native.
 	local recoveryTaint = false
 	local recoverySignaled = false
+	local requiredFailureSignaled = false
 	local recoveryScheduled = false
 	local recoveryRetried = false
 	local function issueRetry()
@@ -195,8 +236,21 @@ do
 			timer.Simple(1, issueRetry)
 		end
 	end
-	local function stubRecovery(generation)
+	local function stubRecovery(generation, required)
+		-- A cached pre-required stub has no second argument. Fall back to replicated lane
+		-- policy so enabling required mode cannot resurrect the old automatic retry loop.
+		if required == nil then required = requiredMode end
 		recoveryTaint = true
+		if required then
+			if not requiredFailureSignaled then
+				requiredFailureSignaled = true
+				warn("required pack " .. tostring(generation) ..
+					" could not resolve this Lua file; requesting one authenticated engine reconnect" ..
+					" (manual opt out: +tv_nochat no_gluapack)")
+				RunConsoleCommand("holylib_luapack_failed", tostring(generation or ""))
+			end
+			return function() end
+		end
 		if not recoverySignaled then
 			recoverySignaled = true
 			warn("cannot resolve stubbed Lua for generation " .. tostring(generation) ..
@@ -217,16 +271,13 @@ do
 	-- Stubs must never hit a nil global, even when the full bootstrap below cannot run
 	-- (empty or unparsable manifest snapshot). installOverrides() replaces this guard.
 	if not _G.__holypack then
-		_G.__holypack = function(generation) return stubRecovery(generation) end
+		_G.__holypack = function(generation, required) return stubRecovery(generation, required) end
 	end
 
 	local function bootstrap()
 		if _G.__holypack_bootstrapped then return end
 
-		local flags = (FCVAR_REPLICATED or 0) + (FCVAR_PROTECTED or 0) +
-			(FCVAR_DONTRECORD or 0) + (FCVAR_UNLOGGED or 0) + (FCVAR_UNREGISTERED or 0)
-		local ok, manifestConVar = pcall(CreateConVar, "holylib_gmoddatapack_luapack_manifest", "", flags)
-		manifestConVar = ok and manifestConVar or getConVar("holylib_gmoddatapack_luapack_manifest")
+		local manifestConVar = mirroredConVar("holylib_gmoddatapack_luapack_manifest", "")
 		local snapshot = manifestConVar and manifestConVar:GetString() or ""
 		if snapshot == "" then return end
 
@@ -262,18 +313,23 @@ do
 
 		local currentGeneration, manifests = parseSnapshot(snapshot)
 		if not currentGeneration then
-			warn("ignored an invalid manifest snapshot; vanilla Lua delivery remains active")
+			warn("ignored an invalid manifest snapshot; no Lua pack generation can be acknowledged")
 			return
-		end
-
-		local function manifestFromSnapshot(value, wantedGeneration)
-			local _, refreshManifests = parseSnapshot(value)
-			return refreshManifests and refreshManifests[wantedGeneration] or nil
 		end
 
 		local function parsePack(contents, manifest)
 			if #contents < 1 or string.byte(contents, 1) ~= 1 then return nil, "unsupported pack version" end
 			local pack = {vfs = {}, vfsLCL = {}, salt = manifest.salt, manifest = manifest}
+			local function registerLocal(key, source)
+				local existing = pack.vfsLCL[key]
+				if existing == nil then
+					pack.vfsLCL[key] = source
+				elseif existing ~= source then
+					-- Local forms are compatibility fallbacks. A divergent collision must
+					-- fail lookup instead of selecting whichever full path was parsed last.
+					pack.vfsLCL[key] = false
+				end
+			end
 			local cursor = 2
 			while cursor <= #contents do
 				if #contents - cursor + 1 < 52 then return nil, "truncated entry header" end
@@ -284,9 +340,10 @@ do
 				local length = a * 16777216 + b * 65536 + c * 256 + d
 				if length < 0 or cursor + length - 1 > #contents then return nil, "truncated entry payload" end
 				local source = string.sub(contents, cursor, cursor + length - 1); cursor = cursor + length
+				if pack.vfs[sourceKey] ~= nil then return nil, "duplicate exact source key" end
 				pack.vfs[sourceKey] = source
-				pack.vfsLCL[localKeyOne] = source
-				pack.vfsLCL[localKeyTwo] = source
+				registerLocal(localKeyOne, source)
+				registerLocal(localKeyTwo, source)
 			end
 			return pack
 		end
@@ -311,7 +368,7 @@ do
 		end
 
 		local selectedGeneration
-		local activate -- defined after the overrides below
+		local activate -- defined after the resolver below
 
 		local function normalizedForms(path)
 			path = string.gsub(path or "", "^@", "")
@@ -329,33 +386,47 @@ do
 	// MSVC caps a single string literal at 16380 characters (C2026), which the bootstrap
 	// outgrew; adjacent raw literals concatenate at compile time (total cap 65535).
 	R"HOLYLUAPACK(
-		local function findSource(pack, path)
+		local function findSource(pack, path, allowAliases)
 			local sourcePath, first, second = normalizedForms(path)
 			local salted = function(value) return string.lower(util.MD5(pack.salt .. value)) end
-			return pack.vfs[salted(sourcePath)] or pack.vfsLCL[salted(first)] or pack.vfsLCL[salted(second)]
+			local source = pack.vfs[salted(sourcePath)]
+			if source ~= nil then return source, sourcePath end
+			if not allowAliases then return nil end
+
+			local firstSource = pack.vfsLCL[salted(first)]
+			if firstSource == false then return nil end
+			if firstSource ~= nil then return firstSource, sourcePath end
+			if second == first then return nil end
+			local secondSource = pack.vfsLCL[salted(second)]
+			if secondSource == false then return nil end
+			if secondSource ~= nil then return secondSource, sourcePath end
+			return nil
 		end
 
-		local function compilePacked(pack, path)
-			local source = findSource(pack, path)
-			if not source then return nil end
-			local compiled = CompileString(source, path, false)
+		local function compilePacked(pack, path, allowAliases, showError)
+			local source, resolvedPath = findSource(pack, path, allowAliases)
+			if not source then return nil, false end
+			local chunkName = "@" .. resolvedPath
+			local compiled = CompileString(source, chunkName, showError ~= false)
 			if type(compiled) ~= "function" then
-				warn("failed to compile packed file " .. tostring(path) .. ": " .. tostring(compiled))
-				return nil
+				warn("failed to compile packed file " .. tostring(resolvedPath) .. ": " .. tostring(compiled))
+				return nil, true
 			end
-			return compiled
+			return compiled, true
 		end
 
-		local overridesInstalled = false
-		local function installOverrides()
-			if overridesInstalled then return end
-			overridesInstalled = true
+		local resolverInstalled = false
+		local function installResolver()
+			if resolverInstalled then return end
+			resolverInstalled = true
 			_G.__holypack_bootstrapped = true
 			_G.__holypack_packs = packs
 
-			local originalCompileFile, originalInclude = CompileFile, include
-
-			function _G.__holypack(generation)
+			function _G.__holypack(generation, required)
+				-- Canonical placeholders are deliberately generation-independent so their
+				-- SHA256 can be registered once in client_lua_files. The replicated manifest
+				-- selects the immutable map-base generation for this level.
+				if generation == nil then generation = selectedGeneration or currentGeneration end
 				local pack = packs[generation]
 				if not pack and not recoveryTaint and not lazyMountAttempted[generation] then
 					-- A speculative stub can arrive while the pack's FastDL download is still
@@ -369,106 +440,32 @@ do
 						RunConsoleCommand("holylib_luapack_ready", generation, manifest.md5)
 					end
 				end
-				if not pack then return stubRecovery(generation) end
+				if not pack then return stubRecovery(generation, required) end
 				selectedGeneration = generation
 				local info = debug.getinfo(2, "S")
 				local sourcePath = info and info.source or ""
-				local compiled = compilePacked(pack, string.gsub(sourcePath, "^@", ""))
+				local compiled = compilePacked(pack, string.gsub(sourcePath, "^@", ""), true, false)
 				if not compiled then
 					-- Mounted pack but no usable entry (or the entry failed to compile): the
 					-- file cannot be produced in place either way, so recover like an
 					-- unmounted generation instead of erroring the boot.
 					warn("pack " .. tostring(generation) .. " has no usable entry for " .. tostring(sourcePath))
-					return stubRecovery(generation)
+					return stubRecovery(generation, required)
 				end
 				return compiled
 			end
 
-			function _G.CompileFile(path)
-				local pack = selectedGeneration and packs[selectedGeneration]
-				return (pack and compilePacked(pack, path)) or originalCompileFile(path)
-			end
-
-			function _G.include(path)
-				-- extensions/net.lua (which defines net.Receive) is included later by this same
-				-- init file, so the autorefresh receiver is installed lazily from here.
-				if installReceiver and net and net.Receive then
-					local install = installReceiver
-					installReceiver = nil
-					local installed, message = pcall(install)
-					if not installed then warn("autorefresh receiver failed to install: " .. tostring(message)) end
-				end
-				local pack = selectedGeneration and packs[selectedGeneration]
-				local compiled = pack and compilePacked(pack, path)
-				if compiled then return compiled() end
-				return originalInclude(path)
-			end
-		end
-
-		installReceiver = function()
-			net.Receive("gmsv_holylib_luapack_autorefresh", function()
-				local generation = net.ReadString()
-				local refreshSnapshot = net.ReadString()
-				local downloadUrl = net.ReadString()
-
-				local manifest = manifestFromSnapshot(refreshSnapshot, generation)
-				if not manifest or downloadUrl == "" then
-					warn("autorefresh generation " .. tostring(generation) .. " has no usable FastDL manifest; future files will use vanilla delivery")
-					return
-				end
-				if packs[generation] then
-					selectedGeneration = generation
-					if not recoveryTaint then
-						RunConsoleCommand("holylib_luapack_ready", generation, manifest.md5)
-					end
-					return
-				end
-
-				local url = string.gsub(downloadUrl, "/+$", "") .. "/" .. string.gsub(manifest.resource, "^/+", "")
-				http.Fetch(url, function(compressed)
-					local contents = util.Decompress(compressed or "")
-					if not contents or string.lower(util.MD5(contents)) ~= manifest.md5 then
-						warn("autorefresh generation " .. generation .. " failed decompression or MD5 validation; future files will use vanilla delivery")
-						return
-					end
-
-					local pack, parseError = parsePack(contents, manifest)
-					if not pack then
-						warn("autorefresh generation " .. generation .. " is invalid (" .. tostring(parseError) .. "); future files will use vanilla delivery")
-						return
-					end
-
-					-- Retained packs are immutable: the previous generation keeps resolving any
-					-- stubs that were issued against it. The engine's own autorefresh re-send
-					-- re-executes changed files, so nothing is re-included from here.
-					packs[generation] = pack
-					selectedGeneration = generation
-					if not recoveryTaint then
-						RunConsoleCommand("holylib_luapack_ready", generation, manifest.md5)
-					end
-				end, function(message)
-					warn("autorefresh FastDL fetch failed for generation " .. generation .. ": " .. tostring(message) .. "; future files will use vanilla delivery")
-				end)
-			end)
 		end
 
 		activate = function()
-			installOverrides()
-			-- On late activation (after init has finished) net.Receive already exists, so the
-			-- receiver installs here; during init the include override installs it instead.
-			if installReceiver and net and net.Receive then
-				local install = installReceiver
-				installReceiver = nil
-				local installed, message = pcall(install)
-				if not installed then warn("autorefresh receiver failed to install: " .. tostring(message)) end
-			end
+			installResolver()
 		end
 
-		-- Boot mount pass. Acknowledge whatever is already on disk; stub delivery is gated
-		-- server-side on this exact ACK and must not depend on anything loaded later in init.
-		-- The bounded level-lifetime downloadables table may contain an earlier retained
-		-- generation, while the current generation can require the post-spawn HTTP handoff.
-		-- Mount every available retained object opportunistically, but only warn for current.
+		-- Boot mount pass. Acknowledge whatever is already on disk so the server can record
+		-- mounted-object health; required initial stubs are baseline-pinned and do not wait
+		-- for this ACK.
+		-- Map-base mode publishes one generation per level. Keep the table loop for manifest
+		-- parser compatibility, but only the current base is expected.
 		local pendingManifests = {}
 		local downloadFilter = getConVar("cl_downloadfilter")
 		local downloadsDisabled = downloadFilter and downloadFilter:GetString() == "none"
@@ -479,15 +476,15 @@ do
 			end
 			if not mountedNow and generation == currentGeneration then
 				if downloadsDisabled then
-					warn("pack " .. generation .. " is missing and downloads are disabled; set cl_downloadfilter to mapsonly or all. This join will use vanilla Lua delivery")
+					warn("pack " .. generation .. " is missing and downloads are disabled; set cl_downloadfilter to mapsonly or all. Required delivery will disconnect; fail-open delivery can use native Lua")
 				else
-					warn("pack " .. generation .. " " .. failure .. "; staying on vanilla Lua delivery while the FastDL download finishes in the background")
+					warn("pack " .. generation .. " " .. failure .. "; waiting for the background FastDL download before it can be acknowledged")
 				end
 			end
 		end
 
-		-- The overrides install even when nothing mounted: the server may speculate with
-		-- stubs before this client has acknowledged anything, and __holypack must then
+		-- The resolver installs even when nothing mounted: required or speculative stubs may
+		-- arrive before this client has acknowledged anything, and __holypack must then
 		-- lazily mount a download that completed after the pass above — or recover —
 		-- instead of hitting a nil global.
 		activate()
@@ -518,7 +515,7 @@ do
 					timer.Remove("HolyLibLuaPackMount")
 				elseif attempts >= 60 then
 					if pendingManifests[currentGeneration] then
-						warn("pack " .. currentGeneration .. " could not be mounted after five minutes (last failure: " .. tostring(lastFailure[currentGeneration]) .. "); this session stays on vanilla Lua delivery")
+						warn("pack " .. currentGeneration .. " could not be mounted after five minutes (last failure: " .. tostring(lastFailure[currentGeneration]) .. ") and remains unacknowledged")
 					end
 				end
 			end)
@@ -526,12 +523,11 @@ do
 	end
 
 	local ok, message = xpcall(bootstrap, debug.traceback)
-	if not ok then Msg("[HolyLib luapack] bootstrap failed; vanilla Lua delivery remains active: " .. tostring(message) .. "\n") end
+	if not ok then Msg("[HolyLib luapack] bootstrap failed; no Lua pack generation can be acknowledged: " .. tostring(message) .. "\n") end
 end
 )HOLYLUAPACK";
 
 	static const char* serverBridge = R"HLPACKSERVER(
-util.AddNetworkString("gmsv_holylib_luapack_autorefresh")
 concommand.Add("holylib_gmoddatapack_luapack_kill", function(caller)
 	if IsValid(caller) and not caller:IsSuperAdmin() then
 		caller:ChatPrint("HolyLib luapack kill-switch requires superadmin")
@@ -540,22 +536,6 @@ concommand.Add("holylib_gmoddatapack_luapack_kill", function(caller)
 	RunConsoleCommand("holylib_gmoddatapack_luapack_enable", "0")
 	Msg("[HolyLib luapack] kill-switch activated; all clients now use vanilla Lua delivery\n")
 end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua networking", FCVAR_DONTRECORD)
-hook.Add("HolyLib:LuaPackPublished", "HolyLib:LuaPackAutorefreshBridge", function(generation, manifest, recipients, changedPaths)
-	local targets = {}
-	for _, index in ipairs(recipients or {}) do
-		-- recipients carries entity indices (client slot + 1), not UserIDs.
-		local target = Entity(index)
-		if IsValid(target) and target:IsPlayer() then targets[#targets + 1] = target end
-	end
-	if #targets == 0 then return end
-
-	local downloadUrl = GetConVar("sv_downloadurl")
-	net.Start("gmsv_holylib_luapack_autorefresh")
-		net.WriteString(generation)
-		net.WriteString(manifest)
-		net.WriteString(downloadUrl and downloadUrl:GetString() or "")
-	net.Send(targets)
-end)
 )HLPACKSERVER";
 
 	static std::string NormalizePath(std::string path)
@@ -565,6 +545,11 @@ end)
 			path.erase(path.begin());
 
 		return path;
+	}
+
+	static std::string ContentIdentity(const std::string& contents)
+	{
+		return picosha2::hash256_hex_string(contents);
 	}
 
 	static bool StartsWith(const std::string& value, const char* prefix)
@@ -662,11 +647,15 @@ end)
 
 		size_t offset = 1;
 		size_t fileIndex = 0;
+		std::unordered_set<std::string> sourceKeys;
 		while (offset < dataLength)
 		{
 			if (dataLength - offset < (16 * 3) + 4 || fileIndex >= task->files.size())
 				return false;
 
+			const std::string sourceKey(reinterpret_cast<const char*>(data + offset), 16);
+			if (!Policy::RegisterExactKey(sourceKeys, sourceKey))
+				return false;
 			offset += 16 * 3;
 			const unsigned int contentLength =
 				(static_cast<unsigned int>(data[offset]) << 24) |
@@ -746,9 +735,9 @@ end)
 		task->complete.store(true);
 	}
 
-	static std::shared_ptr<Bootil::AutoBuffer> BuildCompressedStub(const std::string& generation)
+	static std::shared_ptr<Bootil::AutoBuffer> BuildCompressedStub()
 	{
-		const std::string source = "return __holypack(\"" + generation + "\")()";
+		const std::string source = canonicalStubSource;
 		std::vector<unsigned char> hash(32);
 		picosha2::hash256_one_by_one hasher;
 		hasher.process(source.c_str(), source.c_str() + source.length() + 1);
@@ -765,7 +754,12 @@ end)
 
 	static double ServerTime()
 	{
-		return Util::engineserver ? Util::engineserver->Time() : 0.0;
+		// LuaPack uses this clock only for elapsed-time gates and expirations. The
+		// IVEngineServer mirror is not ABI-stable across current GMod engine builds;
+		// calling Time() through a stale virtual slot produced nonsensical values
+		// on Linux x64 and broke recovery deadlines. Plat_FloatTime is monotonic and
+		// does not depend on that engine vtable layout.
+		return Plat_FloatTime();
 	}
 
 	static void ReleaseGenerationReference(ClientPin& client)
@@ -785,6 +779,25 @@ end)
 		client = ClientPin();
 	}
 
+	static bool PinCurrentGeneration(ClientPin& client)
+	{
+		if (!client.generation.empty())
+			return true;
+		if (state.currentGeneration.empty())
+			return false;
+
+		auto generation = state.generations.find(state.currentGeneration);
+		if (generation == state.generations.end())
+			return false;
+
+		client.generation = generation->first;
+		client.deadline = ServerTime() + GetConfig().readyDeadlineSeconds;
+		client.fallback = false;
+		client.holdsPin = true;
+		++generation->second.pins;
+		return true;
+	}
+
 	static void MarkFallback(ClientPin& client)
 	{
 		ReleaseGenerationReference(client);
@@ -795,6 +808,400 @@ end)
 	static bool IsValidSlot(int slot)
 	{
 		return slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT;
+	}
+
+	static void RecordNativeJoin(ClientPin& client, size_t nativeSourceBytes)
+	{
+		if (client.active)
+			return;
+
+		++client.joinNativeFiles;
+		client.joinNativeBytes += nativeSourceBytes;
+	}
+
+	static bool BindResolvedIdentity(int slot, ClientPin& client)
+	{
+		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		if (!baseClient || !baseClient->m_SteamID.IsValid())
+			return false;
+
+		const std::uint64_t steamID64 = baseClient->m_SteamID.ConvertToUint64();
+		if (steamID64 == 0 || (client.resolvedIdentity && client.steamID64 != steamID64))
+			return false;
+
+		client.steamID64 = steamID64;
+		client.resolvedIdentity = true;
+		return true;
+	}
+
+	static bool BindAuthenticatedIdentity(int slot, ClientPin& client)
+	{
+		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		if (!baseClient || !BindResolvedIdentity(slot, client) || !baseClient->IsFullyAuthenticated())
+			return false;
+
+		client.authenticatedIdentity = true;
+		return true;
+	}
+
+	static void StartClientEpoch(int slot)
+	{
+		ReleasePin(state.clients[slot]);
+		ClientPin& client = state.clients[slot];
+		++state.nextConnectionSerial;
+		if (state.nextConnectionSerial == 0)
+			++state.nextConnectionSerial;
+		client.connectionSerial = state.nextConnectionSerial;
+		if (!IsEnabled())
+			return;
+
+		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		const char* networkID = baseClient ? baseClient->GetNetworkIDString() : nullptr;
+		if (networkID && networkID[0] != '\0' &&
+			V_stricmp(networkID, "BOT") != 0 && V_stricmp(networkID, "UNKNOWN") != 0)
+			client.networkID = networkID;
+
+		PinCurrentGeneration(client);
+	}
+
+	static const char* BeginPendingRecoveryBaseline(int slot)
+	{
+		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		const std::uint64_t account = baseClient && baseClient->m_SteamID.IsValid()
+			? baseClient->m_SteamID.ConvertToUint64() : 0;
+		const bool authenticated = baseClient && baseClient->IsFullyAuthenticated();
+		Policy::RequiredRecoveryHandoff* handoff = nullptr;
+		for (int handoffSlot = 0; handoffSlot < ABSOLUTE_PLAYER_LIMIT; ++handoffSlot)
+		{
+			Policy::RequiredRecoveryHandoff& candidate = state.recoveryHandoffs[handoffSlot];
+			if (!candidate.Pending() || candidate.Account() != account)
+				continue;
+			if (handoff)
+				return "multiple recovery handoffs matched the authenticated SteamID64";
+			handoff = &candidate;
+		}
+		if (!handoff)
+		{
+			if (state.recoveryHandoffs[slot].Pending())
+				return "the recovery ServerInfo boundary did not have its authenticated SteamID64";
+			return nullptr;
+		}
+
+		ClientPin& failedClient = state.clients[slot];
+		const std::uint64_t failedConnection = failedClient.connectionSerial;
+		const std::uint64_t expectedAccount = handoff->Account();
+		const std::uint64_t expectedConnection = handoff->FailedConnection();
+		const Policy::RecoveryHandoffResult begin = handoff->BeginBaseline(
+			account, authenticated, ServerTime());
+		if (begin == Policy::RecoveryHandoffResult::OwnershipMismatch)
+		{
+			handoff->Reset();
+			Warning(PROJECT_NAME " - luapack: ignored a stale recovery handoff at ServerInfo for slot %i; expected account %llu connection %llu, got %llu connection %llu\n",
+				slot, static_cast<unsigned long long>(expectedAccount),
+				static_cast<unsigned long long>(expectedConnection),
+				static_cast<unsigned long long>(account),
+				static_cast<unsigned long long>(failedConnection));
+			return nullptr;
+		}
+		if (begin != Policy::RecoveryHandoffResult::BeginBaseline)
+			return "the engine reconnect did not begin an authenticated recovery baseline within its bounded handoff window";
+
+		// This is the first instruction at the engine's new ServerInfo boundary. The
+		// reconnect can run ClientDisconnect/ClientConnect in either order around this
+		// hook, so begin a fresh epoch here unconditionally and consume the account latch
+		// atomically. No old-join request can observe this new native lane.
+		StartClientEpoch(slot);
+		ClientPin& recovery = state.clients[slot];
+		if (!BindResolvedIdentity(slot, recovery) || recovery.steamID64 != expectedAccount ||
+			!baseClient->IsFullyAuthenticated())
+		{
+			return "SteamID64 ownership changed while the engine reconnect entered ServerInfo";
+		}
+		recovery.authenticatedIdentity = true;
+		const Policy::RecoveryConsumeResult consumed = state.requiredRecovery.Consume(
+			recovery.steamID64, recovery.connectionSerial, ServerTime());
+		if (consumed != Policy::RecoveryConsumeResult::Native)
+		{
+			return "the one-shot recovery latch could not be consumed at the new ServerInfo baseline";
+		}
+
+		recovery.requiredLane = true;
+		recovery.requiredRecovery = true;
+		recovery.nativeLane = true;
+		recovery.nativeLatched = true;
+		recovery.deliveryLaneResolved = true;
+		MarkFallback(recovery);
+		Msg(PROJECT_NAME " - luapack: client slot %i (%llu) began engine reconnect epoch %llu with a wholly native initial baseline\n",
+			slot, static_cast<unsigned long long>(recovery.steamID64),
+			static_cast<unsigned long long>(recovery.connectionSerial));
+		return nullptr;
+	}
+
+	static void ClearProvenRecoveryState(int slot, ClientPin& client)
+	{
+		if (client.recoveryStateCleared || !client.active || !BindAuthenticatedIdentity(slot, client))
+			return;
+
+		if (client.requiredRecovery)
+		{
+			if (!state.requiredRecovery.Complete(client.steamID64, client.connectionSerial))
+				return;
+			client.recoveryStateCleared = true;
+			Msg(PROJECT_NAME " - luapack: client slot %i (%llu) completed its authenticated native recovery connection; retry state cleared\n",
+				slot, static_cast<unsigned long long>(client.steamID64));
+			return;
+		}
+
+		if (client.optOut || (client.requiredLane && client.ready))
+		{
+			const Policy::RecoveryClearResult cleared =
+				state.requiredRecovery.ClearAfterSuccessfulConnection(
+					client.steamID64, client.connectionSerial);
+			if (cleared == Policy::RecoveryClearResult::SameFailedConnection)
+			{
+				Warning(PROJECT_NAME " - luapack: retained required recovery state for slot %i (%llu); the connection that armed it cannot clear its own latch\n",
+					slot, static_cast<unsigned long long>(client.steamID64));
+				return;
+			}
+			if (cleared == Policy::RecoveryClearResult::Cleared)
+			{
+				Msg(PROJECT_NAME " - luapack: client slot %i (%llu) reached a distinct authenticated successful connection; prior recovery state cleared\n",
+					slot, static_cast<unsigned long long>(client.steamID64));
+			}
+			client.recoveryStateCleared = true;
+		}
+	}
+
+	static bool PreserveClaimedRecoveryLifecycle(int slot, bool gameLayerCallback)
+	{
+		if (!IsValidSlot(slot))
+			return false;
+
+		ClientPin& client = state.clients[slot];
+		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		const std::uint64_t account = baseClient && baseClient->m_SteamID.IsValid()
+			? baseClient->m_SteamID.ConvertToUint64() : 0;
+		const bool identityMatches = account != 0 && client.resolvedIdentity &&
+			account == client.steamID64;
+		const bool ownsConsumedRecovery = state.requiredRecovery.OwnsConsumed(
+			client.steamID64, client.connectionSerial);
+		return Policy::ShouldPreserveRecoveryLifecycle(gameLayerCallback,
+			client.requiredRecovery && client.nativeLane, client.active,
+			client.recoveryStateCleared, identityMatches, ownsConsumedRecovery);
+	}
+
+	static void ProcessRequiredRecoveryHandoffs(double now)
+	{
+		for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
+		{
+			Policy::RequiredRecoveryHandoff& handoff = state.recoveryHandoffs[slot];
+			if (!handoff.Pending())
+				continue;
+
+			ClientPin& client = state.clients[slot];
+			CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+			const std::uint64_t account = baseClient && baseClient->m_SteamID.IsValid()
+				? baseClient->m_SteamID.ConvertToUint64() : 0;
+			const std::uint64_t expectedAccount = handoff.Account();
+			const std::uint64_t expectedConnection = handoff.FailedConnection();
+			const bool authenticated = baseClient && baseClient->IsFullyAuthenticated();
+			const bool channelReady = baseClient && baseClient->IsConnected() && baseClient->GetNetChannel();
+			const Policy::RecoveryHandoffResult result = handoff.TryInvoke(account,
+				client.connectionSerial, authenticated, channelReady, now);
+			switch (result)
+			{
+				case Policy::RecoveryHandoffResult::Invoke:
+					Msg(PROJECT_NAME " - luapack: invoking one engine reconnect for slot %i (%llu) after failed connection epoch %llu\n",
+						slot, static_cast<unsigned long long>(account),
+						static_cast<unsigned long long>(client.connectionSerial));
+					// Virtual dispatch reaches CGameClient::Reconnect. A later frame may dispatch
+					// exactly one ServerInfo only after the engine has returned to CONNECTED.
+					baseClient->Reconnect();
+					// Reconnect may synchronously run disconnect/connect callbacks. Re-resolve the
+					// slot instead of dereferencing the pre-reconnect client pointer afterward.
+					if (CBaseClient* restarted = Util::server ? Util::GetClientByIndex(slot) : nullptr)
+					{
+						Msg(PROJECT_NAME " - luapack: engine reconnect returned for slot %i (%llu): signon=%i send_server_info=%s channel=%s authenticated=%s\n",
+							slot, static_cast<unsigned long long>(account),
+							restarted->m_nSignonState, restarted->m_bSendServerInfo ? "yes" : "no",
+							restarted->GetNetChannel() ? "yes" : "no",
+							restarted->IsFullyAuthenticated() ? "yes" : "no");
+					}
+					else
+					{
+						Msg(PROJECT_NAME " - luapack: engine reconnect returned for slot %i (%llu) with the slot temporarily unavailable\n",
+							slot, static_cast<unsigned long long>(account));
+					}
+					break;
+				case Policy::RecoveryHandoffResult::AlreadyInvoked:
+				{
+					const bool signonRestarted = baseClient &&
+						baseClient->m_nSignonState == SIGNONSTATE_CONNECTED;
+					const Policy::RecoveryHandoffResult dispatch = handoff.TryDispatchServerInfo(
+						account, authenticated, channelReady, signonRestarted, now);
+					if (dispatch == Policy::RecoveryHandoffResult::DispatchServerInfo)
+					{
+						const bool engineQueued = baseClient->m_bSendServerInfo;
+						// Reconnect resets the sign-on state but does not reliably queue the next
+						// baseline on this engine branch. At exact CONNECTED, this is the engine's
+						// normal pre-ServerInfo flag; the detoured call atomically consumes the
+						// account latch before any Lua string-table hashes are serialized.
+						baseClient->m_bSendServerInfo = true;
+						Msg(PROJECT_NAME " - luapack: dispatching one native ServerInfo for slot %i (%llu) after sign-on restart (engine_queued=%s)\n",
+							slot, static_cast<unsigned long long>(account),
+							engineQueued ? "yes" : "no");
+						if (!baseClient->SendServerInfo())
+						{
+							Warning(PROJECT_NAME " - luapack: native recovery ServerInfo failed for slot %i (%llu); the consumed one-shot will not retry\n",
+								slot, static_cast<unsigned long long>(account));
+						}
+					}
+					break;
+				}
+				case Policy::RecoveryHandoffResult::Expired:
+					if (account == expectedAccount)
+					{
+						DisconnectRequiredClient(slot,
+							"the engine reconnect did not begin its native ServerInfo baseline within the bounded handoff window");
+					}
+					break;
+				case Policy::RecoveryHandoffResult::OwnershipMismatch:
+					handoff.Reset();
+					Warning(PROJECT_NAME " - luapack: cancelled stale recovery handoff for slot %i; expected account %llu connection %llu, got %llu connection %llu\n",
+						slot, static_cast<unsigned long long>(expectedAccount),
+						static_cast<unsigned long long>(expectedConnection),
+						static_cast<unsigned long long>(account),
+						static_cast<unsigned long long>(client.connectionSerial));
+					break;
+				case Policy::RecoveryHandoffResult::Invalid:
+					handoff.Reset();
+					DisconnectRequiredClient(slot,
+						"the authenticated engine reconnect could not be invoked safely");
+					break;
+				case Policy::RecoveryHandoffResult::None:
+				case Policy::RecoveryHandoffResult::NotReady:
+				case Policy::RecoveryHandoffResult::DispatchServerInfo:
+				case Policy::RecoveryHandoffResult::BeginBaseline:
+					break;
+			}
+		}
+	}
+
+	static void ResolveDeliveryLane(int slot, ClientPin& client)
+	{
+		if (client.deliveryLaneResolved)
+			return;
+
+		const Config& currentConfig = GetConfig();
+		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		const char* optOutValue = baseClient ? baseClient->GetUserSetting("tv_nochat") : nullptr;
+		const Policy::Lane lane = Policy::ResolveLane(currentConfig.requiredStubbing,
+			currentConfig.allowOptOut, optOutValue);
+		client.optOut = lane == Policy::Lane::NativeOptOut;
+		client.requiredLane = lane == Policy::Lane::Required;
+		client.nativeLane = lane != Policy::Lane::Required;
+		client.deliveryLaneResolved = true;
+
+		if (client.nativeLane)
+		{
+			// Explicit opt-out remains the highest-priority lane. Capture a resolved
+			// identity when available so a successful manual recovery can heal a pending
+			// automatic latch, but never reject opt-out for an authentication race.
+			if (client.optOut)
+				BindResolvedIdentity(slot, client);
+			MarkFallback(client);
+			if (client.optOut)
+				Msg(PROJECT_NAME " - luapack: client slot %i selected native delivery with tv_nochat=no_gluapack\n", slot);
+			else
+				Msg(PROJECT_NAME " - luapack: client slot %i selected the explicit native rescue lane because required mode is disabled\n", slot);
+			return;
+		}
+
+		const bool resolvedIdentity = BindResolvedIdentity(slot, client);
+		if (Policy::CanConsumeRequiredRecovery(currentConfig.requiredRecovery,
+			resolvedIdentity))
+		{
+			// The ticket-provided SteamID is resolved before ServerInfo, while Source's
+			// fully-authenticated flag normally arrives later in signon. Resolution is
+			// sufficient to select an account-keyed baseline; arming and successful clear
+			// still require the later authenticated identity to match exactly.
+			const Policy::RecoveryConsumeResult recovery = state.requiredRecovery.Consume(
+				client.steamID64, client.connectionSerial, ServerTime());
+			if (recovery == Policy::RecoveryConsumeResult::Native)
+			{
+				client.requiredRecovery = true;
+				client.nativeLane = true;
+				client.nativeLatched = true;
+				MarkFallback(client);
+				Msg(PROJECT_NAME " - luapack: client slot %i (%llu) consumed its one-shot required recovery latch; the initial baseline is wholly native\n",
+					slot, static_cast<unsigned long long>(client.steamID64));
+				return;
+			}
+		}
+		// Queue clients can reach ServerInfo before Source exposes their ticket identity.
+		// That makes account-owned recovery unavailable at this boundary, but it must not
+		// reject an otherwise valid required base. A later authenticated failure may bind
+		// ownership and arm recovery for the next connection.
+
+		// The old optimistic-recovery latch only belongs to the fail-open lane. Required
+		// connections must either resolve their pack or be kicked, regardless of prior history.
+		if (!client.requiredLane && !client.networkID.empty())
+		{
+			auto latch = state.nativeLatches.find(client.networkID);
+			if (latch != state.nativeLatches.end())
+			{
+				if (ServerTime() <= latch->second)
+				{
+					client.nativeLatched = true;
+					Msg(PROJECT_NAME " - luapack: client slot %i (%s) selected fail-open delivery with a native latch from a failed speculative join\n",
+						slot, client.networkID.c_str());
+				}
+				else
+				{
+					state.nativeLatches.erase(latch);
+				}
+			}
+		}
+	}
+
+	static std::string DataDirectory(const std::string& packDirectory);
+
+	static Policy::Lane ClientLane(const ClientPin& client)
+	{
+		if (client.requiredRecovery)
+			return Policy::Lane::NativeRecovery;
+		if (client.requiredLane)
+			return Policy::Lane::Required;
+		return client.optOut ? Policy::Lane::NativeOptOut : Policy::Lane::NativeRescue;
+	}
+
+	static Policy::BaseAvailability BaseAvailabilityForClient(const ClientPin& client, bool verifyLocalObject)
+	{
+		if (client.generation.empty())
+			return Policy::BaseAvailability::Missing;
+
+		auto generation = state.generations.find(client.generation);
+		if (generation == state.generations.end())
+			return Policy::BaseAvailability::Missing;
+
+		const Generation& base = generation->second;
+		const std::string expectedPath = DataDirectory(GetConfig().packDirectory) + "/" + base.id + ".bsp";
+		if (!base.engineDownloadable || !base.compressedRequiredStub || base.resourcePath != expectedPath ||
+			(verifyLocalObject && (!g_pFullFileSystem ||
+				!g_pFullFileSystem->FileExists(base.resourcePath.c_str(), "MOD"))))
+		{
+			return Policy::BaseAvailability::Unusable;
+		}
+
+		return Policy::BaseAvailability::Ready;
+	}
+
+	static bool IsNativeDelta(const Generation& base, const std::string& virtualPath)
+	{
+		const std::string path = NormalizePath(virtualPath);
+		auto baseFile = base.files.find(path);
+		return baseFile == base.files.end() ||
+			base.nativeDeltas.find(path) != base.nativeDeltas.end();
 	}
 
 	static std::string DataDirectory(const std::string& packDirectory)
@@ -994,7 +1401,7 @@ end)
 		if (!downloadUrl)
 		{
 			if (publishing)
-				Warning(PROJECT_NAME " - luapack: sv_downloadurl is unavailable; refusing to publish a FastDL generation\n");
+				Warning(PROJECT_NAME " - luapack: sv_downloadurl is unavailable; refusing to publish the FastDL map base\n");
 			return false;
 		}
 
@@ -1003,7 +1410,7 @@ end)
 			if (downloadUrl->GetString()[0] == '\0')
 			{
 				if (publishing)
-					Warning(PROJECT_NAME " - luapack: sv_downloadurl is empty and policy=require; generation remains unpublished\n");
+					Warning(PROJECT_NAME " - luapack: sv_downloadurl is empty and policy=require; map base remains unpublished\n");
 				return false;
 			}
 			return true;
@@ -1098,7 +1505,7 @@ end)
 		const unsigned int registered = RegisteredPackObjectCount(downloadables, packDirectory);
 		if (registered >= limit)
 		{
-			Msg(PROJECT_NAME " - luapack: downloadables budget exhausted (%u/%u); generation '%s' will use the post-spawn HTTP handoff for new joins\n",
+			Msg(PROJECT_NAME " - luapack: downloadables budget exhausted (%u/%u); map base '%s' cannot be engine-downloadable in this level lifecycle\n",
 				registered, limit, resourcePath.c_str());
 			return DownloadableRegistration::BudgetExhausted;
 		}
@@ -1184,6 +1591,11 @@ end)
 
 	static void StartBuild()
 	{
+		// One immutable generation is admitted to Source's level-lifetime
+		// downloadables table. Hot refreshes after this point are native deltas.
+		if (!state.currentGeneration.empty())
+			return;
+
 		BuildTask* task = new BuildTask;
 		{
 			std::lock_guard<std::mutex> lock(state.registryMutex);
@@ -1202,9 +1614,6 @@ end)
 
 				task->files.push_back(pair.second);
 			}
-			for (const auto& change : state.pendingChanges)
-				task->changedPaths.push_back(change.first);
-			state.pendingChanges.clear();
 			task->sourceRevision = state.revision;
 			state.buildRequested = false;
 		}
@@ -1224,7 +1633,7 @@ end)
 
 	static ConVar luapack_enable(
 		"holylib_gmoddatapack_luapack_enable", "0", FCVAR_ARCHIVE,
-		"Bundle clientside Lua for FastDL delivery. Disabled by default; vanilla Lua delivery remains the fallback");
+		"Bundle clientside Lua for FastDL delivery. Disabled by default; required versus fail-open delivery is configured separately");
 	static ConVar luapack_packdir(
 		"holylib_gmoddatapack_luapack_packdir", "holylib/luapack", FCVAR_ARCHIVE,
 		"Directory below garrysmod/data used for immutable Lua pack objects");
@@ -1239,11 +1648,11 @@ end)
 		"HTTP method for the optional pack ingest hook");
 	static ConVar luapack_downloadable_limit(
 		"holylib_gmoddatapack_luapack_downloadable_limit", "1", FCVAR_ARCHIVE,
-		"Maximum immutable pack objects appended to the level-lifetime downloadables table; later generations use post-spawn HTTP handoff",
+		"Maximum immutable pack objects appended to the level-lifetime downloadables table; LuaPack publishes only one map base and sends later changes natively",
 		true, 0.0f, true, 64.0f);
 	static ConVar luapack_retention_ttl(
 		"holylib_gmoddatapack_luapack_retention_ttl", "300", FCVAR_ARCHIVE,
-		"Minimum seconds to retain an immutable generation after its last pinned client leaves",
+		"Compatibility floor for immutable object retention; map-base mode does not rotate generations during a level",
 		true, 30.0f, true, 86400.0f);
 	static ConVar luapack_object_retention_ttl(
 		"holylib_gmoddatapack_luapack_object_retention_ttl", "604800", FCVAR_ARCHIVE,
@@ -1251,11 +1660,24 @@ end)
 		true, 0.0f, true, 31536000.0f);
 	static ConVar luapack_ready_deadline(
 		"holylib_gmoddatapack_luapack_ready_deadline", "180", FCVAR_ARCHIVE,
-		"Seconds a silent spawned client keeps its generation pinned (the clock starts at activation, not connect); a matching late acknowledgement is still accepted afterwards",
+		"Seconds a silent spawned client keeps its map base pinned (the clock starts at activation, not connect); a matching late acknowledgement is still accepted afterwards",
 		true, 1.0f, true, 3600.0f);
+	static ConVar luapack_required(
+		"holylib_gmoddatapack_luapack_required", "0", FCVAR_ARCHIVE | FCVAR_REPLICATED,
+		"Require connecting clients to use the pinned engine-downloaded Lua pack; failures fail closed or use the bounded authenticated recovery path instead of switching the current join to native Lua");
+	static ConVar luapack_allow_optout(
+		"holylib_gmoddatapack_luapack_allow_optout", "1", FCVAR_ARCHIVE | FCVAR_REPLICATED,
+		"Allow a client whose tv_nochat userinfo is exactly no_gluapack to use native Lua for its entire connection");
+	static ConVar luapack_required_recovery(
+		"holylib_gmoddatapack_luapack_required_recovery", "1", FCVAR_ARCHIVE,
+		"Allow one authenticated engine reconnect whose next ServerInfo baseline is wholly native after a required map-base failure");
+	static ConVar luapack_required_recovery_ttl(
+		"holylib_gmoddatapack_luapack_required_recovery_ttl", "120", FCVAR_ARCHIVE,
+		"Seconds an authenticated one-shot required recovery latch remains valid",
+		true, 5.0f, true, 900.0f);
 	static ConVar luapack_optimistic(
 		"holylib_gmoddatapack_luapack_optimistic", "0", FCVAR_ARCHIVE,
-		"Speculatively deliver generation stubs to large joins before the client acknowledges its pack. Off by default; the native join prefix and every fail-open path stay unchanged");
+		"Speculatively deliver generation stubs to fail-open joins before the client acknowledges its pack. Ignored by connections on the required lane");
 	static ConVar luapack_optimistic_prefix_files(
 		"holylib_gmoddatapack_luapack_optimistic_prefix_files", "256", FCVAR_ARCHIVE,
 		"Files delivered natively at the start of a join before speculative stubbing may begin",
@@ -1272,7 +1694,7 @@ end)
 	// which would destroy the manifest snapshot. The client-created mirror adds the non-server flags.
 	static ConVar luapack_manifest(
 		"holylib_gmoddatapack_luapack_manifest", "", FCVAR_REPLICATED | FCVAR_DONTRECORD | FCVAR_UNLOGGED,
-		"Atomic retained-generation manifest used by the client bootstrap");
+		"Atomic immutable map-base manifest used by the client bootstrap");
 
 	static Config config;
 
@@ -1290,27 +1712,9 @@ end)
 	}
 
 	// The client engine truncates replicated convar values to 255 characters. The snapshot
-	// therefore only carries what the bootstrap cannot derive: a generation id doubles as
-	// the content MD5 and the FastDL object basename, and every generation in one server
-	// lifecycle shares the salt (state.generations and state.salt reset together).
+	// therefore only carries what the bootstrap cannot derive: the map-base id doubles as
+	// the content MD5 and FastDL object basename, plus the base directory and salt.
 	static const size_t MAXIMUM_MANIFEST_LENGTH = 255;
-
-	static std::string SingleGenerationManifest(const std::string& generationId)
-	{
-		auto generation = state.generations.find(generationId);
-		if (generation == state.generations.end())
-			return "";
-
-		const std::string packDirectory = GetConfig().packDirectory;
-		if (generation->second.resourcePath != DataDirectory(packDirectory) + "/" + generationId + ".bsp")
-			return "";
-
-		std::ostringstream serialized;
-		serialized << "1|" << generationId << '|' << HexEncode(packDirectory)
-			<< '|' << HexEncode(generation->second.salt) << '|' << generationId;
-		const std::string value = serialized.str();
-		return value.length() <= MAXIMUM_MANIFEST_LENGTH ? value : "";
-	}
 
 	static void PublishManifest()
 	{
@@ -1330,18 +1734,18 @@ end)
 		const std::string& packDirectory = GetConfig().packDirectory;
 		if (current->second.resourcePath != DataDirectory(packDirectory) + "/" + state.currentGeneration + ".bsp")
 		{
-			// The pack directory changed after this generation was built; a derived client
-			// path would point at nothing. The next build publishes under the new directory.
-			Warning(PROJECT_NAME " - luapack: pack directory changed after generation %s was built; refusing publication until the next build\n",
+			// The pack directory changed after the map base was built; a derived client
+			// path would point at nothing. Map-base immutability defers replacement.
+			Warning(PROJECT_NAME " - luapack: pack directory changed after map base %s was built; refusing publication until level shutdown\n",
 				state.currentGeneration.c_str());
 			luapack_manifest.SetValue("");
 			return;
 		}
 
-		std::ostringstream header;
-		header << "1|" << state.currentGeneration << '|' << HexEncode(packDirectory)
+		std::ostringstream manifest;
+		manifest << "1|" << state.currentGeneration << '|' << HexEncode(packDirectory)
 			<< '|' << HexEncode(current->second.salt) << '|' << state.currentGeneration;
-		std::string serialized = header.str();
+		const std::string serialized = manifest.str();
 		if (serialized.length() > MAXIMUM_MANIFEST_LENGTH)
 		{
 			Warning(PROJECT_NAME " - luapack: pack directory '%s' pushes the replicated manifest over %u characters; refusing publication\n",
@@ -1350,133 +1754,8 @@ end)
 			return;
 		}
 
-		for (const auto& pair : state.generations)
-		{
-			if (pair.first == state.currentGeneration)
-				continue;
-			// A retained generation that no longer fits, or that was built under a different
-			// directory or salt, stays valid server-side for late acknowledgements; new
-			// bootstraps only ever need the current generation.
-			if (pair.second.salt != current->second.salt ||
-				pair.second.resourcePath != DataDirectory(packDirectory) + "/" + pair.first + ".bsp" ||
-				serialized.length() + 1 + pair.first.length() > MAXIMUM_MANIFEST_LENGTH)
-				continue;
-			serialized += ';';
-			serialized += pair.first;
-		}
-
 		// One SetValue call is the publication barrier: clients never observe a partially-updated generation.
 		luapack_manifest.SetValue(serialized.c_str());
-	}
-
-	static bool SendGenerationHandoff(const std::string& generationId, const std::vector<int>& recipients,
-		const std::vector<std::string>& changedPaths)
-	{
-		if (!g_Lua || recipients.empty())
-			return false;
-
-		auto generation = state.generations.find(generationId);
-		if (generation == state.generations.end())
-			return false;
-		const std::string manifest = SingleGenerationManifest(generationId);
-		if (manifest.empty() || !Lua::PushHook("HolyLib:LuaPackPublished"))
-			return false;
-
-		g_Lua->PushString(generationId.c_str());
-		g_Lua->PushString(manifest.c_str());
-		g_Lua->PreCreateTable(recipients.size(), 0);
-		for (size_t index = 0; index < recipients.size(); ++index)
-		{
-			g_Lua->PushNumber(recipients[index] + 1);
-			Util::RawSetI(g_Lua, -2, index + 1);
-		}
-		g_Lua->PreCreateTable(changedPaths.size(), 0);
-		for (size_t index = 0; index < changedPaths.size(); ++index)
-		{
-			g_Lua->PushString(changedPaths[index].c_str());
-			Util::RawSetI(g_Lua, -2, index + 1);
-		}
-		g_Lua->CallFunctionProtected(5, 0, true);
-		return true;
-	}
-
-	static void NotifyAutorefresh(const std::string& previousGeneration, const BuildTask* task)
-	{
-		if (!g_Lua || previousGeneration.empty() || previousGeneration == state.currentGeneration ||
-			!task || task->changedPaths.empty())
-			return;
-
-		std::vector<int> recipients;
-		for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
-		{
-			const ClientPin& client = state.clients[slot];
-			if (client.active && client.ready && !client.fallback && client.generation == previousGeneration)
-				recipients.push_back(slot);
-		}
-		if (recipients.empty())
-			return;
-
-		auto generation = state.generations.find(state.currentGeneration);
-		if (generation == state.generations.end())
-			return;
-		if (!SendGenerationHandoff(state.currentGeneration, recipients, task->changedPaths))
-			return;
-
-		for (int slot : recipients)
-		{
-			ClientPin& client = state.clients[slot];
-			ReleaseGenerationReference(client);
-			client.generation = state.currentGeneration;
-			client.deadline = ServerTime() + GetConfig().readyDeadlineSeconds;
-			client.nextHandoffAt = ServerTime() + 10.0;
-			client.ready = false;
-			client.fallback = false;
-			client.holdsPin = true;
-			++generation->second.pins;
-		}
-	}
-
-	static void NotifyJoiningClient(int slot)
-	{
-		if (!IsValidSlot(slot))
-			return;
-
-		ClientPin& client = state.clients[slot];
-		if (!client.active || client.ready || client.fallback || client.generation.empty())
-			return;
-
-		if (SendGenerationHandoff(client.generation, std::vector<int>{slot}, std::vector<std::string>()))
-			client.nextHandoffAt = ServerTime() + 10.0;
-	}
-
-	static void CatchUpClient(int slot)
-	{
-		if (!IsValidSlot(slot) || state.currentGeneration.empty())
-			return;
-
-		ClientPin& client = state.clients[slot];
-		if (!client.active || !client.ready || client.fallback || client.generation.empty() ||
-			client.generation == state.currentGeneration)
-			return;
-
-		auto generation = state.generations.find(state.currentGeneration);
-		if (generation == state.generations.end() ||
-			!SendGenerationHandoff(state.currentGeneration, std::vector<int>{slot}, std::vector<std::string>()))
-		{
-			return;
-		}
-
-		const std::string previousGeneration = client.generation;
-		ReleaseGenerationReference(client);
-		client.generation = state.currentGeneration;
-		client.deadline = ServerTime() + GetConfig().readyDeadlineSeconds;
-		client.nextHandoffAt = ServerTime() + 10.0;
-		client.ready = false;
-		client.fallback = false;
-		client.holdsPin = true;
-		++generation->second.pins;
-		Msg(PROJECT_NAME " - luapack: client slot %i catching up from acknowledged generation %s to current generation %s\n",
-			slot, previousGeneration.c_str(), state.currentGeneration.c_str());
 	}
 
 	static void RefreshConfig()
@@ -1492,6 +1771,10 @@ end)
 		if (config.objectRetentionSeconds > 0.0)
 			config.objectRetentionSeconds = std::max(config.objectRetentionSeconds, config.generationRetentionSeconds);
 		config.readyDeadlineSeconds = luapack_ready_deadline.GetFloat();
+		config.requiredStubbing = luapack_required.GetBool();
+		config.allowOptOut = luapack_allow_optout.GetBool();
+		config.requiredRecovery = luapack_required_recovery.GetBool();
+		config.requiredRecoveryTtlSeconds = luapack_required_recovery_ttl.GetFloat();
 		config.optimisticStubbing = luapack_optimistic.GetBool();
 		config.optimisticPrefixFiles = static_cast<unsigned int>(luapack_optimistic_prefix_files.GetInt());
 		config.optimisticPrefixBytes = static_cast<unsigned long long>(luapack_optimistic_prefix_bytes.GetInt());
@@ -1520,9 +1803,12 @@ end)
 		}
 
 		if (!state.stringTables)
-			Warning(PROJECT_NAME " - luapack: INetworkStringTableContainer is unavailable; FastDL publishing will stay fail-open\n");
+			Warning(PROJECT_NAME " - luapack: INetworkStringTableContainer is unavailable; FastDL publishing cannot start\n");
 		RefreshConfig();
 		state.featureEnabledLastFrame = IsEnabled();
+		// InitDetour runs after Init. The first Think observes the installed hook set and
+		// reprocesses cached registrations if canonical delivery became available.
+		state.canonicalRegistrationAvailableLastFrame = false;
 	}
 
 	void Shutdown()
@@ -1545,7 +1831,6 @@ end)
 
 		std::lock_guard<std::mutex> lock(state.registryMutex);
 		state.files.clear();
-		state.pendingChanges.clear();
 		state.buildRequested = false;
 		state.generations.clear();
 		state.currentGeneration.clear();
@@ -1554,12 +1839,21 @@ end)
 		state.lockedDownloadUrl.clear();
 		state.downloadUrlLocked = false;
 		state.featureEnabledLastFrame = false;
+		state.canonicalRegistrationAvailableLastFrame = false;
 		state.bootstrapRefresh = false;
+		state.registrationRefreshPending = false;
 		state.lastCaptureAt = 0.0;
 		state.nextBuildAllowed = 0.0;
 		for (ClientPin& client : state.clients)
 			client = ClientPin();
+		for (Policy::RequiredRecoveryHandoff& handoff : state.recoveryHandoffs)
+			handoff.Reset();
 		state.nativeLatches.clear();
+		if (state.requiredRecovery.Size() != 0)
+			Msg(PROJECT_NAME " - luapack: clearing %llu required recovery entries at module shutdown\n",
+				static_cast<unsigned long long>(state.requiredRecovery.Size()));
+		state.requiredRecovery.Reset();
+		state.nextConnectionSerial = 0;
 		luapack_manifest.SetValue("");
 	}
 
@@ -1571,10 +1865,13 @@ end)
 	void Think()
 	{
 		const bool enabled = IsEnabled();
+		const bool canonicalRegistrationAvailable =
+			Policy::UsesCanonicalRegistration(enabled, SupportsCanonicalRegistration());
 		if (enabled != state.featureEnabledLastFrame)
 		{
 			state.featureEnabledLastFrame = enabled;
 			state.bootstrapRefresh = true;
+			state.registrationRefreshPending = true;
 			if (enabled)
 			{
 				std::lock_guard<std::mutex> lock(state.registryMutex);
@@ -1582,11 +1879,25 @@ end)
 			} else {
 				// The disabled state must not retain a second copy of all registered Lua. Clearing
 				// also prevents a runtime re-enable from publishing a stale pre-refresh snapshot.
+				// Fail safe for every preserved immutable generation until the refresh recaptures
+				// the current identities: files may have changed while capture was disabled.
 				std::lock_guard<std::mutex> lock(state.registryMutex);
+				for (auto& generation : state.generations)
+				{
+					Policy::MarkBasePathsNative(generation.second.nativeDeltas,
+						generation.second.files);
+				}
 				state.files.clear();
-				state.pendingChanges.clear();
 				state.buildRequested = false;
 			}
+		}
+		if (canonicalRegistrationAvailable != state.canonicalRegistrationAvailableLastFrame)
+		{
+			state.canonicalRegistrationAvailableLastFrame = canonicalRegistrationAvailable;
+			// A hook-set change alters the byte identity stored in every non-init entry,
+			// just like the master switch. The module refresh loop re-feeds all registrations.
+			state.bootstrapRefresh = true;
+			state.registrationRefreshPending = true;
 		}
 
 		for (auto upload = state.uploads.begin(); upload != state.uploads.end();)
@@ -1611,72 +1922,101 @@ end)
 		{
 			BuildTask* task = state.activeBuild;
 			state.activeBuild = nullptr;
+			auto retryBaseBuild = [](double delay) {
+				state.nextBuildAllowed = ServerTime() + delay;
+				std::lock_guard<std::mutex> lock(state.registryMutex);
+				state.buildRequested = true;
+			};
 
 			state.nextBuildAllowed = ServerTime() + 5.0;
 			if (!task->success)
 			{
-				Warning(PROJECT_NAME " - luapack: Failed to build pack: %s\n", task->error.c_str());
+				Warning(PROJECT_NAME " - luapack: Failed to build map-base pack: %s\n", task->error.c_str());
+				if (IsEnabled() && state.currentGeneration.empty())
+					retryBaseBuild(15.0);
 			} else if (IsEnabled()) {
-				std::string resourcePath;
-				if (!WriteImmutableObject(task, resourcePath))
+				if (!state.currentGeneration.empty())
 				{
-					Warning(PROJECT_NAME " - luapack: Failed to atomically write pack %s\n", task->md5.c_str());
-				} else if (!CoordinateDownloadUrl(true)) {
-					Warning(PROJECT_NAME " - luapack: Pack %s exists but was not published; clients remain on vanilla delivery\n", task->md5.c_str());
-					state.nextBuildAllowed = ServerTime() + 15.0;
-					std::lock_guard<std::mutex> lock(state.registryMutex);
-					state.buildRequested = true;
+					Warning(PROJECT_NAME " - luapack: Discarding a completed replacement build because map base %s is immutable until level shutdown\n",
+						state.currentGeneration.c_str());
 				} else {
-					const Config& currentConfig = GetConfig();
-					const DownloadableRegistration registration = RegisterDownloadable(resourcePath,
-						currentConfig.packDirectory, currentConfig.downloadableLimit);
-					if (registration == DownloadableRegistration::Failed)
+					std::string resourcePath;
+					if (!WriteImmutableObject(task, resourcePath))
 					{
-						Warning(PROJECT_NAME " - luapack: Pack %s exists but was not published; clients remain on vanilla delivery\n", task->md5.c_str());
-						state.nextBuildAllowed = ServerTime() + 15.0;
-						std::lock_guard<std::mutex> lock(state.registryMutex);
-						state.buildRequested = true;
-						delete task;
-						return;
+						Warning(PROJECT_NAME " - luapack: Failed to atomically write map-base pack %s\n", task->md5.c_str());
+						retryBaseBuild(15.0);
+					} else if (!CoordinateDownloadUrl(true)) {
+						Warning(PROJECT_NAME " - luapack: Map base %s exists but was not published; native lanes continue and required joins are rejected\n", task->md5.c_str());
+						retryBaseBuild(15.0);
+					} else {
+						const Config& currentConfig = GetConfig();
+						const DownloadableRegistration registration = RegisterDownloadable(resourcePath,
+							currentConfig.packDirectory, currentConfig.downloadableLimit);
+						if (registration == DownloadableRegistration::Failed)
+						{
+							Warning(PROJECT_NAME " - luapack: Map base %s could not enter the engine download queue; native lanes continue and required joins are rejected\n", task->md5.c_str());
+							retryBaseBuild(15.0);
+						}
+						else if (registration == DownloadableRegistration::BudgetExhausted)
+						{
+							Warning(PROJECT_NAME " - luapack: No engine-downloadable slot remains for map base %s; refusing an HTTP-only base until level shutdown\n", task->md5.c_str());
+							std::lock_guard<std::mutex> lock(state.registryMutex);
+							state.buildRequested = false;
+						}
+						else
+						{
+							Generation generation;
+							generation.id = task->md5;
+							generation.md5 = task->md5;
+							generation.salt = task->salt;
+							generation.resourcePath = resourcePath;
+							generation.engineDownloadable = true;
+							generation.sourceRevision = task->sourceRevision;
+							generation.publishedAt = ServerTime();
+							generation.compressedStub = BuildCompressedStub();
+							generation.compressedRequiredStub = generation.compressedStub;
+							for (const FileRecord& file : task->files)
+								generation.files[NormalizePath(file.virtualPath)] = file.identity;
+							{
+								std::lock_guard<std::mutex> lock(state.registryMutex);
+								for (const auto& current : state.files)
+								{
+									const auto baseFile = generation.files.find(current.first);
+									Policy::UpdateNativeDeltaIndex(generation.nativeDeltas,
+										current.first, Policy::IsNativeDelta(
+											baseFile != generation.files.end(),
+											baseFile == generation.files.end() ? std::string() : baseFile->second,
+											current.second.identity));
+								}
+								for (const auto& baseFile : generation.files)
+								{
+									if (state.files.find(baseFile.first) == state.files.end())
+										generation.nativeDeltas.insert(baseFile.first);
+								}
+							}
+							if (!generation.compressedStub || !generation.compressedRequiredStub)
+							{
+								Warning(PROJECT_NAME " - luapack: Failed to build the canonical map-base stub; required joins remain rejected\n");
+								retryBaseBuild(15.0);
+							}
+							else
+							{
+								state.generations[generation.id] = generation;
+								state.currentGeneration = generation.id;
+								{
+									std::lock_guard<std::mutex> lock(state.registryMutex);
+									// Captures newer than the build snapshot stay in state.files
+									// and are selected as native deltas.
+									state.buildRequested = false;
+								}
+								PublishManifest();
+								NotifyPackBuilt(task, generation);
+								HousekeepObjects();
+								Msg(PROJECT_NAME " - luapack: Published immutable map base %s (%u compressed bytes, %u files); subsequent changes use per-client native deltas\n",
+									generation.id.c_str(), task->compressed.GetWritten(), static_cast<unsigned int>(task->files.size()));
+							}
+						}
 					}
-
-					Generation generation;
-					generation.id = task->md5;
-					generation.md5 = task->md5;
-					generation.salt = task->salt;
-					generation.resourcePath = resourcePath;
-					generation.engineDownloadable = registration == DownloadableRegistration::Registered;
-					generation.sourceRevision = task->sourceRevision;
-					generation.publishedAt = ServerTime();
-					generation.compressedStub = BuildCompressedStub(generation.id);
-					for (const FileRecord& file : task->files)
-						generation.files[NormalizePath(file.virtualPath)] = true;
-					if (!generation.compressedStub)
-					{
-						Warning(PROJECT_NAME " - luapack: Failed to build generation stub; pack remains unpublished\n");
-						delete task;
-						return;
-					}
-					auto existing = state.generations.find(generation.id);
-					if (existing != state.generations.end())
-						generation.pins = existing->second.pins;
-
-					const std::string previousGeneration = state.currentGeneration;
-					if (!previousGeneration.empty() && previousGeneration != generation.id)
-					{
-						auto previous = state.generations.find(previousGeneration);
-						if (previous != state.generations.end())
-							previous->second.retireAfter = ServerTime() + GetConfig().generationRetentionSeconds;
-					}
-
-					state.generations[generation.id] = generation;
-					state.currentGeneration = generation.id;
-					PublishManifest();
-					NotifyAutorefresh(previousGeneration, task);
-					NotifyPackBuilt(task, generation);
-					HousekeepObjects();
-					Msg(PROJECT_NAME " - luapack: Built immutable generation %s (%u compressed bytes, %u files)\n",
-						generation.id.c_str(), task->compressed.GetWritten(), static_cast<unsigned int>(task->files.size()));
 				}
 			}
 
@@ -1691,9 +2031,15 @@ end)
 				if (!client.generation.empty())
 					ReleasePin(client);
 			}
+			for (Policy::RequiredRecoveryHandoff& handoff : state.recoveryHandoffs)
+				handoff.Reset();
 			// Disabling the feature forgets speculation-failure history; nothing consults it
 			// while all delivery is native anyway.
 			state.nativeLatches.clear();
+			if (state.requiredRecovery.Size() != 0)
+				Msg(PROJECT_NAME " - luapack: clearing %llu required recovery entries because LuaPack was disabled\n",
+					static_cast<unsigned long long>(state.requiredRecovery.Size()));
+			state.requiredRecovery.Reset();
 			if (luapack_manifest.GetString()[0] != '\0')
 				luapack_manifest.SetValue("");
 			return;
@@ -1701,20 +2047,14 @@ end)
 
 		CoordinateDownloadUrl(false);
 		const double now = ServerTime();
+		ProcessRequiredRecoveryHandoffs(now);
 		for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
 		{
 			ClientPin& client = state.clients[slot];
-			if (client.active && client.ready && !client.fallback &&
-				!client.generation.empty() && client.generation != state.currentGeneration)
-			{
-				CatchUpClient(slot);
-			}
-			if (!client.generation.empty() && !client.ready && !client.fallback && client.active &&
-				now >= client.nextHandoffAt)
-			{
-				NotifyJoiningClient(slot);
-			}
-
+			// Steam authentication commonly completes after SendServerInfo. If the client
+			// reached full entry first, retain the consumed tombstone until
+			// the same connection's authenticated SteamID64 can be revalidated here.
+			ClearProvenRecoveryState(slot, client);
 			// The deadline only runs for spawned clients. A connecting client can legitimately
 			// spend many minutes in map load + the Requesting-Lua burst before its Lua state even
 			// exists; expiring the pin there would mark exactly the joins that matter fallback
@@ -1722,6 +2062,11 @@ end)
 			if (!client.generation.empty() && !client.ready && !client.fallback && client.active &&
 				now > client.deadline)
 			{
+				if (client.requiredLane && !client.everReady)
+				{
+					DisconnectRequiredClient(slot, "the client did not acknowledge its required map base before the READY deadline");
+					continue;
+				}
 				MarkFallback(client);
 			}
 		}
@@ -1733,23 +2078,8 @@ end)
 			else
 				++latch;
 		}
+		state.requiredRecovery.Prune(now);
 
-		bool retiredGeneration = false;
-		for (auto generation = state.generations.begin(); generation != state.generations.end();)
-		{
-			if (generation->first != state.currentGeneration && generation->second.pins == 0 &&
-				generation->second.retireAfter > 0.0 && now >= generation->second.retireAfter)
-			{
-				Msg(PROJECT_NAME " - luapack: Retired unpinned generation %s; object remains protected while registered and is later eligible for housekeeping\n",
-					generation->first.c_str());
-				generation = state.generations.erase(generation);
-				retiredGeneration = true;
-				continue;
-			}
-			++generation;
-		}
-		if (retiredGeneration)
-			PublishManifest();
 		if (luapack_manifest.GetString()[0] == '\0' && !state.currentGeneration.empty())
 			PublishManifest();
 		if (state.activeBuild)
@@ -1758,10 +2088,11 @@ end)
 		bool shouldBuild = false;
 		{
 			std::lock_guard<std::mutex> lock(state.registryMutex);
-			// The quiesce window batches multi-file deploys/refreshes into one whole-pack
-			// build instead of one per touched file; nextBuildAllowed backs off retries so a
-			// failed publish cannot degenerate into a per-frame LZMA loop.
-			shouldBuild = state.buildRequested && now >= state.nextBuildAllowed &&
+			// The quiesce window captures the level's initial registration burst as one
+			// map base; nextBuildAllowed backs off failed initial publication retries.
+			shouldBuild = !state.registrationRefreshPending &&
+				Policy::ShouldBuildMapBase(!state.currentGeneration.empty(), state.buildRequested) &&
+				now >= state.nextBuildAllowed &&
 				now - state.lastCaptureAt >= 2.0;
 		}
 		if (shouldBuild)
@@ -1778,44 +2109,66 @@ end)
 
 	void CaptureFile(const GarrysMod::Lua::LuaFile* file)
 	{
-		if (!IsEnabled() || !file)
+		if (!file)
+			return;
+		CaptureFileContents(file->name, file->contents);
+	}
+
+	void CaptureFileContents(const std::string& inputPath, const std::string& contents)
+	{
+		if (!IsEnabled())
 			return;
 
-		const std::string virtualPath = NormalizePath(file->name);
+		const std::string virtualPath = NormalizePath(inputPath);
 		if (virtualPath.empty())
 			return;
+		const bool needsMapBase = state.currentGeneration.empty();
 
 		{
 			std::lock_guard<std::mutex> lock(state.registryMutex);
 			FileRecord& record = state.files[virtualPath];
-			const std::string sourcePath = NormalizePath(file->source.empty() ? file->name : file->source);
-			if (record.contents == file->contents && record.sourcePath == sourcePath)
+			// LuaFile::source is registration provenance (often the AddCSLuaFile caller),
+			// so hundreds of unrelated entries can share it. The client executes the
+			// registered string-table path; use that unique virtual path for exact lookup.
+			const std::string sourcePath = virtualPath;
+			if (record.contents == contents && record.sourcePath == sourcePath)
 				return;
+			const std::string identity = ContentIdentity(contents);
 
 			record.virtualPath = virtualPath;
 			record.sourcePath = sourcePath;
-			record.contents = file->contents;
+			record.contents = contents;
+			record.identity = identity;
 			record.revision = ++state.revision;
-			state.buildRequested = true;
-			state.pendingChanges[virtualPath] = true;
+			for (auto& generation : state.generations)
+			{
+				const auto baseFile = generation.second.files.find(virtualPath);
+				Policy::UpdateNativeDeltaIndex(generation.second.nativeDeltas,
+					virtualPath, Policy::IsNativeDelta(
+						baseFile != generation.second.files.end(),
+						baseFile == generation.second.files.end() ? std::string() : baseFile->second,
+						identity));
+			}
+			if (needsMapBase)
+			{
+				state.buildRequested = true;
+			}
 			state.lastCaptureAt = ServerTime(); // quiesce window: batch deploys build once, not per file
 		}
-
-		// A changed file must stop being stubbed immediately: every retained generation's
-		// pack body still holds the previous contents, so a stub would make the engine's
-		// autorefresh re-send re-run STALE code on ready clients. Excluding the path here
-		// routes those sends through the real updated file; the next published generation
-		// restores stub coverage. Main thread only, like all generation-map access.
-		for (auto& pair : state.generations)
-			pair.second.files.erase(virtualPath);
+		// Once the immutable map base exists, no replacement generation is queued.
+		// Selection compares this current identity with the base identity: changed or
+		// late paths go native, and an exact restoration becomes canonical again.
 	}
 
 	std::string PrepareVanillaFile(const std::string& virtualPath, const std::string& contents)
 	{
-		if (!IsEnabled() || !IsInitFile(virtualPath))
+		if (!IsEnabled() || !SupportsCanonicalRegistration())
 			return contents;
 
-		return std::string(clientBootstrap) + "\n" + contents;
+		if (IsInitFile(virtualPath))
+			return std::string(clientBootstrap) + "\n" + contents;
+
+		return canonicalStubSource;
 	}
 
 	bool ConsumeBootstrapRefresh()
@@ -1825,105 +2178,265 @@ end)
 		return refresh;
 	}
 
-	const Bootil::AutoBuffer* StubForClient(int slot, const std::string& virtualPath, size_t nativeSourceBytes)
+	bool RegistrationRefreshPending()
+	{
+		const bool enabled = IsEnabled();
+		const bool canonicalRegistrationAvailable =
+			Policy::UsesCanonicalRegistration(enabled, SupportsCanonicalRegistration());
+		return state.registrationRefreshPending ||
+			enabled != state.featureEnabledLastFrame ||
+			canonicalRegistrationAvailable != state.canonicalRegistrationAvailableLastFrame;
+	}
+
+	bool BaselinePreparationPending()
+	{
+		bool baseWorkPending = false;
+		{
+			std::lock_guard<std::mutex> lock(state.registryMutex);
+			baseWorkPending = state.buildRequested || state.activeBuild != nullptr;
+		}
+		return RegistrationRefreshPending() || Policy::InitialMapBasePending(
+			IsEnabled(), GetConfig().requiredStubbing,
+			!state.currentGeneration.empty(), baseWorkPending);
+	}
+
+	void CompleteRegistrationRefresh()
+	{
+		// If another transition was requested while the current sweep completed, retain
+		// the gate until that replacement sweep is consumed and published too.
+		state.registrationRefreshPending = state.bootstrapRefresh;
+	}
+
+	BaselineDecision DecideBaselineForClient(int slot)
+	{
+		if (!IsValidSlot(slot))
+			return BaselineDecision();
+		if (BaselinePreparationPending())
+			return {BaselineAction::Reject, "Lua registration identities or the immutable map base are still being prepared"};
+		if (!IsEnabled())
+			return BaselineDecision();
+		if (const char* recoveryFailure = BeginPendingRecoveryBaseline(slot))
+			return {BaselineAction::Reject, recoveryFailure};
+
+		if (Policy::NeedsConnectionEpochAtBaseline(
+			state.clients[slot].connectionSerial))
+			StartClientEpoch(slot);
+		ClientPin& client = state.clients[slot];
+		ResolveDeliveryLane(slot, client);
+		if (Policy::ShouldPinCurrentBaseForBaseline(ClientLane(client),
+			!client.generation.empty(), !state.currentGeneration.empty()))
+			PinCurrentGeneration(client);
+		const Policy::BaseAvailability base = BaseAvailabilityForClient(client, true);
+		switch (Policy::SelectBaseline(ClientLane(client), SupportsCanonicalRegistration(), base))
+		{
+			case Policy::Action::Native:
+				return {BaselineAction::NativeSource, nullptr};
+			case Policy::Action::CanonicalStub:
+				return {BaselineAction::BasePlusDelta, nullptr};
+			case Policy::Action::Reject:
+				if (!SupportsCanonicalRegistration())
+					return {BaselineAction::Reject, "canonical Lua placeholder registration is unavailable on this platform"};
+				if (base == Policy::BaseAvailability::Missing)
+					return {BaselineAction::Reject, "no immutable map base was pinned before the client string-table baseline"};
+				return {BaselineAction::Reject, "the pinned map base is absent, invalid, or not in the engine download queue"};
+		}
+
+		return {BaselineAction::Reject, "invalid map-base baseline policy result"};
+	}
+
+	BaselineDecision DecideFileBaselineForClient(int slot, const std::string& virtualPath)
+	{
+		if (!IsEnabled() || !IsValidSlot(slot))
+			return BaselineDecision();
+
+		ClientPin& client = state.clients[slot];
+		ResolveDeliveryLane(slot, client);
+		const Policy::BaseAvailability base = BaseAvailabilityForClient(client, false);
+		bool nativeDelta = true;
+		if (base == Policy::BaseAvailability::Ready)
+		{
+			auto generation = state.generations.find(client.generation);
+			if (generation != state.generations.end())
+				nativeDelta = IsNativeDelta(generation->second, virtualPath);
+		}
+
+		switch (Policy::SelectFile(ClientLane(client), SupportsCanonicalRegistration(),
+			base, IsInitFile(virtualPath), nativeDelta))
+		{
+			case Policy::Action::Native:
+				return {BaselineAction::NativeSource, nullptr};
+			case Policy::Action::CanonicalStub:
+				return {BaselineAction::CanonicalStub, nullptr};
+			case Policy::Action::Reject:
+				return {BaselineAction::Reject, base == Policy::BaseAvailability::Missing
+					? "the immutable map base is not pinned" : "the immutable map base is unusable"};
+		}
+
+		return {BaselineAction::Reject, "invalid per-file map-base policy result"};
+	}
+
+	BaselineDecision DecidePinnedFileBaselineForClient(int slot, const std::string& virtualPath)
+	{
+		if (!IsEnabled() || !IsValidSlot(slot))
+			return {BaselineAction::Reject, "LuaPack became unavailable during ServerInfo preparation"};
+
+		// This is the immediate continuation of DecideBaselineForClient inside one
+		// SendServerInfo call. That outer decision already verified the exact pinned
+		// object, manifest path, downloadable registration, and local file. Repeating
+		// those ConVar/path checks for every string-table entry made a flood multiply
+		// thousands of identical validations on the main thread.
+		const ClientPin& client = state.clients[slot];
+		if (ClientLane(client) != Policy::Lane::Required)
+		{
+			return {BaselineAction::Reject, "the required baseline lane changed during ServerInfo preparation"};
+		}
+		auto generation = state.generations.find(client.generation);
+		if (generation == state.generations.end() ||
+			!generation->second.engineDownloadable ||
+			!generation->second.compressedRequiredStub)
+		{
+			return {BaselineAction::Reject, "the pinned map base became unavailable during ServerInfo preparation"};
+		}
+
+		switch (Policy::SelectFile(Policy::Lane::Required, true,
+			Policy::BaseAvailability::Ready, IsInitFile(virtualPath),
+			IsNativeDelta(generation->second, virtualPath)))
+		{
+			case Policy::Action::Native:
+				return {BaselineAction::NativeSource, nullptr};
+			case Policy::Action::CanonicalStub:
+				return {BaselineAction::CanonicalStub, nullptr};
+			case Policy::Action::Reject:
+				return {BaselineAction::Reject, "the pinned map-base file decision was rejected"};
+		}
+
+		return {BaselineAction::Reject, "invalid pinned map-base file policy result"};
+	}
+
+	const Bootil::AutoBuffer* RequiredStubPayloadForClient(int slot)
 	{
 		if (!IsEnabled() || !IsValidSlot(slot))
 			return nullptr;
 
-		ClientPin& client = state.clients[slot];
-		if (client.fallback || client.generation.empty())
-			return nullptr;
+		const ClientPin& client = state.clients[slot];
 		auto generation = state.generations.find(client.generation);
-		if (generation == state.generations.end() || !generation->second.compressedStub)
-			return nullptr;
-
-		const std::string path = NormalizePath(virtualPath);
-		const bool stubbable = !IsInitFile(path) &&
-			generation->second.files.find(path) != generation->second.files.end();
-
-		if (client.ready)
+		if (generation == state.generations.end() ||
+			!generation->second.compressedRequiredStub)
 		{
-			if (!stubbable)
-				return nullptr;
-			if (!client.active)
-				++client.joinReadyStubs;
-			return generation->second.compressedStub.get();
-		}
-
-		// Everything below is the pre-acknowledgement join burst. Requests from a spawned
-		// client that never acknowledged stay native: it may hold no mountable pack at all.
-		if (client.active)
-			return nullptr;
-
-		const Config& currentConfig = GetConfig();
-		const bool prefixDelivered = client.joinNativeFiles >= currentConfig.optimisticPrefixFiles &&
-			client.joinNativeBytes >= currentConfig.optimisticPrefixBytes;
-		if (!currentConfig.optimisticStubbing || !generation->second.engineDownloadable ||
-			client.nativeLatched || !stubbable || !prefixDelivered)
-		{
-			// Counted even while speculation is off or latched: the join summary is the
-			// measurement that sizes the prefix thresholds in the first place.
-			++client.joinNativeFiles;
-			client.joinNativeBytes += nativeSourceBytes;
 			return nullptr;
 		}
 
-		++client.joinOptimisticStubs;
-		if (client.joinOptimisticStubs == 1)
-			Msg(PROJECT_NAME " - luapack: client slot %i crossed the native prefix (%u files, %llu source bytes) before acknowledging generation %s; speculatively stubbing the rest of the join\n",
-				slot, client.joinNativeFiles, client.joinNativeBytes, client.generation.c_str());
-		return generation->second.compressedStub.get();
+		return generation->second.compressedRequiredStub.get();
 	}
 
-	void ClientConnect(int slot)
+	std::size_t RequiredStubCompressedBytesForClient(int slot)
+	{
+		const Bootil::AutoBuffer* payload = RequiredStubPayloadForClient(slot);
+		return payload ? payload->GetWritten() : 0;
+	}
+
+	bool RecordPinnedRequiredStubForClient(int slot)
+	{
+		if (!IsEnabled() || !IsValidSlot(slot))
+			return false;
+
+		ClientPin& client = state.clients[slot];
+		if (ClientLane(client) != Policy::Lane::Required || client.generation.empty())
+			return false;
+		if (!client.active)
+		{
+			++client.joinRequiredStubs;
+			if (client.joinRequiredStubs == 1)
+				Msg(PROJECT_NAME " - luapack: client slot %i is using required map base %s with per-path native deltas; stubbing unchanged files without waiting for READY\n",
+					slot, client.generation.c_str());
+		}
+		return true;
+	}
+
+	bool NeedsNativeHashUpdate(int slot)
+	{
+		if (!IsEnabled() || !IsValidSlot(slot))
+			return false;
+		// If the hook set disappeared since the previous Think, registrations are still
+		// canonical until the queued all-file refresh runs. Keep repairing native bodies
+		// during that bounded transition; a fresh unsupported start has neither flag.
+		if (!SupportsCanonicalRegistration() &&
+			!state.canonicalRegistrationAvailableLastFrame)
+			return false;
+
+		ClientPin& client = state.clients[slot];
+		ResolveDeliveryLane(slot, client);
+		// Global registration is canonical when the per-client baseline hook is active.
+		// Every native body therefore receives its current per-client hash, both for JIP
+		// deltas and for active-client hot refreshes on wholly native lanes.
+		return Policy::NeedsPerClientNativeHashes(ClientLane(client));
+	}
+
+	DeliveryDecision DecideDeliveryForClient(int slot, const std::string& virtualPath, size_t nativeSourceBytes)
+	{
+		DeliveryDecision decision;
+		if (!IsEnabled() || !IsValidSlot(slot))
+			return decision;
+
+		ClientPin& client = state.clients[slot];
+		ResolveDeliveryLane(slot, client);
+		const BaselineDecision fileBaseline = DecideFileBaselineForClient(slot, virtualPath);
+		if (fileBaseline.action == BaselineAction::Reject)
+			return {DeliveryAction::Reject, nullptr, fileBaseline.failure};
+		if (fileBaseline.action == BaselineAction::NativeSource || fileBaseline.action == BaselineAction::Unchanged)
+		{
+			RecordNativeJoin(client, nativeSourceBytes);
+			return decision;
+		}
+
+		auto generation = state.generations.find(client.generation);
+		if (generation == state.generations.end() || !generation->second.compressedRequiredStub)
+			return {DeliveryAction::Reject, nullptr, "the immutable map base became unavailable during Lua transfer"};
+		RecordPinnedRequiredStubForClient(slot);
+		return {DeliveryAction::Stub, generation->second.compressedRequiredStub.get(), nullptr};
+	}
+
+	void DisconnectRequiredClient(int slot, const char* failure)
 	{
 		if (!IsValidSlot(slot))
 			return;
 
-		ReleasePin(state.clients[slot]);
 		ClientPin& client = state.clients[slot];
-		if (!IsEnabled())
+		if (client.disconnectIssued)
 			return;
+		client.disconnectIssued = true;
 
-		// The native latch is keyed by account, not slot: a client that reported (or silently
-		// died on) unresolvable stubs must get native files on its next attempt, whichever
-		// slot it reconnects into.
+		Warning(PROJECT_NAME " - luapack: disconnecting required-pack client slot %i: %s\n",
+			slot, failure ? failure : "unspecified required-pack failure");
 		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
-		const char* networkID = baseClient ? baseClient->GetNetworkIDString() : nullptr;
-		if (networkID && networkID[0] != '\0' &&
-			V_stricmp(networkID, "BOT") != 0 && V_stricmp(networkID, "UNKNOWN") != 0)
-			client.networkID = networkID;
-
-		if (!client.networkID.empty())
+		if (baseClient)
 		{
-			auto latch = state.nativeLatches.find(client.networkID);
-			if (latch != state.nativeLatches.end())
-			{
-				if (ServerTime() <= latch->second)
-				{
-					client.nativeLatched = true;
-					Msg(PROJECT_NAME " - luapack: client slot %i (%s) joins with native delivery latched after a failed speculative join\n",
-						slot, client.networkID.c_str());
-				}
-				else
-				{
-					state.nativeLatches.erase(latch);
-				}
-			}
+			baseClient->Disconnect("%s",
+				"Required LuaPack failed. Automatic native recovery was unavailable or exhausted. Manual opt out: set launch option +tv_nochat no_gluapack, restart Garry's Mod, then reconnect.");
+		}
+	}
+
+	bool ClientConnect(int slot)
+	{
+		if (!IsValidSlot(slot))
+			return false;
+
+		if (PreserveClaimedRecoveryLifecycle(slot, true))
+		{
+			const ClientPin& client = state.clients[slot];
+			Msg(PROJECT_NAME " - luapack: preserving claimed native recovery epoch %llu for slot %i (%llu) across its late game-layer ClientConnect callback\n",
+				static_cast<unsigned long long>(client.connectionSerial), slot,
+				static_cast<unsigned long long>(client.steamID64));
+			return true;
 		}
 
-		if (state.currentGeneration.empty())
-			return;
-
-		auto generation = state.generations.find(state.currentGeneration);
-		if (generation == state.generations.end())
-			return;
-
-		client.generation = generation->first;
-		client.deadline = ServerTime() + GetConfig().readyDeadlineSeconds;
-		client.fallback = false;
-		client.holdsPin = true;
-		++generation->second.pins;
+		// A real network connection supersedes a merely queued request. Once the engine
+		// reconnect was invoked, preserve its gate across Source's disconnect/connect
+		// callback ordering; authenticated ServerInfo ownership decides whether to consume it.
+		if (!state.recoveryHandoffs[slot].Invoked())
+			state.recoveryHandoffs[slot].Reset();
+		StartClientEpoch(slot);
+		return false;
 	}
 
 	void ClientActive(int slot)
@@ -1940,36 +2453,54 @@ end)
 		if (!client.ready && !client.fallback && !client.generation.empty())
 			client.deadline = ServerTime() + GetConfig().readyDeadlineSeconds;
 
+		ClearProvenRecoveryState(slot, client);
+
 		if (IsEnabled() && !client.joinSummaryLogged &&
-			(client.joinNativeFiles > 0 || client.joinOptimisticStubs > 0 || client.joinReadyStubs > 0))
+			(client.joinNativeFiles > 0 || client.joinOptimisticStubs > 0 ||
+				client.joinRequiredStubs > 0 || client.joinReadyStubs > 0))
 		{
 			client.joinSummaryLogged = true;
 			// The acknowledgement usually arrives after the client spawned (queued client
 			// commands only flush post-signon), so ready=no here is normal for stub joins.
-			Msg(PROJECT_NAME " - luapack: join summary slot %i (%s): %u native files (%llu source bytes), %u speculative stubs, %u acknowledged stubs, generation=%s ready=%s latched=%s fallback=%s\n",
+			Msg(PROJECT_NAME " - luapack: join summary slot %i (%s): %u native files (%llu source bytes), %u required stubs, %u speculative stubs, %u acknowledged stubs, lane=%s generation=%s ready=%s latched=%s fallback=%s\n",
 				slot,
 				client.networkID.empty() ? "?" : client.networkID.c_str(),
 				client.joinNativeFiles, client.joinNativeBytes,
-				client.joinOptimisticStubs, client.joinReadyStubs,
+				client.joinRequiredStubs, client.joinOptimisticStubs, client.joinReadyStubs,
+				client.requiredRecovery ? "recovery-native" :
+					(client.optOut ? "optout-native" : (client.requiredLane ? "required" : "fail-open")),
 				client.generation.empty() ? "-" : client.generation.c_str(),
 				client.ready ? "yes" : "no",
 				client.nativeLatched ? "yes" : "no",
 				client.fallback ? "yes" : "no");
 		}
 
-		// A generation published after the level's bounded downloadables budget is exhausted
-		// is intentionally absent from the engine download queue. Once the Lua state is active,
-		// hand the pinned generation to the same validated HTTP path used by autorefresh. This is
-		// also a harmless retry when the engine-downloaded object mounted but READY is still queued.
-		NotifyJoiningClient(slot);
+		// The required map base is admitted only through Source's pre-spawn resource
+		// phase. A missing/corrupt base must fail closed in the bootstrap; it is never
+		// repaired after spawn by switching the whole join to native or HTTP delivery.
 	}
 
-	void ClientDisconnect(int slot)
+	bool ClientDisconnect(int slot, bool gameLayerCallback)
 	{
 		if (!IsValidSlot(slot))
-			return;
+			return false;
+
+		if (PreserveClaimedRecoveryLifecycle(slot, gameLayerCallback))
+		{
+			const ClientPin& recovery = state.clients[slot];
+			Msg(PROJECT_NAME " - luapack: preserving claimed native recovery epoch %llu for slot %i (%llu) across its late game-layer ClientDisconnect callback\n",
+				static_cast<unsigned long long>(recovery.connectionSerial), slot,
+				static_cast<unsigned long long>(recovery.steamID64));
+			return true;
+		}
 
 		ClientPin& client = state.clients[slot];
+		// A late game-layer disconnect can precede the replacement ServerInfo. Keep an
+		// invoked handoff for that exact authenticated boundary, but discard a queued
+		// request or any handoff at the lower-level physical disconnect boundary.
+		if (!Policy::ShouldKeepInvokedRecoveryHandoff(gameLayerCallback,
+			state.recoveryHandoffs[slot].Invoked()))
+			state.recoveryHandoffs[slot].Reset();
 		// A speculated join that never acknowledged its generation is treated as failed even
 		// without the client's explicit recovery command: its channel may have died before
 		// that command flushed. Latching here is what makes every failure path converge —
@@ -1981,12 +2512,118 @@ end)
 				slot, client.networkID.c_str(), client.joinOptimisticStubs);
 		}
 		ReleasePin(client);
+		return false;
+	}
+
+	void PhysicalClientDisconnect(int slot, std::uint64_t steamID64)
+	{
+		if (!IsValidSlot(slot))
+			return;
+
+		unsigned int clearedHandoffs = 0;
+		if (steamID64 != 0)
+		{
+			for (Policy::RequiredRecoveryHandoff& handoff : state.recoveryHandoffs)
+			{
+				if (handoff.ResetIfOwnedBy(steamID64))
+					++clearedHandoffs;
+			}
+		}
+		if (clearedHandoffs > 0)
+		{
+			Msg(PROJECT_NAME " - luapack: physical Steam disconnect for slot %i (%llu) cleared %u required recovery handoff(s)\n",
+				slot, static_cast<unsigned long long>(steamID64), clearedHandoffs);
+		}
+
+		// Unlike late game-layer callbacks around CGameClient::Reconnect, the Steam
+		// disconnect must discard any unidentified per-slot handoff so a reused slot
+		// cannot inherit the reconnect gate. The account tracker deliberately survives:
+		// an Armed latch remains available to the next physical connection, while a
+		// Consumed tombstone must remain until proven success or server reset.
+		ClientDisconnect(slot, false);
 	}
 
 	MODULE_RESULT ClientCommand(int slot, const CCommand* args)
 	{
 		if (!args || args->ArgC() < 1)
 			return MODULE_RESULT::CONTINUE;
+
+		if (V_stricmp(args->Arg(0), "holylib_luapack_failed") == 0)
+		{
+			// Always consume the private command. Only an exact failure for this connection's
+			// pinned required generation may arm recovery; malformed/stale commands still fail
+			// closed and can only disconnect the sender.
+			if (!IsEnabled() || !IsValidSlot(slot))
+				return MODULE_RESULT::STOP;
+
+			ClientPin& client = state.clients[slot];
+			const bool ownsConsumedRecovery = state.requiredRecovery.OwnsConsumed(
+				client.steamID64, client.connectionSerial);
+			if (Policy::ShouldIgnoreLateRecoveryFailure(
+				client.requiredRecovery && client.nativeLane, ownsConsumedRecovery,
+				client.recoveryStateCleared))
+			{
+				Warning(PROJECT_NAME " - luapack: ignored a late required-generation failure from the failed baseline during native recovery epoch %llu for slot %i (%llu)\n",
+					static_cast<unsigned long long>(client.connectionSerial), slot,
+					static_cast<unsigned long long>(client.steamID64));
+				return MODULE_RESULT::STOP;
+			}
+			const bool exactFailure = client.requiredLane && !client.requiredRecovery &&
+				args->ArgC() == 2 && !client.generation.empty() &&
+				client.generation == args->Arg(1);
+			bool handoffQueued = false;
+			if (exactFailure && GetConfig().requiredRecovery)
+			{
+				// Some queue clients had no ticket identity at their initial ServerInfo. First
+				// authenticated binding is safe for this connection epoch; an identity that was
+				// already bound must still match exactly to prevent slot-reuse ownership leaks.
+				const bool previouslyResolved = client.resolvedIdentity;
+				const std::uint64_t expectedSteamID64 = client.steamID64;
+				const bool authenticatedNow = BindAuthenticatedIdentity(slot, client);
+				if (Policy::RequiredFailureIdentityReady(true, client.resolvedIdentity,
+					client.authenticatedIdentity) && authenticatedNow &&
+					Policy::RequiredFailureIdentityMatches(previouslyResolved,
+						expectedSteamID64, client.steamID64))
+				{
+					const double ttl = GetConfig().requiredRecoveryTtlSeconds;
+					const Policy::RecoveryArmResult armed = state.requiredRecovery.Arm(
+						client.steamID64, client.connectionSerial, ServerTime(), ttl);
+					if (armed == Policy::RecoveryArmResult::Armed)
+					{
+						const double handoffWindow = Policy::RecoveryHandoffWindow(ttl);
+						handoffQueued = state.recoveryHandoffs[slot].Queue(
+							client.steamID64, client.connectionSerial, ServerTime(), handoffWindow);
+						if (handoffQueued)
+						{
+							Msg(PROJECT_NAME " - luapack: authenticated required failure for slot %i (%llu); one wholly native next connection armed for %.0f seconds and one engine reconnect queued with a %.0f-second ServerInfo window\n",
+								slot, static_cast<unsigned long long>(client.steamID64), ttl,
+								handoffWindow);
+						}
+						else
+						{
+							state.requiredRecovery.Clear(client.steamID64);
+							Warning(PROJECT_NAME " - luapack: required recovery handoff could not be queued for slot %i (%llu); latch removed and join remains fail-closed\n",
+								slot, static_cast<unsigned long long>(client.steamID64));
+						}
+					}
+					else
+					{
+						Warning(PROJECT_NAME " - luapack: required recovery was not re-armed for slot %i (%llu); its one-shot state is already pending or consumed\n",
+							slot, static_cast<unsigned long long>(client.steamID64));
+					}
+				}
+				else
+				{
+					Warning(PROJECT_NAME " - luapack: required recovery was not armed for slot %i because authenticated SteamID64 ownership could not be revalidated\n",
+						slot);
+				}
+			}
+			if (client.requiredLane && !handoffQueued)
+				DisconnectRequiredClient(slot, exactFailure
+					? "the authenticated client reported that its required generation could not resolve a stub"
+					: "the client reported a stale or malformed required-generation failure");
+			return MODULE_RESULT::STOP;
+		}
 
 		if (V_stricmp(args->Arg(0), "holylib_luapack_unready") == 0)
 		{
@@ -1997,6 +2634,22 @@ end)
 				return MODULE_RESULT::STOP;
 
 			ClientPin& client = state.clients[slot];
+			const bool ownsConsumedRecovery = state.requiredRecovery.OwnsConsumed(
+				client.steamID64, client.connectionSerial);
+			if (Policy::ShouldIgnoreLateRecoveryFailure(
+				client.requiredRecovery && client.nativeLane, ownsConsumedRecovery,
+				client.recoveryStateCleared))
+			{
+				Warning(PROJECT_NAME " - luapack: ignored a late legacy unready command from the failed baseline during native recovery epoch %llu for slot %i (%llu)\n",
+					static_cast<unsigned long long>(client.connectionSerial), slot,
+					static_cast<unsigned long long>(client.steamID64));
+				return MODULE_RESULT::STOP;
+			}
+			if (client.requiredLane)
+			{
+				DisconnectRequiredClient(slot, "the client reported an unresolvable required stub through the legacy recovery command");
+				return MODULE_RESULT::STOP;
+			}
 			MarkFallback(client); // whatever remains of this connection goes native immediately
 			client.nativeLatched = true;
 			if (!client.networkID.empty())
@@ -2017,6 +2670,8 @@ end)
 			return MODULE_RESULT::STOP;
 
 		ClientPin& client = state.clients[slot];
+		if (client.nativeLane)
+			return MODULE_RESULT::STOP;
 		const std::string generationId = args->Arg(1);
 		const std::string md5 = args->Arg(2);
 		auto generation = state.generations.find(client.generation);
@@ -2028,6 +2683,7 @@ end)
 			generationId == client.generation && md5 == generation->second.md5)
 		{
 			client.ready = true;
+			client.everReady = true;
 			client.fallback = false;
 			// Proof of a mounted pack also heals the account's native latch.
 			client.nativeLatched = false;
@@ -2039,9 +2695,11 @@ end)
 				++generation->second.pins;
 			}
 			if (client.active)
+			{
 				ReleaseGenerationReference(client);
-			Msg(PROJECT_NAME " - luapack: client slot %i acknowledged pinned generation %s\n", slot, generationId.c_str());
-			CatchUpClient(slot);
+				ClearProvenRecoveryState(slot, client);
+			}
+			Msg(PROJECT_NAME " - luapack: client slot %i acknowledged required map base %s\n", slot, generationId.c_str());
 		}
 
 		return MODULE_RESULT::STOP;

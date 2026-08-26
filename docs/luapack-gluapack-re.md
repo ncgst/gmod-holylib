@@ -4,7 +4,7 @@ This note records the evidence used to design HolyLib's `gmoddatapack` luapack f
 
 ## Evidence and limits
 
-The requested stripped `gmsv_gluapack_plugin64.so` and 32-bit plugin were not present in the supplied workspace. The earlier operator report was treated as a hypothesis, not evidence. Consequently, claims about the incumbent's native detours are explicitly left open below.
+The requested stripped `gmsv_gluapack_plugin64.so` and 32-bit plugin were not present during the initial study. The earlier operator report was therefore treated as a hypothesis, not evidence. A later follow-up inspected one archived Linux x86-64 incumbent plugin for its observable pre-Lua opt-out protocol; claims requiring the missing architectures or unobserved native detours remain explicitly open below.
 
 Evidence that was available:
 
@@ -13,6 +13,8 @@ Evidence that was available:
 - HolyLib's complete `source/modules/gmoddatapack.cpp`, symbols, module manager, filesystem, string-table, thread-pool, and build integration.
 - A publicly committed recovered incumbent bootstrap at `eoan-ermine/urfim_ww2`, commit `2bb21fc383301c125753ef95640078bdf158f7ef`, path `addons/urf_plib/lua/includes/init.lua`. It is used only as behavioral evidence. HolyLib's bootstrap was written independently.
 - `danielga/sourcesdk-minimal` public interfaces for signon states, cvar flags, string tables, and GMod client messages.
+
+Later follow-up also inspected an archived Linux x86-64 incumbent plugin (SHA-256 `7ba78ad490d9d554ac1b19d4e88a825889f1acfc8ef1375a24be213d4cf11395`, 5,829,800 bytes). Its pre-Lua opt-out path asks the engine for the client's `tv_nochat` user setting, compares it with the exact value `no_gluapack`, and stores a per-slot boolean. HolyLib independently implements only that observable protocol through `CBaseClient::GetUserSetting`; no incumbent code or payload is reused.
 
 Offsets below are ELF virtual addresses in the two target `server.so` files, not stable signatures.
 
@@ -24,15 +26,15 @@ The exported symbols are `_ZN12GModDataPack16SendFileToClientEii` on both target
 
 No server-side per-file counter or end-of-list state is mutated in this function. The barrier advances because the requested file ID receives a syntactically normal `LuaFileDownload`. Suppressing the function without a replacement message can therefore strand the client at Requesting Lua.
 
-Implementation decision: the full init file uses HolyLib's existing async-compressed real-file path so it can carry the bootstrap. A ready client then receives a normally framed, SHA-256-prefixed/LZMA-compressed stub for an eligible requested ID. Any other post-bootstrap request invokes the native trampoline directly, preserving the engine contract without reproducing its internal state transitions.
+Current HolyLib decision: the full init file uses the existing async-compressed real-file path so it can carry the bootstrap. A pinned required connection receives a normally framed, SHA-256-prefixed/LZMA-compressed canonical placeholder for each eligible requested ID without waiting for READY; the bounded request scheduler preserves the engine's request allowance and advances the barrier normally. Init, native deltas, opt-out, recovery, and other native lanes retain the native body path.
 
 ### 2. Global suppression versus hidden per-client state — OPEN for the incumbent
 
-The native plugin was unavailable, so the suspected global `pack active => suppress` branch cannot be truthfully confirmed from a native xref. The recovered bootstrap contains no client-to-server READY acknowledgement and the four manifest cvars are global, which is consistent with the reported deadlock but is not proof of the native decision.
+The incumbent's relevant native detour remains unavailable, so the suspected global `pack active => suppress` branch cannot be truthfully confirmed from a native xref. The recovered bootstrap contains no client-to-server READY acknowledgement and the four manifest cvars are global, which is consistent with the reported deadlock but is not proof of the native decision.
 
 What would settle it: the stripped plugin's `SendFileToClient` detour or a runtime trace of two simultaneous clients with different pack outcomes.
 
-Implementation decision: HolyLib does not depend on this inference. Stub delivery requires an exact per-slot `READY(generation, md5)` acknowledgement before every optimized send. Once the full bootstrap/init file has run, any request that does not qualify for a stub is passed to the recovered native `SendFileToClient` trampoline.
+Current HolyLib decision: required-mode eligibility is fixed per connection and advertised through an exact per-client `SendServerInfo` baseline. Required canonical requests do not wait for READY; READY later proves that the exact immutable object mounted successfully. Requests outside the pinned canonical set remain on the identity-aware native path, while malformed batches and all native lanes retain the engine decoder.
 
 ### 3. `AddOrUpdateFile` identity and bytes — CONFIRMED for HolyLib and target engine
 
@@ -48,7 +50,7 @@ The public bootstrap's resolver is named `gluapack`; it hashes `debug.getinfo(2,
 
 The prior reconstruction is corrected in one respect: the recovered incumbent bootstrap does **not** override `include` or `RunString`.
 
-Implementation decision: use a generation-explicit, independently named stub `return __holypack("<generation>")()` and cover `CompileFile`, `include`, and identifier-based `RunString`, always falling back to the originals when a key is absent.
+Current HolyLib decision: use the generation-independent canonical placeholder `return __holypack()()`. Preserve the engine's native `include` and `CompileFile` registration semantics so caller-relative paths remain authoritative; the placeholder resolver uses the registered logical source identity to enter the already-mounted immutable base. Init, late registrations, and current native deltas are never replaced by this placeholder.
 
 ### 5. Pack layout, compression, crypto, and MD5 — CONFIRMED client-side; server producer remains OPEN
 
@@ -81,29 +83,29 @@ The recovered bootstrap independently creates `gluapack_file`, `gluapack_md5`, `
 
 Source SDK correction: a **server** cvar carrying a manifest cannot use `FCVAR_PROTECTED`; Source replicates a protected value as a boolean rather than its text. `FCVAR_UNREGISTERED` also conflicts with normal server registration. HolyLib therefore uses one registered `FCVAR_REPLICATED | FCVAR_DONTRECORD | FCVAR_UNLOGGED` server cvar, while the client-created mirror requests the additional local flags.
 
-Implementation decision: publish one snapshot containing the current ID and every retained immutable generation. One `SetValue` is the publication barrier.
+Current HolyLib decision: publish one compact snapshot for the level's single immutable map base. It carries the base ID, pack directory, and salt; the client derives the object path. One `SetValue` remains the publication barrier.
 
 ### 9. Generation and autorefresh — MESSAGE FORMAT CONFIRMED; NATIVE PINNING OPEN
 
 The public bootstrap registers `gmsv_gluapack_autorefresh`, reads one path string, and removes the path's normalized keys from its tables. It does not re-include autorun files in that recovered version. The native `Autorefresh detected! Repacking...` flow and absence of hidden connection pinning cannot be proven without the plugin.
 
-Implementation decision: pin the current immutable generation at `ClientConnect`; keep its manifest/stub mapping while a slot holds the pin; publish a new generation without modifying old records. Loaded ready clients receive only generation/path metadata and fetch the new object over HTTP. Autorun paths are re-included after validated mount.
+Current HolyLib decision: publish exactly one immutable map base per level lifecycle and pin required connections to it. Later registrations and byte changes are native per-path deltas; they do not rotate the manifest, publish another object, or consume another `downloadables` slot. An exact byte-for-byte restoration returns that path to its canonical base identity.
 
 ### 10. Bootstrap injection point — FILE POSITION CONFIRMED; NATIVE DETOURS OPEN
 
 The public artifact places the bootstrap at the top of `lua/includes/init.lua`, before the normal GMod init body. The unavailable plugin's `CLuaInterface::Init` / `CLuaManager::Startup` detours and byte signatures could not be inspected. The target x86-64 `CLuaManager::Startup` was located from `CLuaManager::Startup Lua already exsits?` at approximately `0x00c20120`, but that alone does not reveal the plugin injection instruction.
 
-Implementation decision: compose through HolyLib's existing `AddOrUpdateFile` ownership by prepending a self-contained bootstrap only to `includes/init.lua`; that file is always excluded from stubbing. This avoids adding unverified Lua-manager detours. `// TODO(review):` live-test on the target branch that the init file executes before the first non-init Lua request; safety is unaffected because no READY means vanilla delivery.
+Current HolyLib decision: compose through the existing `AddOrUpdateFile` ownership by prepending a self-contained bootstrap only to `includes/init.lua`; that file is always excluded from stubbing. This avoids adding unverified Lua-manager detours. The production bootstrap harness and isolated/runtime joins confirmed init executes before canonical placeholders are resolved.
 
 ### 11. Failure handling and the `cl_downloadfilter=none` limbo — CONFIRMED
 
 The recovered `failed(message, disconnect, openHelp)` installs a no-op resolver when `disconnect` is truthy. Missing-pack and MD5-mismatch sites pass a disconnect reason. At label `::failed::`, however, `RunConsoleCommand("disconnect")` executes only when `cl_downloadfilter ~= "none"`; the code then requires three base modules and returns. Thus the exact downloads-disabled branch does not disconnect and cannot install the real packed Lua state: it is a genuine limbo path.
 
-Implementation decision: HolyLib never acknowledges a missing, undecodable, undecompressible, unparsable, or MD5-mismatched generation. It prints actionable download-filter guidance and continues the ordinary init body. Because the server has not received READY, every requested file is delivered normally. No client waits silently and no forced disconnect is required for recovery.
+Current HolyLib decision: the default fail-open lane retains its compatibility behavior. The separately configured required lane marks placeholders explicitly and reports an unresolvable required stub without scheduling client `retry`. By default, one exact failure with revalidated authenticated SteamID64 ownership queues a server-driven engine reconnect whose next initial baseline is wholly native; disabled, unavailable, or exhausted recovery disconnects with the documented `+tv_nochat no_gluapack` opt-out. The failed join never changes lanes in progress. The server also rejects a required join before sending placeholders when its pinned object is not in the engine download queue or the complete Linux required-delivery hook set is unavailable. Active hot changes use matching native hashes and bodies until exact canonical restoration.
 
 ### 12. Sigscan validity — CONFIRMED for HolyLib symbols; incumbent comparison OPEN
 
-HolyLib resolves `AddOrUpdateFile` and `SendFileToClient` by the exported Itanium names above on Linux and its existing Windows symbols. Those names match both supplied target server binaries. HolyLib does not need new signatures for luapack.
+HolyLib resolves `AddOrUpdateFile` and `SendFileToClient` by the exported Itanium names above on Linux and its existing Windows symbols. Required delivery additionally resolves its per-client `CBaseClient::SendServerInfo` baseline boundary and the Linux request-batch path used to preserve the engine allowance before bounded canonical delivery. The supported Linux x86-64 target and Windows x64 build checks cover the implemented symbol set; Windows required-mode runtime support remains intentionally unavailable.
 
 The incumbent signatures for those functions, `CLuaInterface::Init`, `CLuaManager::Startup`, and `AddResource` cannot be extracted without its plugin, so cross-plugin signature drift remains open.
 
@@ -114,17 +116,18 @@ What would settle it: provide both stripped plugin architectures plus the exact 
 | HolyLib choice | Evidence |
 |---|---|
 | Normal compressed stub message, never suppression | Findings 1 and 4 |
-| Per-client READY gate and native fallback | Findings 1, 2, and 11 |
+| Per-client required baseline, mounted-object READY proof, and native recovery | Findings 1, 2, and 11 |
 | Existing module/detours and worker infrastructure | Findings 3 and 12 |
 | Three salted path keys, versioned entry stream | Findings 5 and 6 |
 | No encryption or secret | Finding 5; clean-room/no-DRM requirement |
-| Atomic retained-generation manifest | Findings 8 and 9 |
+| Atomic single-map-base manifest | Findings 8 and 9 |
 | Init-file bootstrap excluded from stubbing | Finding 10 |
-| Missing/corrupt pack means no READY, not limbo | Finding 11 |
+| Missing/corrupt required pack permits one authenticated native next-connection recovery by default; disabled or exhausted recovery kicks | Finding 11 |
+| `tv_nochat=no_gluapack` selects a per-slot native lane before Lua | Follow-up native artifact |
 | Only HTTP carries the pack body | Findings 1, 7, and 9 |
 
-## Remaining runtime checks
+## Remaining evidence boundary
 
-- `// TODO(review):` capture a target-branch join to verify `includes/init.lua` is processed before any file that could receive a stub.
-- `// TODO(review):` capture one fallback and one ready join to confirm the client accepts a requested file whose normal string-table hash describes the real source while its delivered payload is the stub.
-- `// TODO(review):` if the stripped plugin is supplied, complete native findings 2, 3 (incumbent half), 4 (exact stub), 5 (producer), 7 (registration), 8 (set timing), 9 (pinning), 10 (detours), and 12 (signature comparison) before claiming binary equivalence.
+HolyLib's current init ordering, canonical hash/body pairing, required cold and cached joins, native recovery, exact opt-out, hot deltas, canonical restoration, bounded request delivery, and connection-flood behavior have runtime evidence on the reviewed candidate. This note does not claim binary equivalence with the incumbent.
+
+If both stripped incumbent plugin architectures are supplied, findings 2, 3 (incumbent half), 4 (exact stub), 5 (producer), 7 (registration), 8 (set timing), 9 (pinning), 10 (detours), and 12 (signature comparison) can be completed before making any binary-equivalence claim. That comparison is not a HolyLib runtime-readiness gate.

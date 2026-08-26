@@ -1,0 +1,1388 @@
+#pragma once
+
+#include <algorithm>
+#include <bitset>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <limits>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace HolyLib::LuaPack::Policy
+{
+	template <std::size_t Capacity>
+	class PinnedCanonicalFileSet
+	{
+	public:
+		void Reset()
+		{
+			files.reset();
+		}
+
+		void Mark(int fileID)
+		{
+			if (fileID >= 0 && static_cast<std::size_t>(fileID) < Capacity)
+				files.set(static_cast<std::size_t>(fileID));
+		}
+
+		void Invalidate(int fileID)
+		{
+			if (fileID >= 0 && static_cast<std::size_t>(fileID) < Capacity)
+				files.reset(static_cast<std::size_t>(fileID));
+		}
+
+		bool Contains(int fileID) const
+		{
+			return fileID >= 0 && static_cast<std::size_t>(fileID) < Capacity &&
+				files.test(static_cast<std::size_t>(fileID));
+		}
+
+	private:
+		std::bitset<Capacity> files;
+	};
+
+	enum class RequiredStubEnqueueResult
+	{
+		Queued,
+		AlreadyQueued,
+		OutOfRange,
+	};
+
+	// GMod can request the complete missing Lua baseline in one ProcessMessages call.
+	// Retain one response per unique file ID without allocating an unbounded queue or
+	// allowing a repeated request to amplify the reliable response burst.
+	template <std::size_t Capacity>
+	class RequiredStubQueue
+	{
+	public:
+		RequiredStubEnqueueResult Enqueue(int fileID)
+		{
+			if (fileID < 0 || static_cast<std::size_t>(fileID) >= Capacity)
+				return RequiredStubEnqueueResult::OutOfRange;
+			if (queued.Contains(fileID))
+				return RequiredStubEnqueueResult::AlreadyQueued;
+
+			queued.Mark(fileID);
+			files.push_back(fileID);
+			return RequiredStubEnqueueResult::Queued;
+		}
+
+		bool Empty() const
+		{
+			return files.empty();
+		}
+
+		std::size_t Size() const
+		{
+			return files.size();
+		}
+
+		int Front() const
+		{
+			return files.empty() ? -1 : files.front();
+		}
+
+		void Pop()
+		{
+			if (files.empty())
+				return;
+
+			queued.Invalidate(files.front());
+			files.pop_front();
+		}
+
+		void Reset()
+		{
+			files.clear();
+			queued.Reset();
+		}
+
+	private:
+		std::deque<int> files;
+		PinnedCanonicalFileSet<Capacity> queued;
+	};
+
+	// Fixed-capacity, allocation-bounded FIFO for per-slot work. A slot can be
+	// scheduled only once, so repeated engine polls coalesce without moving an
+	// older client behind newly arriving work.
+	template <std::size_t SlotCount>
+	class RoundRobinSlotScheduler
+	{
+	public:
+		bool Schedule(int slot)
+		{
+			if (slot < 0 || static_cast<std::size_t>(slot) >= SlotCount ||
+			scheduled.test(static_cast<std::size_t>(slot)))
+			{
+				return false;
+			}
+
+			scheduled.set(static_cast<std::size_t>(slot));
+			active.push_back(slot);
+			return true;
+		}
+
+		int TakeNext()
+		{
+			if (active.empty())
+				return -1;
+
+			const int slot = active.front();
+			active.pop_front();
+			scheduled.reset(static_cast<std::size_t>(slot));
+			return slot;
+		}
+
+		void Unschedule(int slot)
+		{
+			if (slot < 0 || static_cast<std::size_t>(slot) >= SlotCount)
+				return;
+
+			scheduled.reset(static_cast<std::size_t>(slot));
+			active.erase(std::remove(active.begin(), active.end(), slot), active.end());
+		}
+
+		bool IsScheduled(int slot) const
+		{
+			return slot >= 0 && static_cast<std::size_t>(slot) < SlotCount &&
+				scheduled.test(static_cast<std::size_t>(slot));
+		}
+
+		bool Empty() const
+		{
+			return active.empty();
+		}
+
+		std::size_t Size() const
+		{
+			return active.size();
+		}
+
+		void Reset()
+		{
+			active.clear();
+			scheduled.reset();
+		}
+
+	private:
+		std::deque<int> active;
+		std::bitset<SlotCount> scheduled;
+	};
+
+	template <std::size_t SlotCount>
+	using RequiredStubScheduler = RoundRobinSlotScheduler<SlotCount>;
+
+	constexpr bool ShouldScheduleLuaPackServerInfo(bool enabled,
+		bool canonicalRegistration, bool registrationRefreshPending,
+		bool sendServerInfoPending,
+		bool connectedState, bool validSlot, bool channelReady)
+	{
+		return (registrationRefreshPending || (enabled && canonicalRegistration)) &&
+			sendServerInfoPending &&
+			connectedState && validSlot && channelReady;
+	}
+
+	constexpr std::size_t BoundedRegistrationRefreshEnd(std::size_t next,
+		std::size_t total, std::size_t budget)
+	{
+		if (next >= total || budget == 0)
+			return (std::min)(next, total);
+		return budget >= total - next ? total : next + budget;
+	}
+
+	// client_lua_files reserves string-table index 0 for the engine's "paths"
+	// sentinel. It has no Lua source and must never participate in a registration
+	// refresh or its retry set.
+	constexpr std::size_t FirstClientLuaRegistration(std::size_t registeredStrings)
+	{
+		return registeredStrings == 0 ? 0 : 1;
+	}
+
+	constexpr std::size_t ClientLuaRegistrationCount(std::size_t registeredStrings)
+	{
+		return registeredStrings == 0 ? 0 : registeredStrings - 1;
+	}
+
+	constexpr bool CanCompleteRegistrationRefresh(bool initialPassComplete,
+		bool initRefreshed, std::size_t unresolvedFiles,
+		std::size_t pendingSourceHashes)
+	{
+		return initialPassComplete && initRefreshed && unresolvedFiles == 0 &&
+			pendingSourceHashes == 0;
+	}
+
+	constexpr bool InitialMapBasePending(bool enabled, bool required,
+		bool currentBaseAvailable, bool baseWorkPending)
+	{
+		return enabled && required && !currentBaseAvailable && baseWorkPending;
+	}
+
+	constexpr bool QueuedServerInfoIdentityMatches(bool sameClient,
+		bool sameChannel, bool sameSlot, bool sameUserID,
+		bool sameChallenge, bool connectedState, bool sendServerInfoPending)
+	{
+		return sameClient && sameChannel && sameSlot && sameUserID &&
+			sameChallenge && connectedState && sendServerInfoPending;
+	}
+
+	constexpr bool CanUsePinnedRequiredStub(bool enabled, bool canonicalRegistration,
+		bool filePinned, bool payloadAvailable, std::size_t compressedBytes)
+	{
+		return enabled && canonicalRegistration && filePinned && payloadAvailable &&
+			compressedBytes >= 32u;
+	}
+
+	template <typename Index, typename Key>
+	void UpdateNativeDeltaIndex(Index& nativeDeltas, const Key& key, bool nativeDelta)
+	{
+		if (nativeDelta)
+			nativeDeltas.insert(key);
+		else
+			nativeDeltas.erase(key);
+	}
+
+	template <typename Index, typename Files>
+	void MarkBasePathsNative(Index& nativeDeltas, const Files& baseFiles)
+	{
+		for (const auto& baseFile : baseFiles)
+			nativeDeltas.insert(baseFile.first);
+	}
+
+	enum class BaselineHashDisposition
+	{
+		ReusePublished,
+		OverrideCached,
+		OverrideComputed,
+	};
+
+	constexpr BaselineHashDisposition SelectBaselineHashDisposition(
+		bool publishedMatches, bool cachedIdentity)
+	{
+		if (publishedMatches)
+			return BaselineHashDisposition::ReusePublished;
+		return cachedIdentity
+			? BaselineHashDisposition::OverrideCached
+			: BaselineHashDisposition::OverrideComputed;
+	}
+
+	// GMod encodes one requested Lua file ID in each 16-bit word. Required delivery
+	// may decode that bounded batch directly only while the exact pinned baseline and
+	// payload remain usable. Empty or malformed messages retain the engine parser.
+	constexpr bool CanDecodePinnedRequiredRequestBatch(bool enabled,
+		bool canonicalRegistration, bool payloadAvailable,
+		std::size_t compressedBytes, int messageBits, int availableBits,
+		int registeredFiles, std::size_t trackedCapacity)
+	{
+		return CanUsePinnedRequiredStub(enabled, canonicalRegistration, true,
+			payloadAvailable, compressedBytes) &&
+			messageBits > 0 && availableBits >= messageBits &&
+			(messageBits % 16) == 0 && registeredFiles > 1 &&
+			static_cast<std::size_t>(registeredFiles) <= trackedCapacity &&
+			(messageBits / 16) <= registeredFiles;
+	}
+
+	template <std::size_t Capacity, typename BitReader>
+	bool DecodeRequiredRequestIds(BitReader& message, int messageBits,
+		int registeredFiles, PinnedCanonicalFileSet<Capacity>& requested,
+		std::size_t& uniqueRequests)
+	{
+		uniqueRequests = 0;
+		if (messageBits <= 0 || message.GetNumBitsLeft() < messageBits ||
+			(messageBits % 16) != 0 || registeredFiles <= 1 ||
+			static_cast<std::size_t>(registeredFiles) > Capacity ||
+			(messageBits / 16) > registeredFiles)
+		{
+			return false;
+		}
+
+		const int requestCount = messageBits / 16;
+		for (int request = 0; request < requestCount; ++request)
+		{
+			const int fileID = static_cast<int>(message.ReadUBitLong(16));
+			if (fileID <= 0 || fileID >= registeredFiles || requested.Contains(fileID))
+				continue;
+			requested.Mark(fileID);
+			++uniqueRequests;
+		}
+		return !message.IsOverflowed();
+	}
+
+	enum class Lane
+	{
+		NativeRescue,
+		NativeOptOut,
+		NativeRecovery,
+		Required,
+	};
+
+	enum class RecoveryPhase
+	{
+		Armed,
+		Consumed,
+	};
+
+	enum class RecoveryArmResult
+	{
+		Armed,
+		Invalid,
+		RetryExhausted,
+	};
+
+	enum class RecoveryConsumeResult
+	{
+		None,
+		Native,
+		SameConnection,
+		RetryExhausted,
+		Expired,
+	};
+
+	enum class RecoveryClearResult
+	{
+		None,
+		Cleared,
+		SameFailedConnection,
+	};
+
+	struct RecoveryEntry
+	{
+		RecoveryPhase phase = RecoveryPhase::Armed;
+		std::uint64_t failedConnection = 0;
+		std::uint64_t recoveryConnection = 0;
+		double expiresAt = 0.0;
+	};
+
+	// Main-thread state machine for required-pack recovery. The account key prevents
+	// slot reuse from inheriting another player's lane, while connection serials make
+	// it impossible to consume a latch on the connection that armed it.
+	class RequiredRecoveryTracker
+	{
+	public:
+		RecoveryArmResult Arm(std::uint64_t account, std::uint64_t connection,
+			double now, double ttl)
+		{
+			if (account == 0 || connection == 0 || ttl <= 0.0)
+				return RecoveryArmResult::Invalid;
+
+			EraseExpired(account, now);
+			if (entries.find(account) != entries.end())
+				return RecoveryArmResult::RetryExhausted;
+
+			entries.emplace(account, RecoveryEntry{
+				RecoveryPhase::Armed, connection, 0, now + ttl});
+			return RecoveryArmResult::Armed;
+		}
+
+		RecoveryConsumeResult Consume(std::uint64_t account, std::uint64_t connection,
+			double now)
+		{
+			if (account == 0 || connection == 0)
+				return RecoveryConsumeResult::None;
+
+			auto entry = entries.find(account);
+			if (entry == entries.end())
+				return RecoveryConsumeResult::None;
+			if (entry->second.phase == RecoveryPhase::Armed && now >= entry->second.expiresAt)
+			{
+				entries.erase(entry);
+				return RecoveryConsumeResult::Expired;
+			}
+			if (entry->second.phase != RecoveryPhase::Armed)
+				return RecoveryConsumeResult::RetryExhausted;
+			if (entry->second.failedConnection == connection)
+				return RecoveryConsumeResult::SameConnection;
+
+			entry->second.phase = RecoveryPhase::Consumed;
+			entry->second.recoveryConnection = connection;
+			return RecoveryConsumeResult::Native;
+		}
+
+		bool Complete(std::uint64_t account, std::uint64_t connection)
+		{
+			auto entry = entries.find(account);
+			if (entry == entries.end() || entry->second.phase != RecoveryPhase::Consumed ||
+				entry->second.recoveryConnection != connection)
+				return false;
+			entries.erase(entry);
+			return true;
+		}
+
+		bool OwnsConsumed(std::uint64_t account, std::uint64_t connection) const
+		{
+			auto entry = entries.find(account);
+			return account != 0 && connection != 0 && entry != entries.end() &&
+				entry->second.phase == RecoveryPhase::Consumed &&
+				entry->second.recoveryConnection == connection;
+		}
+
+		bool Clear(std::uint64_t account)
+		{
+			return account != 0 && entries.erase(account) != 0;
+		}
+
+		RecoveryClearResult ClearAfterSuccessfulConnection(std::uint64_t account,
+			std::uint64_t connection)
+		{
+			if (account == 0 || connection == 0)
+				return RecoveryClearResult::None;
+
+			auto entry = entries.find(account);
+			if (entry == entries.end())
+				return RecoveryClearResult::None;
+			// A late READY/active callback from the connection that armed recovery is
+			// not a safe boundary. Only a distinct successful connection can retire an
+			// armed latch without consuming its native baseline.
+			if (entry->second.phase == RecoveryPhase::Armed &&
+				entry->second.failedConnection == connection)
+				return RecoveryClearResult::SameFailedConnection;
+
+			entries.erase(entry);
+			return RecoveryClearResult::Cleared;
+		}
+
+		void Prune(double now)
+		{
+			for (auto entry = entries.begin(); entry != entries.end();)
+			{
+				if (entry->second.phase == RecoveryPhase::Armed && now >= entry->second.expiresAt)
+					entry = entries.erase(entry);
+				else
+					++entry;
+			}
+		}
+
+		void Reset()
+		{
+			entries.clear();
+		}
+
+		std::size_t Size() const
+		{
+			return entries.size();
+		}
+
+	private:
+		void EraseExpired(std::uint64_t account, double now)
+		{
+			auto entry = entries.find(account);
+			if (entry != entries.end() && entry->second.phase == RecoveryPhase::Armed &&
+				now >= entry->second.expiresAt)
+				entries.erase(entry);
+		}
+
+		std::unordered_map<std::uint64_t, RecoveryEntry> entries;
+	};
+
+	enum class RecoveryHandoffPhase
+	{
+		Empty,
+		Queued,
+		Invoked,
+		ServerInfoClaimed,
+	};
+
+	enum class RecoveryHandoffResult
+	{
+		None,
+		Invoke,
+		AlreadyInvoked,
+		NotReady,
+		DispatchServerInfo,
+		BeginBaseline,
+		OwnershipMismatch,
+		Invalid,
+		Expired,
+	};
+
+	// Per-slot gate around the engine's server-side Reconnect call. It deliberately
+	// keeps the failed connection's lane unchanged until a new SendServerInfo baseline
+	// begins, and guarantees that the engine reconnect primitive is invoked at most once.
+	class RequiredRecoveryHandoff
+	{
+	public:
+		bool Queue(std::uint64_t inputAccount, std::uint64_t inputConnection,
+			double now, double window)
+		{
+			if (phase != RecoveryHandoffPhase::Empty || inputAccount == 0 ||
+				inputConnection == 0 || window <= 0.0)
+				return false;
+			account = inputAccount;
+			failedConnection = inputConnection;
+			windowSeconds = window;
+			expiresAt = now + window;
+			phase = RecoveryHandoffPhase::Queued;
+			return true;
+		}
+
+		RecoveryHandoffResult TryInvoke(std::uint64_t currentAccount,
+			std::uint64_t currentConnection, bool authenticated, bool channelReady,
+			double now)
+		{
+			if (phase == RecoveryHandoffPhase::Empty)
+				return RecoveryHandoffResult::None;
+			if (now >= expiresAt)
+			{
+				Reset();
+				return RecoveryHandoffResult::Expired;
+			}
+			// Reconnect may temporarily clear or replace the slot before its next
+			// ServerInfo. Once invoked, ownership is checked at that baseline instead;
+			// this gate must neither invoke twice nor discard the account handoff.
+			if (phase == RecoveryHandoffPhase::Invoked ||
+				phase == RecoveryHandoffPhase::ServerInfoClaimed)
+				return RecoveryHandoffResult::AlreadyInvoked;
+			if (currentAccount != account || currentConnection != failedConnection)
+				return RecoveryHandoffResult::OwnershipMismatch;
+			if (!authenticated)
+				return RecoveryHandoffResult::Invalid;
+			if (!channelReady)
+				return RecoveryHandoffResult::Invalid;
+			phase = RecoveryHandoffPhase::Invoked;
+			return RecoveryHandoffResult::Invoke;
+		}
+
+		RecoveryHandoffResult TryDispatchServerInfo(std::uint64_t currentAccount,
+			bool authenticated, bool channelReady, bool signonRestarted, double now)
+		{
+			if (phase == RecoveryHandoffPhase::Empty)
+				return RecoveryHandoffResult::None;
+			if (now >= expiresAt)
+			{
+				Reset();
+				return RecoveryHandoffResult::Expired;
+			}
+			if (phase == RecoveryHandoffPhase::Queued)
+				return RecoveryHandoffResult::Invalid;
+			if (phase == RecoveryHandoffPhase::ServerInfoClaimed)
+				return RecoveryHandoffResult::AlreadyInvoked;
+			// Reconnect can temporarily clear the slot, and the replacement connection can
+			// be admitted in another slot. Never dispatch through an unidentified or reused
+			// slot; the account-owned handoff remains available to that connection's normal
+			// ServerInfo hook until the bounded expiry.
+			if (currentAccount == 0 || !authenticated || !channelReady)
+				return RecoveryHandoffResult::NotReady;
+			if (currentAccount != account)
+				return RecoveryHandoffResult::NotReady;
+			if (!signonRestarted)
+				return RecoveryHandoffResult::NotReady;
+			phase = RecoveryHandoffPhase::ServerInfoClaimed;
+			// Authentication/reconnect may have consumed most of the dispatch window.
+			// Give the accepted baseline work one full, still-finite scheduler window.
+			expiresAt = now + windowSeconds;
+			return RecoveryHandoffResult::DispatchServerInfo;
+		}
+
+		RecoveryHandoffResult BeginBaseline(std::uint64_t currentAccount,
+			bool authenticated, double now)
+		{
+			if (phase == RecoveryHandoffPhase::Empty)
+				return RecoveryHandoffResult::None;
+			if (now >= expiresAt)
+			{
+				Reset();
+				return RecoveryHandoffResult::Expired;
+			}
+			if (currentAccount != account)
+				return RecoveryHandoffResult::OwnershipMismatch;
+			if (!authenticated)
+				return RecoveryHandoffResult::Invalid;
+			if (phase != RecoveryHandoffPhase::Invoked &&
+				phase != RecoveryHandoffPhase::ServerInfoClaimed)
+				return RecoveryHandoffResult::Invalid;
+			Reset();
+			return RecoveryHandoffResult::BeginBaseline;
+		}
+
+		void Reset()
+		{
+			phase = RecoveryHandoffPhase::Empty;
+			account = 0;
+			failedConnection = 0;
+			windowSeconds = 0.0;
+			expiresAt = 0.0;
+		}
+
+		bool Pending() const
+		{
+			return phase != RecoveryHandoffPhase::Empty;
+		}
+
+		bool Invoked() const
+		{
+			return phase == RecoveryHandoffPhase::Invoked ||
+				phase == RecoveryHandoffPhase::ServerInfoClaimed;
+		}
+
+		bool ResetIfOwnedBy(std::uint64_t inputAccount)
+		{
+			if (inputAccount == 0 || phase == RecoveryHandoffPhase::Empty ||
+				account != inputAccount)
+				return false;
+			Reset();
+			return true;
+		}
+
+		std::uint64_t Account() const
+		{
+			return account;
+		}
+
+		std::uint64_t FailedConnection() const
+		{
+			return failedConnection;
+		}
+
+	private:
+		RecoveryHandoffPhase phase = RecoveryHandoffPhase::Empty;
+		std::uint64_t account = 0;
+		std::uint64_t failedConnection = 0;
+		double windowSeconds = 0.0;
+		double expiresAt = 0.0;
+	};
+
+	enum class BaseAvailability
+	{
+		Missing,
+		Unusable,
+		Ready,
+	};
+
+	enum class Action
+	{
+		Native,
+		CanonicalStub,
+		Reject,
+	};
+
+	inline Lane ResolveLane(bool required, bool allowOptOut, const char* tvNoChat)
+	{
+		const bool optedOut = allowOptOut && tvNoChat && std::strcmp(tvNoChat, "no_gluapack") == 0;
+		return optedOut ? Lane::NativeOptOut : (required ? Lane::Required : Lane::NativeRescue);
+	}
+
+	constexpr bool CanConsumeRequiredRecovery(bool recoveryEnabled,
+		bool resolvedIdentity)
+	{
+		return recoveryEnabled && resolvedIdentity;
+	}
+
+	constexpr bool NeedsConnectionEpochAtBaseline(std::uint64_t connectionSerial)
+	{
+		return connectionSerial == 0;
+	}
+
+	constexpr bool ShouldPinCurrentBaseForBaseline(Lane lane,
+		bool hasPinnedBase, bool currentBaseAvailable)
+	{
+		return lane == Lane::Required && !hasPinnedBase && currentBaseAvailable;
+	}
+
+	constexpr bool RequiredFailureIdentityReady(bool recoveryEnabled,
+		bool resolvedIdentity, bool authenticatedIdentity)
+	{
+		return !recoveryEnabled || (resolvedIdentity && authenticatedIdentity);
+	}
+
+	constexpr bool RequiredFailureIdentityMatches(bool previouslyResolved,
+		std::uint64_t expectedAccount, std::uint64_t authenticatedAccount)
+	{
+		return authenticatedAccount != 0 &&
+			(!previouslyResolved || expectedAccount == authenticatedAccount);
+	}
+
+	constexpr bool RejectUnavailableRequiredAdmission(bool enabled, bool required,
+		bool canonicalRegistration)
+	{
+		return enabled && required && !canonicalRegistration;
+	}
+
+	constexpr bool UsesCanonicalRegistration(bool enabled, bool canonicalRegistration)
+	{
+		return enabled && canonicalRegistration;
+	}
+
+	constexpr bool UsesPassthroughProcessing(bool enabled)
+	{
+		return enabled;
+	}
+
+	constexpr bool RegistrationModeMatches(bool cachedCanonical, bool cachedPassthrough,
+		bool enabled, bool canonicalRegistration)
+	{
+		return cachedCanonical == UsesCanonicalRegistration(enabled, canonicalRegistration) &&
+			cachedPassthrough == UsesPassthroughProcessing(enabled);
+	}
+
+	constexpr bool RegistrationNeedsHashPublication(bool cachedCanonical, bool cachedPassthrough,
+		bool hasSource, bool contentReady, bool hashPublished,
+		bool enabled, bool canonicalRegistration)
+	{
+		return !hasSource || !contentReady || !hashPublished ||
+			!RegistrationModeMatches(cachedCanonical, cachedPassthrough,
+				enabled, canonicalRegistration);
+	}
+
+	constexpr bool NeedsOrderedCanonicalHash(bool clientActive, bool nativeHashKnown,
+		bool publishedHashMatchesCanonical)
+	{
+		return clientActive || nativeHashKnown || publishedHashMatchesCanonical;
+	}
+
+	enum class ActiveHashRefreshAction
+	{
+		None,
+		Native,
+		Canonical,
+	};
+
+	enum class ActiveHashRefreshEntryAction
+	{
+		Retry,
+		RepairForcedSourceHash,
+		Ready,
+	};
+
+	// The active-refresh budget limits transport attempts, not only successful
+	// writes. A full reliable channel must therefore consume one unit just like a
+	// successful hash update; otherwise a failing recipient can be retried without
+	// bound in one server frame.
+	class ActiveHashRefreshAttemptBudget
+	{
+	public:
+		explicit constexpr ActiveHashRefreshAttemptBudget(std::size_t limit) :
+			limit(limit == 0 ? 1 : limit)
+		{
+		}
+
+		constexpr bool TryConsume()
+		{
+			if (attempts >= limit)
+				return false;
+			++attempts;
+			return true;
+		}
+
+		constexpr std::size_t Attempts() const
+		{
+			return attempts;
+		}
+
+		constexpr bool Exhausted() const
+		{
+			return attempts >= limit;
+		}
+
+	private:
+		std::size_t limit;
+		std::size_t attempts = 0;
+	};
+
+	constexpr int NextActiveHashRefreshSlot(int attemptedSlot, int slotCount)
+	{
+		return attemptedSlot >= 0 && attemptedSlot + 1 < slotCount
+			? attemptedSlot + 1 : 0;
+	}
+
+	// A forced existing-registration recovery must not wait forever when the
+	// compressed canonical body is already ready but its native source identity is
+	// not. Only that explicit one-file path may repair the source hash synchronously;
+	// ordinary registration work remains on the bounded worker.
+	constexpr ActiveHashRefreshEntryAction SelectActiveHashRefreshEntryAction(
+		bool forceRefresh, bool passthrough, bool hasSource, bool sourceHashReady,
+		bool contentHashReady, bool hashPublished)
+	{
+		if (!hasSource || !contentHashReady || !hashPublished)
+			return ActiveHashRefreshEntryAction::Retry;
+		if (!sourceHashReady)
+		{
+			return forceRefresh && passthrough
+				? ActiveHashRefreshEntryAction::RepairForcedSourceHash
+				: ActiveHashRefreshEntryAction::Retry;
+		}
+		return ActiveHashRefreshEntryAction::Ready;
+	}
+
+	// The global Lua registration remains the generation-independent canonical stub.
+	// An existing path hotfix therefore republishes byte-identical userdata and Source
+	// emits no string-table change. Queue an explicit per-client identity for that
+	// no-op transition. An operator-requested recovery may also force the queue after
+	// vanilla changed userdata without proving execution; ordinary changes do not.
+	constexpr bool ShouldQueueActiveHashRefresh(bool enabled,
+		bool canonicalRegistration, bool registrationTransition,
+		bool publishedHashChanged, bool initFile, bool forceRefresh = false)
+	{
+		return enabled && canonicalRegistration && registrationTransition &&
+			(!publishedHashChanged || forceRefresh) && !initFile;
+	}
+
+	// Some filesystem autorefresh paths bypass GModDataPack::AddOrUpdateFile.
+	// Capture only changed existing registrations; unknown paths must never become
+	// client registrations. Every captured change needs LuaPack's active rescan:
+	// vanilla's post-refresh server cache does not prove delivery or execution on a
+	// connected client.
+	constexpr bool ShouldCaptureAutoRefresh(bool enabled,
+		bool canonicalRegistration,
+		bool existingRegistration, bool sourceReadable, bool sourceChanged)
+	{
+		return enabled && canonicalRegistration &&
+			existingRegistration && sourceReadable && sourceChanged;
+	}
+
+	// An explicit recovery may run after GMod has already refreshed HolyLib's
+	// server-side source cache without proving that an active client received the
+	// new identity. Requeue that existing identity only for the explicit path.
+	constexpr bool ShouldQueueExplicitRefreshRecovery(bool explicitRecovery,
+		bool enabled, bool canonicalRegistration, bool existingRegistration,
+		bool sourceReadable, bool sourceChanged)
+	{
+		return explicitRecovery && enabled && canonicalRegistration &&
+			existingRegistration && sourceReadable && !sourceChanged;
+	}
+
+	// Auto-refresh callbacks and volume-backed hotfix tools may identify the same
+	// Lua file as a canonical registration ("foo/bar.lua"), a GAME path
+	// ("lua/foo/bar.lua"), or an addon source path
+	// ("addons/name/lua/foo/bar.lua"). Resolve those spellings without ever
+	// accepting an absolute/traversing path or manufacturing a registration.
+	inline bool NormalizeExistingLuaRefreshRegistrationPath(std::string path,
+		std::string& output)
+	{
+		output.clear();
+		std::replace(path.begin(), path.end(), '\\', '/');
+		while (path.compare(0, 2, "./") == 0)
+			path.erase(0, 2);
+
+		if (path.empty() || path.front() == '/' || path.find(':') != std::string::npos)
+			return false;
+		if (path.compare(0, 7, "addons/") == 0 &&
+			path.find("/lua/") == std::string::npos)
+			return false;
+
+		if (path.empty() || path.size() < 5 ||
+			path.compare(path.size() - 4, 4, ".lua") != 0)
+		{
+			return false;
+		}
+
+		std::size_t segmentStart = 0;
+		while (segmentStart <= path.size())
+		{
+			const std::size_t segmentEnd = path.find('/', segmentStart);
+			const std::size_t length = (segmentEnd == std::string::npos
+				? path.size() : segmentEnd) - segmentStart;
+			if (length == 0 || (length == 1 && path[segmentStart] == '.') ||
+				(length == 2 && path[segmentStart] == '.' && path[segmentStart + 1] == '.'))
+			{
+				return false;
+			}
+			if (segmentEnd == std::string::npos)
+				break;
+			segmentStart = segmentEnd + 1;
+		}
+
+		output = path;
+		return true;
+	}
+
+	inline bool NormalizeExistingLuaRefreshPath(std::string path, std::string& output)
+	{
+		std::string registrationPath;
+		if (!NormalizeExistingLuaRefreshRegistrationPath(path, registrationPath))
+			return false;
+		path = registrationPath;
+
+		if (path.compare(0, 4, "lua/") == 0)
+		{
+			path.erase(0, 4);
+		} else if (path.compare(0, 7, "addons/") == 0) {
+			const std::size_t luaRoot = path.find("/lua/");
+			if (luaRoot == std::string::npos)
+				return false;
+			path.erase(0, luaRoot + 5);
+		}
+
+		return NormalizeExistingLuaRefreshRegistrationPath(path, output);
+	}
+
+	enum class LuaRefreshPathResolution
+	{
+		InvalidPath,
+		UnknownRegistration,
+		ExistingRegistration,
+	};
+
+	template <typename Exists>
+	LuaRefreshPathResolution ResolveExistingLuaRefreshPath(
+		const std::string& fileRelPath, const std::string& fileName,
+		Exists&& exists, std::string& output)
+	{
+		output.clear();
+		bool normalizedAny = false;
+		std::unordered_set<std::string> tried;
+		auto trySpelling = [&](const std::string& spelling) -> bool
+		{
+			if (!tried.insert(spelling).second)
+				return false;
+			if (!exists(spelling))
+				return false;
+			output = spelling;
+			return true;
+		};
+		auto tryCandidate = [&](const std::string& candidate) -> bool
+		{
+			std::string registrationPath;
+			if (NormalizeExistingLuaRefreshRegistrationPath(candidate,
+				registrationPath))
+			{
+				normalizedAny = true;
+				if (trySpelling(registrationPath))
+					return true;
+			}
+
+			std::string normalized;
+			if (!NormalizeExistingLuaRefreshPath(candidate, normalized))
+				return false;
+			normalizedAny = true;
+			return trySpelling(normalized);
+		};
+
+		if (tryCandidate(fileName) || tryCandidate(fileRelPath))
+			return LuaRefreshPathResolution::ExistingRegistration;
+		return normalizedAny ? LuaRefreshPathResolution::UnknownRegistration
+			: LuaRefreshPathResolution::InvalidPath;
+	}
+
+	constexpr ActiveHashRefreshAction SelectActiveHashRefresh(bool clientActive,
+		Action fileAction, bool nativeHashKnown, bool nativeHashMatchesCurrent,
+		bool forceRefresh = false)
+	{
+		if (!clientActive)
+			return ActiveHashRefreshAction::None;
+		if (fileAction == Action::Native)
+		{
+			return !forceRefresh && nativeHashMatchesCurrent
+				? ActiveHashRefreshAction::None
+				: ActiveHashRefreshAction::Native;
+		}
+		if (fileAction == Action::CanonicalStub && (nativeHashKnown || forceRefresh))
+			return ActiveHashRefreshAction::Canonical;
+		return ActiveHashRefreshAction::None;
+	}
+
+	constexpr bool ShouldStageActiveHashRefresh(ActiveHashRefreshAction action,
+		bool targetHashAlreadyPending, bool forceRefresh = false)
+	{
+		return action != ActiveHashRefreshAction::None &&
+			(forceRefresh || !targetHashAlreadyPending);
+	}
+
+	constexpr bool ShouldRequestActiveLuaScan(std::size_t stagedHashUpdates)
+	{
+		return stagedHashUpdates != 0;
+	}
+
+	// Source's bf_write truncates backing storage to a four-byte boundary.
+	// A smaller buffer therefore has zero writable bits even when the payload
+	// itself is only one byte.
+	constexpr bool IsSourceBitWriterStorageSizeValid(std::size_t storageBytes,
+		std::size_t payloadBits)
+	{
+		const std::size_t payloadBytes = payloadBits / 8u +
+			(payloadBits % 8u != 0 ? 1u : 0u);
+		return storageBytes != 0 && storageBytes % sizeof(std::uint32_t) == 0 &&
+			payloadBits != 0 && payloadBytes <= storageBytes;
+	}
+
+	constexpr std::size_t ClientLuaRescanRequestBits = 8u;
+
+	constexpr std::size_t ClientLuaHashBytes = 32u;
+	constexpr std::size_t ClientLuaHashBits = ClientLuaHashBytes * 8u;
+	constexpr int ClientLuaHashUpdateLengthBits = 20;
+
+	constexpr std::size_t ClientLuaHashUpdateBits(int entryBits)
+	{
+		return entryBits > 0
+			? 1u + static_cast<std::size_t>(entryBits) + 1u + 1u + ClientLuaHashBits
+			: 0u;
+	}
+
+	// Encode one existing fixed-size client_lua_files entry exactly as
+	// CNetworkStringTable::WriteUpdate: explicit index, no string body, and one
+	// 32-byte SHA-256 userdata value. The surrounding SVC_UpdateStringTable owns
+	// the table ID, changed-entry count, and payload length.
+	template <typename BitWriter>
+	bool AppendClientLuaHashUpdate(BitWriter& output, std::uint32_t fileID,
+		int entryBits, const void* hash, std::size_t hashBytes)
+	{
+		const std::size_t updateBits = ClientLuaHashUpdateBits(entryBits);
+		if (!hash || hashBytes != ClientLuaHashBytes || entryBits <= 0 ||
+			entryBits >= static_cast<int>(sizeof(std::uint32_t) * 8u) ||
+			fileID == 0 || fileID >= (1u << entryBits) || updateBits == 0)
+		{
+			return false;
+		}
+
+		const int bitsBefore = output.GetNumBitsWritten();
+		const int bitsLeft = output.GetNumBitsLeft();
+		if (bitsBefore < 0 || bitsLeft < 0 || output.IsOverflowed() ||
+			updateBits > static_cast<std::size_t>(bitsLeft) ||
+			updateBits > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
+		{
+			return false;
+		}
+
+		output.WriteOneBit(0);
+		output.WriteUBitLong(fileID, entryBits);
+		output.WriteOneBit(0);
+		output.WriteOneBit(1);
+		output.WriteBits(hash, static_cast<int>(ClientLuaHashBits));
+
+		return !output.IsOverflowed() && output.GetNumBitsWritten() - bitsBefore ==
+			static_cast<int>(updateBits);
+	}
+
+	constexpr std::size_t ClientLuaHashUpdateWireBits(int serviceTypeBits,
+		int tableBits, int entryBits)
+	{
+		const std::size_t updateBits = ClientLuaHashUpdateBits(entryBits);
+		return serviceTypeBits > 0 && tableBits > 0 && updateBits != 0
+			? static_cast<std::size_t>(serviceTypeBits) +
+				static_cast<std::size_t>(tableBits) + 1u +
+				static_cast<std::size_t>(ClientLuaHashUpdateLengthBits) + updateBits
+			: 0u;
+	}
+
+	// Append the complete svc_UpdateStringTable record directly to a reliable
+	// stream. The active-refresh path already owns ordering with the following
+	// RequestLuaFiles message; avoiding a temporary INetMessage also avoids
+	// treating engine-side message rejection as reliable-channel backpressure.
+	template <typename BitWriter>
+	bool AppendClientLuaHashUpdateWire(BitWriter& output,
+		std::uint32_t serviceType, int serviceTypeBits,
+		std::uint32_t tableID, int tableBits,
+		std::uint32_t fileID, int entryBits,
+		const void* hash, std::size_t hashBytes)
+	{
+		const std::size_t updateBits = ClientLuaHashUpdateBits(entryBits);
+		const std::size_t wireBits = ClientLuaHashUpdateWireBits(
+			serviceTypeBits, tableBits, entryBits);
+		if (!hash || hashBytes != ClientLuaHashBytes ||
+			serviceTypeBits <= 0 || serviceTypeBits >= static_cast<int>(sizeof(std::uint32_t) * 8u) ||
+			tableBits <= 0 || tableBits >= static_cast<int>(sizeof(std::uint32_t) * 8u) ||
+			entryBits <= 0 || entryBits >= static_cast<int>(sizeof(std::uint32_t) * 8u) ||
+			serviceType >= (1u << serviceTypeBits) || tableID >= (1u << tableBits) ||
+			fileID == 0 || fileID >= (1u << entryBits) || updateBits == 0 || wireBits == 0 ||
+			updateBits >= (1u << ClientLuaHashUpdateLengthBits))
+		{
+			return false;
+		}
+
+		const int bitsBefore = output.GetNumBitsWritten();
+		const int bitsLeft = output.GetNumBitsLeft();
+		if (bitsBefore < 0 || bitsLeft < 0 || output.IsOverflowed() ||
+			wireBits > static_cast<std::size_t>(bitsLeft) ||
+			wireBits > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
+		{
+			return false;
+		}
+
+		output.WriteUBitLong(serviceType, serviceTypeBits);
+		output.WriteUBitLong(tableID, tableBits);
+		output.WriteOneBit(0); // one changed entry
+		output.WriteUBitLong(static_cast<std::uint32_t>(updateBits),
+			ClientLuaHashUpdateLengthBits);
+		output.WriteOneBit(0); // explicit entry index
+		output.WriteUBitLong(fileID, entryBits);
+		output.WriteOneBit(0); // unchanged string body
+		output.WriteOneBit(1); // replacement userdata follows
+		output.WriteBits(hash, static_cast<int>(ClientLuaHashBits));
+
+		return !output.IsOverflowed() && output.GetNumBitsWritten() - bitsBefore ==
+			static_cast<int>(wireBits);
+	}
+
+	// GMod asks for every missing Lua ID in one request. Required delivery retains that
+	// ownership boundary but stages a bounded number of canonical placeholders per frame.
+	// This math reserves reliable scratch space for one bounded batch plus unrelated
+	// sign-on traffic. The outer wire envelope is the svc type (6) plus payload
+	// length (20); the payload is the GMod message type (8), Lua file ID (16), and
+	// compressed placeholder bytes.
+	constexpr std::size_t RequiredStubReliableReserveBytes = 64u * 1024u;
+	constexpr int RequiredStubServiceTypeBits = 6;
+	constexpr int RequiredStubPayloadLengthBits = 20;
+	constexpr int RequiredStubMessageTypeBits = 8;
+	constexpr int RequiredStubFileIdBits = 16;
+	constexpr std::size_t RequiredStubOuterEnvelopeBits =
+		RequiredStubServiceTypeBits + RequiredStubPayloadLengthBits;
+	constexpr std::size_t RequiredStubPayloadEnvelopeBits =
+		RequiredStubMessageTypeBits + RequiredStubFileIdBits;
+	constexpr std::size_t RequiredStubMaximumPayloadBits =
+		(1u << RequiredStubPayloadLengthBits) - 1u;
+
+	constexpr std::size_t RequiredStubPayloadBits(std::size_t compressedBytes)
+	{
+		const std::size_t maximum = (std::numeric_limits<std::size_t>::max)();
+		return compressedBytes > (maximum - RequiredStubPayloadEnvelopeBits) / 8u
+			? maximum
+			: RequiredStubPayloadEnvelopeBits + compressedBytes * 8u;
+	}
+
+	constexpr std::size_t RequiredStubWireBits(std::size_t compressedBytes)
+	{
+		const std::size_t maximum = (std::numeric_limits<std::size_t>::max)();
+		const std::size_t payloadBits = RequiredStubPayloadBits(compressedBytes);
+		return payloadBits == maximum || payloadBits > maximum - RequiredStubOuterEnvelopeBits
+			? maximum
+			: RequiredStubOuterEnvelopeBits + payloadBits;
+	}
+
+	constexpr bool CanAppendRequiredStub(bool reliableOverflowed,
+		std::size_t reliableBitsLeft, std::size_t compressedBytes)
+	{
+		const std::size_t payloadBits = RequiredStubPayloadBits(compressedBytes);
+		const std::size_t wireBits = RequiredStubWireBits(compressedBytes);
+		return !reliableOverflowed && payloadBits <= RequiredStubMaximumPayloadBits &&
+			wireBits != (std::numeric_limits<std::size_t>::max)() &&
+			wireBits <= reliableBitsLeft;
+	}
+
+	enum class RequiredStubDrainAction
+	{
+		Append,
+		WaitForReliableSpace,
+		Reject,
+	};
+
+	constexpr RequiredStubDrainAction SelectRequiredStubDrainAction(
+		bool enabled, bool canonicalRegistration, bool filePinned,
+		bool payloadAvailable, std::size_t compressedBytes,
+		bool clientConnected, bool reliableOverflowed,
+		std::size_t reliableBitsLeft)
+	{
+		if (!CanUsePinnedRequiredStub(enabled, canonicalRegistration,
+			filePinned, payloadAvailable, compressedBytes) ||
+			!clientConnected || reliableOverflowed)
+		{
+			return RequiredStubDrainAction::Reject;
+		}
+
+		const std::size_t payloadBits = RequiredStubPayloadBits(compressedBytes);
+		const std::size_t wireBits = RequiredStubWireBits(compressedBytes);
+		if (payloadBits > RequiredStubMaximumPayloadBits ||
+			wireBits == (std::numeric_limits<std::size_t>::max)())
+		{
+			return RequiredStubDrainAction::Reject;
+		}
+
+		return wireBits <= reliableBitsLeft
+			? RequiredStubDrainAction::Append
+			: RequiredStubDrainAction::WaitForReliableSpace;
+	}
+
+	template <typename BitWriter>
+	bool AppendRequiredStubWire(BitWriter& reliable, std::uint32_t serviceType,
+		std::uint32_t messageType, std::uint32_t fileID,
+		const void* compressed, std::size_t compressedBytes)
+	{
+		if (serviceType >= (1u << RequiredStubServiceTypeBits) ||
+			messageType >= (1u << RequiredStubMessageTypeBits) ||
+			fileID >= (1u << RequiredStubFileIdBits) ||
+			(!compressed && compressedBytes != 0))
+		{
+			return false;
+		}
+
+		const int bitsBefore = reliable.GetNumBitsWritten();
+		const int bitsLeft = reliable.GetNumBitsLeft();
+		const std::size_t payloadBits = RequiredStubPayloadBits(compressedBytes);
+		const std::size_t wireBits = RequiredStubWireBits(compressedBytes);
+		if (bitsBefore < 0 || bitsLeft < 0 ||
+			!CanAppendRequiredStub(reliable.IsOverflowed(),
+				static_cast<std::size_t>(bitsLeft), compressedBytes) ||
+			payloadBits > static_cast<std::size_t>((std::numeric_limits<int>::max)()) ||
+			wireBits > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
+		{
+			return false;
+		}
+
+		reliable.WriteUBitLong(serviceType, RequiredStubServiceTypeBits);
+		reliable.WriteUBitLong(static_cast<std::uint32_t>(payloadBits),
+			RequiredStubPayloadLengthBits);
+		reliable.WriteUBitLong(messageType, RequiredStubMessageTypeBits);
+		reliable.WriteUBitLong(fileID, RequiredStubFileIdBits);
+		reliable.WriteBytes(compressed, static_cast<int>(compressedBytes));
+
+		return !reliable.IsOverflowed() && reliable.GetNumBitsWritten() - bitsBefore ==
+			static_cast<int>(wireBits);
+	}
+
+	constexpr std::size_t RequiredStubReliableCapacityBytes(std::size_t stubCount,
+		std::size_t compressedBytes,
+		std::size_t reserveBytes = RequiredStubReliableReserveBytes)
+	{
+		const std::size_t maximum = (std::numeric_limits<std::size_t>::max)();
+		const std::size_t wireBits = RequiredStubWireBits(compressedBytes);
+		if (wireBits == maximum || (stubCount != 0 && wireBits > (maximum - 7u) / stubCount))
+			return maximum;
+
+		const std::size_t burstBytes = (wireBits * stubCount + 7u) / 8u;
+		return reserveBytes > maximum - burstBytes ? maximum : burstBytes + reserveBytes;
+	}
+
+	constexpr bool NeedsPerClientNativeHashes(Lane lane)
+	{
+		return lane == Lane::Required || lane == Lane::NativeRecovery ||
+			lane == Lane::NativeOptOut || lane == Lane::NativeRescue;
+	}
+
+	constexpr bool ShouldPreserveRecoveryLifecycle(bool gameLayerCallback,
+		bool nativeRecovery, bool active, bool recoveryStateCleared,
+		bool identityMatches, bool ownsConsumedRecovery)
+	{
+		return gameLayerCallback && nativeRecovery && !active &&
+			!recoveryStateCleared && identityMatches && ownsConsumedRecovery;
+	}
+
+	constexpr bool ShouldKeepInvokedRecoveryHandoff(bool gameLayerCallback,
+		bool invoked)
+	{
+		return gameLayerCallback && invoked;
+	}
+
+	constexpr bool ShouldIgnoreLateRecoveryFailure(bool nativeRecovery,
+		bool ownsConsumedRecovery, bool recoveryStateCleared)
+	{
+		// A native recovery baseline contains no stubs. A required/unready command
+		// observed during its consumed or successfully-completed epoch can only belong
+		// to the failed baseline.
+		return nativeRecovery && (ownsConsumedRecovery || recoveryStateCleared);
+	}
+
+	constexpr double RecoveryHandoffWindow(double recoveryTtlSeconds)
+	{
+		if (recoveryTtlSeconds <= 0.0)
+			return 0.0;
+		const double halfTtl = recoveryTtlSeconds * 0.5;
+		return halfTtl < 30.0 ? halfTtl : 30.0;
+	}
+
+	constexpr Action SelectBaseline(Lane lane, bool canonicalRegistration,
+		BaseAvailability base)
+	{
+		return lane != Lane::Required ? Action::Native :
+			(!canonicalRegistration || base != BaseAvailability::Ready ? Action::Reject : Action::CanonicalStub);
+	}
+
+	constexpr Action SelectFile(Lane lane, bool canonicalRegistration,
+		BaseAvailability base, bool bootstrap, bool nativeDelta)
+	{
+		return lane != Lane::Required ? Action::Native :
+			(!canonicalRegistration || base != BaseAvailability::Ready ? Action::Reject :
+				(bootstrap || nativeDelta ? Action::Native : Action::CanonicalStub));
+	}
+
+	constexpr bool ShouldBuildMapBase(bool hasMapBase, bool buildRequested)
+	{
+		return !hasMapBase && buildRequested;
+	}
+
+	inline bool IsNativeDelta(bool baseContainsPath, const std::string& baseIdentity,
+		const std::string& currentIdentity)
+	{
+		return !baseContainsPath || baseIdentity != currentIdentity;
+	}
+
+	inline bool RegisterExactKey(std::unordered_set<std::string>& keys, const std::string& key)
+	{
+		return keys.insert(key).second;
+	}
+
+	template <typename Hash>
+	inline bool NativeHashMatches(const std::unordered_map<int, Hash>& hashes,
+		int fileID, const Hash& current)
+	{
+		auto known = hashes.find(fileID);
+		return known != hashes.end() && known->second == current;
+	}
+
+	template <typename Hash>
+	inline void RememberNativeHash(std::unordered_map<int, Hash>& hashes,
+		int fileID, const Hash& current)
+	{
+		hashes[fileID] = current;
+	}
+
+	template <typename Hash>
+	inline bool RestoreCanonicalHash(std::unordered_map<int, Hash>& hashes, int fileID)
+	{
+		return hashes.erase(fileID) != 0;
+	}
+
+	static_assert(SelectBaseline(Lane::Required, true, BaseAvailability::Ready) == Action::CanonicalStub,
+		"a usable required base must select mixed canonical/native delivery");
+	static_assert(SelectBaseline(Lane::Required, true, BaseAvailability::Missing) == Action::Reject,
+		"a missing required base must fail closed");
+	static_assert(SelectBaseline(Lane::Required, true, BaseAvailability::Unusable) == Action::Reject,
+		"an unusable required base must fail closed");
+	static_assert(SelectBaseline(Lane::NativeOptOut, true, BaseAvailability::Ready) == Action::Native,
+		"the explicit opt-out lane must remain wholly native");
+	static_assert(SelectBaseline(Lane::NativeRecovery, true, BaseAvailability::Ready) == Action::Native,
+		"a consumed recovery latch must be wholly native from its baseline");
+	static_assert(RejectUnavailableRequiredAdmission(true, true, false),
+		"required mode must reject before a cached client can bypass an unavailable baseline hook");
+	static_assert(!RejectUnavailableRequiredAdmission(true, true, true),
+		"required admission is available when every canonical delivery hook is active");
+	static_assert(!RejectUnavailableRequiredAdmission(true, false, false),
+		"native rescue remains available when required mode is disabled");
+	static_assert(UsesCanonicalRegistration(true, true),
+		"enabled supported registration must use canonical LuaPack contents");
+	static_assert(!UsesCanonicalRegistration(false, true),
+		"the kill switch must restore native registration");
+	static_assert(!UsesCanonicalRegistration(true, false),
+		"unsupported registration must remain native");
+	static_assert(UsesPassthroughProcessing(true),
+		"LuaPack processing must preserve the same raw bytes captured for native and packed bodies");
+	static_assert(!UsesPassthroughProcessing(false),
+		"stock gmoddatapack token processing must resume when LuaPack is disabled");
+	static_assert(!RegistrationModeMatches(true, true, false, true),
+		"disabling LuaPack must invalidate a cached canonical body");
+	static_assert(!RegistrationModeMatches(false, false, true, true),
+		"enabling supported LuaPack must invalidate a cached native body");
+	static_assert(!RegistrationModeMatches(false, false, true, false),
+		"enabling native rescue must invalidate a token-processed native registration");
+	static_assert(RegistrationNeedsHashPublication(true, true, true, true, true, false, true),
+		"a stale canonical body must publish native identity before the kill switch can send it");
+	static_assert(RegistrationNeedsHashPublication(true, true, true, false, false, true, true),
+		"a matching mode is not observable until its replacement hash is published");
+	static_assert(RegistrationNeedsHashPublication(true, true, true, true, false, true, true),
+		"worker processing is not publication until the main thread updates the string table");
+	static_assert(RegistrationNeedsHashPublication(false, false, false, true, true, false, true),
+		"an uninitialized native cache entry must capture source before publishing or sending");
+	static_assert(!RegistrationNeedsHashPublication(true, true, true, true, true, true, true),
+		"a ready canonical body with a matching mode needs no transition repair");
+	static_assert(NeedsOrderedCanonicalHash(true, false, false),
+		"an active client must receive canonical identity before its restored stub body");
+	static_assert(!NeedsOrderedCanonicalHash(false, false, false),
+		"a joining client already received canonical identity in its ServerInfo baseline");
+	static_assert(NeedsPerClientNativeHashes(Lane::NativeRecovery),
+		"required recovery still needs per-client native hash identity");
+	static_assert(NeedsPerClientNativeHashes(Lane::NativeOptOut),
+		"native opt-out hot refreshes need per-client native hash identity");
+	static_assert(NeedsPerClientNativeHashes(Lane::NativeRescue),
+		"native rescue hot refreshes need per-client native hash identity");
+	static_assert(SelectFile(Lane::Required, true, BaseAvailability::Ready, false, false) == Action::CanonicalStub,
+		"an unchanged base file must use the canonical stub");
+	static_assert(SelectFile(Lane::Required, true, BaseAvailability::Ready, false, true) == Action::Native,
+		"a file changed from the base must use native delivery");
+	static_assert(SelectFile(Lane::Required, true, BaseAvailability::Ready, true, false) == Action::Native,
+		"the bootstrap must always use native delivery");
+	static_assert(SelectFile(Lane::Required, true, BaseAvailability::Missing, false, true) == Action::Reject,
+		"a native delta must never turn a missing required base into whole-join fallback");
+	static_assert(SelectFile(Lane::Required, false, BaseAvailability::Ready, true, false) == Action::Reject,
+		"required delivery must fail closed without the per-client baseline hook");
+	static_assert(ShouldBuildMapBase(false, true), "the initial map base must be buildable");
+	static_assert(!ShouldBuildMapBase(true, true), "hotfixes must not rotate the immutable map base");
+}

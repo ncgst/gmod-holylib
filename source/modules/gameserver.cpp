@@ -73,6 +73,32 @@ IModule* pGameServerModule = &g_pGameServerModule;
 
 static std::vector<CGameClient*> g_pQueueClients;
 extern CGlobalVars* gpGlobals;
+static Symbols::CNetChan_SendNetMsg g_pEngineCNetChanSendNetMsg = nullptr;
+
+// Queue clients live outside CBaseServer's physical client array. LuaPack still
+// handles their engine-owned Lua requests synchronously, so callers need a
+// slot-owned lookup instead of assuming vector position or physical capacity.
+// Client-list mutation and Lua delivery both run on the main thread.
+CBaseClient* Gameserver_GetClientBySlot(int slot)
+{
+	if (slot < 0)
+		return nullptr;
+
+	if (Util::server && slot < Util::server->GetClientCount())
+	{
+		CBaseClient* client = static_cast<CBaseClient*>(Util::server->GetClient(slot));
+		if (client && client->m_nClientSlot == slot)
+			return client;
+	}
+
+	for (CGameClient* queueClient : g_pQueueClients)
+	{
+		if (queueClient && queueClient->m_nClientSlot == slot)
+			return static_cast<CBaseClient*>(queueClient);
+	}
+
+	return nullptr;
+}
 
 /*
  * Queue CGameClients use slots at/above gpGlobals->maxClients, but the engine's
@@ -3139,22 +3165,38 @@ static void hook_CVEngineServer_GMOD_SendToClient(void* _this, int client, void 
 	}
 
 	// IsConnected() does NOT imply a live channel (same bug class as the old
-	// GetFreeQueueClient null-netchannel crash) - check both before SendNetMsg.
-	if (!pClient->IsConnected() || !pClient->m_NetChannel)
+	// GetFreeQueueClient null-netchannel crash). The accessor is authoritative while
+	// a parked client is moving between queue and physical ownership.
+	INetChannel* channel = pClient->GetNetChannel();
+	if (!pClient->IsConnected() || !channel)
 	{
 		Msg(PROJECT_NAME " - gameserver: Not sending to null client.\n");
 		return;
 	}
-
-	// Not 1:1 to GMod but should be good enouth
 
 	SVC_CustomMessage msg;
 	msg.m_DataOut.StartWriting(data, 0, 0, dataSize);
 	msg.m_iLength = dataSize;
 	msg.m_iLengthBits = 20;
 	msg.m_iType = svc_GMod_ServerToClient;
-	
-	pClient->m_NetChannel->SendNetMsg(msg, true, false);
+
+	// Queue clients are outside CVEngineServer::GMOD_SendToClient's physical
+	// array. Use the resolved engine implementation here: the locally mirrored
+	// INetChannel vtable is not ABI-stable on current Linux x64 builds.
+#if defined(SYSTEM_LINUX)
+	if (!g_pEngineCNetChanSendNetMsg)
+		return;
+	g_pEngineCNetChanSendNetMsg(static_cast<CNetChan*>(channel), msg, true, false);
+#else
+	channel->SendNetMsg(msg, true, false);
+#endif
+}
+
+bool Gameserver_HasExactGModSender()
+{
+	return g_pEngineCNetChanSendNetMsg &&
+		DETOUR_ISVALID(detour_CVEngineServer_GMOD_SendToClient) &&
+		DETOUR_ISENABLED(detour_CVEngineServer_GMOD_SendToClient);
 }
 
 #if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
@@ -4649,6 +4691,14 @@ void CGameServerModule::InitDetour(bool bPreServer)
 
 	DETOUR_PREPARE_THISCALL();
 	SourceSDK::FactoryLoader engine_loader("engine");
+	g_pEngineCNetChanSendNetMsg = reinterpret_cast<Symbols::CNetChan_SendNetMsg>(
+		Detour::GetFunction(engine_loader.GetModule(), Symbols::CNetChan_SendNetMsgSym));
+#if defined(SYSTEM_LINUX)
+	if (!g_pEngineCNetChanSendNetMsg)
+	{
+		Warning(PROJECT_NAME " - gameserver: could not resolve CNetChan::SendNetMsg; exact early-sign-on GMod delivery is unavailable\n");
+	}
+#endif
 
 #if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
 	void* pHostBuildConVarUpdateMessage = Detour::GetFunction(engine_loader.GetModule(), Symbols::Host_BuildConVarUpdateMessageSym);

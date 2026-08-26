@@ -1026,6 +1026,11 @@ namespace Symbols
 		Symbol::FromSignature("\x55\x8B\x87\xA0\x01\x00\x00\x48"), // 55 8B 87 A0 01 00 00 48 (x64 260706; reverified 260709, m_nSignonState [rdi+0x1A0]; was +0x1A8)
 	};
 
+	const std::vector<Symbol> CBaseClient_SendServerInfoSym = {
+		Symbol::FromName("_ZN11CBaseClient14SendServerInfoEv"),
+		Symbol::FromSignature("\x55\x48\x89\xE5\x41\x57\x41\x56\x41\x55\x4C\x8D\xAD\xA0\xEE\xFF\xFF\x41\x54\x4C\x8D\xA5\x20\xEE\xFF\xFF\x53\x48\x89\xFB"), // GMod Linux x86-64 260709/260803; unique prologue, writes per-client string-table baselines before replicated cvars
+	};
+
 	const std::vector<Symbol> CGameClient_SetSignonStateSym = {
 		Symbol::FromName("_ZN11CGameClient14SetSignonStateEii"),
 #if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
@@ -1302,6 +1307,13 @@ namespace Symbols
 		Symbol::FromName("_ZN12GModDataPack16SendFileToClientEii"), // huh, that's a first
 		Symbol::FromSignature("\x55\x8B\xEC\x83\xEC\x4C\x53\x8B\x5D\x0C\x56\x8B\xF1\x89\x75\xF8"), // 55 8B EC 83 EC 4C 53 8B 5D 0C 56 8B F1 89 75 F8
 		Symbol::FromName("?SendFileToClient@GModDataPack@@QEAAXHH@Z"),
+	};
+
+	const std::vector<Symbol> GModDataPack_OnFilesRequestedSym = {
+		Symbol::FromName("_ZN12GModDataPack16OnFilesRequestedEiP7bf_readi"),
+		// Linux x64 strips this private symbol. Signature verified unique in the
+		// 2026-08-16 server.so (SHA-256 7371BC3CBBFB5379...).
+		Symbol::FromSignature("\x55\x48\x63\xC6\x48\x8D\x04\x87\x48\x89\xE5\x41\x57\x41\x56\x49\x89\xFF\x41\x55\x41\x54\x53\x48\x89\xD3\x48\x83\xEC\x78\x89\xB5\x70\xFF\xFF\xFF\x8B\x50\x20\x85\xD2\x7E\x0B\x83\xEA\x01\xF6\xC1\x0F"), // bits must be a non-empty multiple of 16 before the request tree is built
 	};
 
 	const std::vector<Symbol> GModDataPack_AddOrUpdateFileSym = { // search for singleplayer_files%i
