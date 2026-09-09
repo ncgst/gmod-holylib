@@ -997,6 +997,81 @@ namespace HolyLib::LuaPack::Policy
 	}
 
 	constexpr std::size_t ClientLuaRescanRequestBits = 8u;
+	constexpr int ClientLuaRescanLengthBits = 20;
+
+	constexpr std::size_t ClientLuaRescanWireBits(int serviceTypeBits)
+	{
+		return serviceTypeBits > 0 ? static_cast<std::size_t>(serviceTypeBits) +
+			ClientLuaRescanLengthBits + ClientLuaRescanRequestBits : 0u;
+	}
+
+	struct ActiveLuaRescanOwner
+	{
+		const void* client = nullptr;
+		const void* channel = nullptr;
+		int userID = 0;
+		int challenge = 0;
+
+		bool IsValid() const { return client && channel; }
+		bool Matches(const ActiveLuaRescanOwner& other) const
+		{
+			return IsValid() && other.IsValid() && client == other.client &&
+				channel == other.channel && userID == other.userID && challenge == other.challenge;
+		}
+	};
+
+	// One coalesced operation per connection. A staged hash remains pending even
+	// if its rescan cannot be appended until a later frame with reliable capacity.
+	class PendingActiveLuaRescan
+	{
+	public:
+		bool IsPending() const { return owner.IsValid(); }
+		void Reset() { owner = {}; }
+		void Mark(const ActiveLuaRescanOwner& current) { owner = current; }
+
+		template <typename Append>
+		bool TryAppend(const ActiveLuaRescanOwner& current, Append append)
+		{
+			if (!IsPending())
+				return false;
+			if (!owner.Matches(current))
+			{
+				Reset();
+				return false;
+			}
+			if (!append())
+				return false;
+			Reset();
+			return true;
+		}
+
+	private:
+		ActiveLuaRescanOwner owner;
+	};
+
+	// GMOD_SendToClient returns void. Append its exact reliable envelope here so
+	// insufficient capacity is a non-mutating retry, rather than assumed delivery.
+	template <typename BitWriter>
+	bool AppendClientLuaRescanWire(BitWriter& output, std::uint32_t serviceType,
+		int serviceTypeBits, const void* request, std::size_t requestBits)
+	{
+		if (!request || requestBits != ClientLuaRescanRequestBits || serviceTypeBits <= 0 ||
+			serviceTypeBits >= static_cast<int>(sizeof(std::uint32_t) * 8u) ||
+			serviceType >= (1u << serviceTypeBits))
+			return false;
+		const std::size_t wireBits = ClientLuaRescanWireBits(serviceTypeBits);
+		const int bitsBefore = output.GetNumBitsWritten();
+		const int bitsLeft = output.GetNumBitsLeft();
+		if (bitsBefore < 0 || bitsLeft < 0 || output.IsOverflowed() ||
+			wireBits > static_cast<std::size_t>(bitsLeft))
+			return false;
+
+		output.WriteUBitLong(serviceType, serviceTypeBits);
+		output.WriteUBitLong(static_cast<std::uint32_t>(requestBits), ClientLuaRescanLengthBits);
+		output.WriteBits(request, static_cast<int>(requestBits));
+		return !output.IsOverflowed() && output.GetNumBitsWritten() - bitsBefore ==
+			static_cast<int>(wireBits);
+	}
 
 	constexpr std::size_t ClientLuaHashBytes = 32u;
 	constexpr std::size_t ClientLuaHashBits = ClientLuaHashBytes * 8u;
@@ -1064,7 +1139,7 @@ namespace HolyLib::LuaPack::Policy
 		std::uint32_t serviceType, int serviceTypeBits,
 		std::uint32_t tableID, int tableBits,
 		std::uint32_t fileID, int entryBits,
-		const void* hash, std::size_t hashBytes)
+		const void* hash, std::size_t hashBytes, std::size_t trailingReserveBits = 0)
 	{
 		const std::size_t updateBits = ClientLuaHashUpdateBits(entryBits);
 		const std::size_t wireBits = ClientLuaHashUpdateWireBits(
@@ -1084,6 +1159,7 @@ namespace HolyLib::LuaPack::Policy
 		const int bitsLeft = output.GetNumBitsLeft();
 		if (bitsBefore < 0 || bitsLeft < 0 || output.IsOverflowed() ||
 			wireBits > static_cast<std::size_t>(bitsLeft) ||
+			trailingReserveBits > static_cast<std::size_t>(bitsLeft) - wireBits ||
 			wireBits > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
 		{
 			return false;

@@ -1067,6 +1067,101 @@ int main()
 		0x1234, clientLuaEntryBits, clientLuaHash.data(), clientLuaHash.size()));
 	assert(invalidClientLuaWire.bits.empty());
 
+	// An active hash and its mandatory rescan must both fit. Exercise every
+	// capacity where the old hash-only check succeeded but the rescan could not.
+	const std::size_t rescanWireBits = ClientLuaRescanWireBits(serviceTypeBits);
+	assert(rescanWireBits == 34);
+	assert(clientLuaWireBits == 304);
+	constexpr std::uint32_t rescanServiceType = 33;
+	const std::uint32_t rescanPayload = 0xad;
+	int testClient = 0, replacementClient = 0, testChannel = 0, replacementChannel = 0;
+	const ActiveLuaRescanOwner scanOwner{&testClient, &testChannel, 17, 99};
+	PendingActiveLuaRescan pendingScan;
+	auto stageActiveHash = [&](TestBitWriter& output) {
+		if (!AppendClientLuaHashUpdateWire(output, updateStringTableType, serviceTypeBits,
+			clientLuaTableID, tableIDBits, 0x1234, clientLuaEntryBits,
+			clientLuaHash.data(), clientLuaHash.size(), rescanWireBits))
+			return false;
+		pendingScan.Mark(scanOwner);
+		return true;
+	};
+	auto appendRescan = [&](TestBitWriter& output) {
+		return AppendClientLuaRescanWire(output, rescanServiceType, serviceTypeBits,
+			&rescanPayload, ClientLuaRescanRequestBits);
+	};
+	for (std::size_t remaining = clientLuaWireBits;
+		remaining < clientLuaWireBits + rescanWireBits; ++remaining)
+	{
+		TestBitWriter shortCombined(remaining);
+		assert(!stageActiveHash(shortCombined));
+		assert(shortCombined.bits.empty());
+		assert(!shortCombined.IsOverflowed());
+		assert(!pendingScan.IsPending());
+	}
+	TestBitWriter combinedRetry(3 + clientLuaWireBits + rescanWireBits);
+	combinedRetry.WriteUBitLong(5, 3); // an unaligned existing reliable prefix
+	assert(stageActiveHash(combinedRetry));
+	assert(pendingScan.TryAppend(scanOwner, [&]() { return appendRescan(combinedRetry); }));
+	assert(!pendingScan.IsPending());
+	assert(!combinedRetry.IsOverflowed());
+	assert(combinedRetry.GetNumBitsLeft() == 0);
+	assert(combinedRetry.ReadUBitLong(0, 3) == 5);
+	const std::size_t rescanStart = 3 + clientLuaWireBits;
+	assert(combinedRetry.ReadUBitLong(rescanStart, serviceTypeBits) == rescanServiceType);
+	assert(combinedRetry.ReadUBitLong(rescanStart + serviceTypeBits,
+		ClientLuaRescanLengthBits) == ClientLuaRescanRequestBits);
+	assert(combinedRetry.ReadUBitLong(rescanStart + serviceTypeBits +
+		ClientLuaRescanLengthBits, ClientLuaRescanRequestBits) == rescanPayload);
+
+	// Multiple staged hashes coalesce into one ordered rescan.
+	TestBitWriter coalesced(2 * clientLuaWireBits + rescanWireBits);
+	assert(stageActiveHash(coalesced));
+	assert(stageActiveHash(coalesced));
+	assert(pendingScan.TryAppend(scanOwner, [&]() { return appendRescan(coalesced); }));
+	assert(!pendingScan.TryAppend(scanOwner, [&]() { return appendRescan(coalesced); }));
+	assert(!coalesced.IsOverflowed() && coalesced.GetNumBitsLeft() == 0);
+
+	// If another writer consumes reserved space, retain the rescan independently
+	// of the hash deduplication queue and complete it on the next available frame.
+	TestBitWriter interrupted(clientLuaWireBits + rescanWireBits);
+	assert(stageActiveHash(interrupted));
+	interrupted.WriteOneBit(0);
+	const auto interruptedSize = interrupted.bits.size();
+	assert(!pendingScan.TryAppend(scanOwner, [&]() { return appendRescan(interrupted); }));
+	assert(pendingScan.IsPending());
+	assert(!interrupted.IsOverflowed() && interrupted.bits.size() == interruptedSize);
+	TestBitWriter nextFrame(rescanWireBits);
+	assert(pendingScan.TryAppend(scanOwner, [&]() { return appendRescan(nextFrame); }));
+	assert(!pendingScan.IsPending() && nextFrame.GetNumBitsLeft() == 0);
+	assert(!nextFrame.IsOverflowed());
+
+	// No inherited work on disconnect, pointer reuse, or a replacement connection.
+	for (const auto& replacement : {
+		ActiveLuaRescanOwner{},
+		ActiveLuaRescanOwner{&replacementClient, &testChannel, 17, 99},
+		ActiveLuaRescanOwner{&testClient, &replacementChannel, 17, 99},
+		ActiveLuaRescanOwner{&testClient, &testChannel, 18, 99},
+		ActiveLuaRescanOwner{&testClient, &testChannel, 17, 100}})
+	{
+		pendingScan.Mark(scanOwner);
+		bool attempted = false;
+		assert(!pendingScan.TryAppend(replacement, [&]() { attempted = true; return true; }));
+		assert(!attempted && !pendingScan.IsPending());
+	}
+	pendingScan.Mark(scanOwner);
+	pendingScan.Reset();
+	assert(!pendingScan.IsPending());
+	TestBitWriter invalidRescan(rescanWireBits);
+	assert(!AppendClientLuaRescanWire(invalidRescan, rescanServiceType,
+		serviceTypeBits, &rescanPayload, 7));
+	assert(!AppendClientLuaRescanWire(invalidRescan, rescanServiceType,
+		serviceTypeBits, &rescanPayload, 9));
+	assert(!AppendClientLuaRescanWire(invalidRescan, 64,
+		serviceTypeBits, &rescanPayload, ClientLuaRescanRequestBits));
+	assert(!AppendClientLuaRescanWire(invalidRescan, rescanServiceType,
+		serviceTypeBits, nullptr, ClientLuaRescanRequestBits));
+	assert(invalidRescan.bits.empty() && !invalidRescan.IsOverflowed());
+
 	// Exact-key duplicates are rejected by the same registry used by pack validation.
 	std::unordered_set<std::string> exactKeys;
 	assert(RegisterExactKey(exactKeys, "0123456789abcdef"));

@@ -89,6 +89,8 @@ extern CBaseClient* Gameserver_GetClientBySlot(int slot);
 using ClientLuaHash = std::array<unsigned char, 32>;
 static std::array<std::unordered_map<int, ClientLuaHash>, ABSOLUTE_PLAYER_LIMIT> g_clientNativeLuaHashes;
 static std::array<std::unordered_map<int, ClientLuaHash>, ABSOLUTE_PLAYER_LIMIT> g_clientHashUpdatesPending;
+static std::array<HolyLib::LuaPack::Policy::PendingActiveLuaRescan, ABSOLUTE_PLAYER_LIMIT>
+	g_pendingActiveLuaRescans;
 static unsigned int g_activeHashRefreshNativeAcknowledgements = 0;
 static unsigned int g_activeHashRefreshCanonicalAcknowledgements = 0;
 static constexpr double ACTIVE_HASH_REFRESH_RETRY_DELAY_SECONDS = 0.25;
@@ -328,6 +330,7 @@ static void ClearClientLuaDeliveryState(int slot)
 		ClearQueuedLuaPackServerInfo(slot);
 		g_clientNativeLuaHashes[slot].clear();
 		g_clientHashUpdatesPending[slot].clear();
+		g_pendingActiveLuaRescans[slot].Reset();
 		ClearClientPinnedRequiredDeliveryState(slot);
 	}
 }
@@ -2599,7 +2602,15 @@ static CBaseClient* ResolveLuaPackClientBySlot(int clientIdx)
 #endif
 }
 
-static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned char* hash, size_t hashLength)
+static HolyLib::LuaPack::Policy::ActiveLuaRescanOwner CaptureActiveLuaRescanOwner(CBaseClient* client)
+{
+	if (!client || !client->IsActive() || !client->GetNetChannel())
+		return {};
+	return {client, client->GetNetChannel(), client->GetUserID(), client->m_clientChallenge};
+}
+
+static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned char* hash,
+	size_t hashLength, bool requestActiveScan = false)
 {
 	if (!g_pDataPack || !g_pDataPack->m_pClientLuaFiles || !hash || hashLength != 32)
 		return false;
@@ -2608,6 +2619,10 @@ static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned ch
 	INetChannel* engineChannel = client ? client->GetNetChannel() : nullptr;
 	CNetChan* channel = static_cast<CNetChan*>(engineChannel);
 	if (!client || !channel)
+		return false;
+	const auto scanOwner = CaptureActiveLuaRescanOwner(client);
+	if (requestActiveScan && (clientIdx < 0 || clientIdx >= ABSOLUTE_PLAYER_LIMIT ||
+		!scanOwner.IsValid()))
 		return false;
 
 	INetworkStringTable* table = g_pDataPack->m_pClientLuaFiles;
@@ -2629,17 +2644,20 @@ static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned ch
 	// reliable stream. A live incident showed the temporary INetMessage path
 	// rejecting every update even with an empty, non-overflowed stream; that
 	// deterministic failure was then misreported and retried as backpressure.
-	return HolyLib::LuaPack::Policy::AppendClientLuaHashUpdateWire(
+	const bool appended = HolyLib::LuaPack::Policy::AppendClientLuaHashUpdateWire(
 		channel->m_StreamReliable,
 		static_cast<std::uint32_t>(svc_UpdateStringTable), NETMSG_TYPE_BITS,
 		static_cast<std::uint32_t>(table->GetTableId()), Q_log2(MAX_TABLES),
-		static_cast<std::uint32_t>(fileID), table->GetEntryBits(), hash, hashLength);
+		static_cast<std::uint32_t>(fileID), table->GetEntryBits(), hash, hashLength,
+		requestActiveScan ? HolyLib::LuaPack::Policy::ClientLuaRescanWireBits(NETMSG_TYPE_BITS) : 0u);
+	if (appended && requestActiveScan)
+		g_pendingActiveLuaRescans[clientIdx].Mark(scanOwner);
+	return appended;
 }
 
-static bool RequestActiveClientLuaFiles(int clientIdx)
+static bool RequestActiveClientLuaFiles(CBaseClient* client)
 {
-	CBaseClient* client = ResolveLuaPackClientBySlot(clientIdx);
-	if (!Util::engineserver || !client || !client->IsActive() || !client->GetNetChannel())
+	if (!client || !client->IsActive() || !client->GetNetChannel())
 		return false;
 
 	// bf_write requires dword-sized, dword-aligned storage and truncates smaller
@@ -2659,9 +2677,28 @@ static bool RequestActiveClientLuaFiles(int clientIdx)
 	// A string-table update changes the advertised identity, but active GMod clients
 	// do not rescan client_lua_files until this message asks them to compare the table.
 	// It shares the reliable stream with the preceding hash updates, preserving order.
-	Util::engineserver->GMOD_SendToClient(clientIdx, request.GetData(),
-		request.GetNumBitsWritten());
-	return true;
+	CNetChan* channel = static_cast<CNetChan*>(client->GetNetChannel());
+	return HolyLib::LuaPack::Policy::AppendClientLuaRescanWire(channel->m_StreamReliable,
+		svc_GMod_ServerToClient, NETMSG_TYPE_BITS, request.GetData(), request.GetNumBitsWritten());
+}
+
+static unsigned int DrainActiveLuaRescans()
+{
+	const bool enabled = HolyLib::LuaPack::IsEnabled() &&
+		HolyLib::LuaPack::SupportsCanonicalRegistration();
+	unsigned int sent = 0;
+	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
+	{
+		auto& pending = g_pendingActiveLuaRescans[slot];
+		if (!pending.IsPending())
+			continue;
+		CBaseClient* client = enabled ? ResolveLuaPackClientBySlot(slot) : nullptr;
+		if (pending.TryAppend(CaptureActiveLuaRescanOwner(client), [client]() {
+			return RequestActiveClientLuaFiles(client);
+		}))
+			++sent;
+	}
+	return sent;
 }
 
 static void DrainActiveLuaHashRefreshes()
@@ -2752,7 +2789,6 @@ static void DrainActiveLuaHashRefreshes()
 	unsigned int forcedWithoutRecipient = 0;
 	unsigned int failedAttempts = 0;
 	std::size_t processed = 0;
-	std::array<std::size_t, ABSOLUTE_PLAYER_LIMIT> stagedUpdatesBySlot{};
 	for (std::size_t index = 0; index < pending.size(); ++index)
 	{
 		const int fileID = pending[index];
@@ -2876,7 +2912,7 @@ static void DrainActiveLuaHashRefreshes()
 				slot, ABSOLUTE_PLAYER_LIMIT);
 			if (refresh == HolyLib::LuaPack::Policy::ActiveHashRefreshAction::Native)
 			{
-				if (!SendClientLuaHashUpdate(slot, fileID, sourceHash.data(), sourceHash.size()))
+				if (!SendClientLuaHashUpdate(slot, fileID, sourceHash.data(), sourceHash.size(), true))
 				{
 					failedSlots.set(slot);
 					++failedAttempts;
@@ -2884,7 +2920,6 @@ static void DrainActiveLuaHashRefreshes()
 				}
 				HolyLib::LuaPack::Policy::RememberNativeHash(pendingHashes, fileID, sourceHash);
 				++nativeUpdates;
-				++stagedUpdatesBySlot[slot];
 				updatedFile = true;
 				forcedSlots.reset(slot);
 				failedSlots.reset(slot);
@@ -2892,7 +2927,7 @@ static void DrainActiveLuaHashRefreshes()
 			else if (refresh == HolyLib::LuaPack::Policy::ActiveHashRefreshAction::Canonical)
 			{
 				if (!SendClientLuaHashUpdate(slot, fileID,
-					canonicalHash.data(), canonicalHash.size()))
+					canonicalHash.data(), canonicalHash.size(), true))
 				{
 					failedSlots.set(slot);
 					++failedAttempts;
@@ -2900,7 +2935,6 @@ static void DrainActiveLuaHashRefreshes()
 				}
 				HolyLib::LuaPack::Policy::RememberNativeHash(pendingHashes, fileID, canonicalHash);
 				++canonicalUpdates;
-				++stagedUpdatesBySlot[slot];
 				updatedFile = true;
 				forcedSlots.reset(slot);
 				failedSlots.reset(slot);
@@ -2919,14 +2953,7 @@ static void DrainActiveLuaHashRefreshes()
 		else if (forcedFile && !deferredForBudget && !failedSlots.any())
 			++forcedWithoutRecipient;
 	}
-	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
-	{
-		if (HolyLib::LuaPack::Policy::ShouldRequestActiveLuaScan(
-			stagedUpdatesBySlot[slot]) && RequestActiveClientLuaFiles(slot))
-		{
-			++requestedScans;
-		}
-	}
+	requestedScans = DrainActiveLuaRescans();
 
 	if (!retry.empty())
 	{
@@ -3904,6 +3931,10 @@ void CGModDataPackModule::Think(bool bSimulating)
 			g_pLuaDataPack.PublishEntryHash(fileID, *pEntry);
 		}
 	}
+	// Retried rescans get first use of this frame's space, even with no new hashes.
+	const unsigned int deferredScans = DrainActiveLuaRescans();
+	if (deferredScans != 0)
+		Msg(PROJECT_NAME " - luapack: active hot refresh completed %u deferred client Lua rescan(s)\n", deferredScans);
 	DrainActiveLuaHashRefreshes();
 	ReportActiveLuaHashRefreshAcknowledgements();
 
