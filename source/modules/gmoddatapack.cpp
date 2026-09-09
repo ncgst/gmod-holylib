@@ -2900,20 +2900,10 @@ static void DrainActiveLuaHashRefreshes()
 
 			auto& nativeHashes = g_clientNativeLuaHashes[slot];
 			auto& pendingHashes = g_clientHashUpdatesPending[slot];
-			const bool nativeHashKnown = nativeHashes.find(fileID) != nativeHashes.end();
-			const bool nativeHashMatches = HolyLib::LuaPack::Policy::NativeHashMatches(
-				nativeHashes, fileID, sourceHash);
 			const auto refresh = HolyLib::LuaPack::Policy::SelectActiveHashRefresh(
-				true, fileAction, nativeHashKnown, nativeHashMatches, forceRefresh);
-			const ClientLuaHash* targetHash = nullptr;
-			if (refresh == HolyLib::LuaPack::Policy::ActiveHashRefreshAction::Native)
-				targetHash = &sourceHash;
-			else if (refresh == HolyLib::LuaPack::Policy::ActiveHashRefreshAction::Canonical)
-				targetHash = &canonicalHash;
-			const bool targetHashAlreadyPending = targetHash &&
-				HolyLib::LuaPack::Policy::NativeHashMatches(pendingHashes, fileID, *targetHash);
-			if (!HolyLib::LuaPack::Policy::ShouldStageActiveHashRefresh(
-				refresh, targetHashAlreadyPending, forceRefresh))
+				true, fileAction, nativeHashes, pendingHashes, fileID,
+				sourceHash, canonicalHash, forceRefresh);
+			if (refresh == HolyLib::LuaPack::Policy::ActiveHashRefreshAction::None)
 			{
 				forcedSlots.reset(slot);
 				failedSlots.reset(slot);
@@ -3222,19 +3212,18 @@ static bool SendNativeLuaFile(GModDataPack* pDataPack, int clientIdx, int fileID
 			pendingHash->second == nativeHash;
 		if (requestedHashMatchesNative)
 			++g_activeHashRefreshNativeAcknowledgements;
-		if (!HolyLib::LuaPack::Policy::NativeHashMatches(nativeHashes, fileID, nativeHash))
+		if (!HolyLib::LuaPack::Policy::LatestAdvertisedHashMatches(
+			nativeHashes, pendingHashes, fileID, nativeHash))
 		{
-			// Receipt of this body request proves the client processed the staged hash
-			// and rescan. Only send another ordered update when the requested identity
-			// is stale or came from another publication path.
-			if (!requestedHashMatchesNative &&
-				!SendClientLuaHashUpdate(clientIdx, fileID, nativeHash.data(), nativeHash.size()))
+			// Correct a different pending identity even when an earlier native body
+			// already used this hash. Retire the pending update only after correction.
+			if (!SendClientLuaHashUpdate(clientIdx, fileID, nativeHash.data(), nativeHash.size()))
 			{
 				DisconnectLuaHashFailure(clientIdx, fileName.c_str(), "the native hash update could not be sent");
 				return false;
 			}
-			HolyLib::LuaPack::Policy::RememberNativeHash(nativeHashes, fileID, nativeHash);
 		}
+		HolyLib::LuaPack::Policy::RememberNativeHash(nativeHashes, fileID, nativeHash);
 		if (pendingHash != pendingHashes.end())
 			pendingHashes.erase(pendingHash);
 	}

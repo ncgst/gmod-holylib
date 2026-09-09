@@ -955,30 +955,6 @@ namespace HolyLib::LuaPack::Policy
 			: LuaRefreshPathResolution::InvalidPath;
 	}
 
-	constexpr ActiveHashRefreshAction SelectActiveHashRefresh(bool clientActive,
-		Action fileAction, bool nativeHashKnown, bool nativeHashMatchesCurrent,
-		bool forceRefresh = false)
-	{
-		if (!clientActive)
-			return ActiveHashRefreshAction::None;
-		if (fileAction == Action::Native)
-		{
-			return !forceRefresh && nativeHashMatchesCurrent
-				? ActiveHashRefreshAction::None
-				: ActiveHashRefreshAction::Native;
-		}
-		if (fileAction == Action::CanonicalStub && (nativeHashKnown || forceRefresh))
-			return ActiveHashRefreshAction::Canonical;
-		return ActiveHashRefreshAction::None;
-	}
-
-	constexpr bool ShouldStageActiveHashRefresh(ActiveHashRefreshAction action,
-		bool targetHashAlreadyPending, bool forceRefresh = false)
-	{
-		return action != ActiveHashRefreshAction::None &&
-			(forceRefresh || !targetHashAlreadyPending);
-	}
-
 	constexpr bool ShouldRequestActiveLuaScan(std::size_t stagedHashUpdates)
 	{
 		return stagedHashUpdates != 0;
@@ -1382,6 +1358,43 @@ namespace HolyLib::LuaPack::Policy
 	{
 		auto known = hashes.find(fileID);
 		return known != hashes.end() && known->second == current;
+	}
+
+	template <typename Hash>
+	inline bool LatestAdvertisedHashMatches(const std::unordered_map<int, Hash>& nativeHashes,
+		const std::unordered_map<int, Hash>& pendingHashes, int fileID, const Hash& current)
+	{
+		// A successfully appended update supersedes the remembered body identity,
+		// even before a subsequent file request retires that pending update.
+		auto pending = pendingHashes.find(fileID);
+		return pending != pendingHashes.end() ? pending->second == current
+			: NativeHashMatches(nativeHashes, fileID, current);
+	}
+
+	template <typename Hash>
+	inline ActiveHashRefreshAction SelectActiveHashRefresh(bool clientActive,
+		Action fileAction, const std::unordered_map<int, Hash>& nativeHashes,
+		const std::unordered_map<int, Hash>& pendingHashes, int fileID,
+		const Hash& nativeHash, const Hash& canonicalHash, bool forceRefresh = false)
+	{
+		if (!clientActive)
+			return ActiveHashRefreshAction::None;
+		if (fileAction == Action::Native)
+		{
+			return !forceRefresh && LatestAdvertisedHashMatches(
+				nativeHashes, pendingHashes, fileID, nativeHash)
+				? ActiveHashRefreshAction::None : ActiveHashRefreshAction::Native;
+		}
+		if (fileAction == Action::CanonicalStub)
+		{
+			auto pending = pendingHashes.find(fileID);
+			const bool needsRestore = pending != pendingHashes.end()
+				? pending->second != canonicalHash
+				: nativeHashes.find(fileID) != nativeHashes.end();
+			if (forceRefresh || needsRestore)
+				return ActiveHashRefreshAction::Canonical;
+		}
+		return ActiveHashRefreshAction::None;
 	}
 
 	template <typename Hash>

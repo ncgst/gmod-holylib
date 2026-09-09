@@ -913,31 +913,61 @@ int main()
 	assert(refreshPath.empty());
 	assert(existingRefreshRegistrations.size() == 1);
 	assert(fullPathRefreshRegistrations.size() == 1);
-	assert(SelectActiveHashRefresh(true, Action::Native, false, false) ==
-		ActiveHashRefreshAction::Native);
-	assert(SelectActiveHashRefresh(true, Action::Native, true, false) ==
-		ActiveHashRefreshAction::Native);
-	assert(SelectActiveHashRefresh(true, Action::Native, true, true) ==
-		ActiveHashRefreshAction::None);
-	assert(SelectActiveHashRefresh(true, Action::Native, true, true, true) ==
-		ActiveHashRefreshAction::Native);
-	assert(SelectActiveHashRefresh(true, Action::CanonicalStub, true, false) ==
-		ActiveHashRefreshAction::Canonical);
-	assert(SelectActiveHashRefresh(true, Action::CanonicalStub, false, false) ==
-		ActiveHashRefreshAction::None);
-	assert(SelectActiveHashRefresh(true, Action::CanonicalStub, false, false, true) ==
-		ActiveHashRefreshAction::Canonical);
-	assert(SelectActiveHashRefresh(false, Action::Native, false, false) ==
-		ActiveHashRefreshAction::None);
-	assert(SelectActiveHashRefresh(false, Action::Native, true, true, true) ==
-		ActiveHashRefreshAction::None);
-	assert(SelectActiveHashRefresh(true, Action::Reject, true, false) ==
-		ActiveHashRefreshAction::None);
-	assert(ShouldStageActiveHashRefresh(ActiveHashRefreshAction::Native, false));
-	assert(!ShouldStageActiveHashRefresh(ActiveHashRefreshAction::Native, true));
-	assert(ShouldStageActiveHashRefresh(ActiveHashRefreshAction::Native, true, true));
-	assert(!ShouldStageActiveHashRefresh(ActiveHashRefreshAction::None, false));
-	assert(!ShouldStageActiveHashRefresh(ActiveHashRefreshAction::None, true, true));
+	{
+		std::unordered_map<int, TestHash> remembered;
+		std::unordered_map<int, TestHash> pending;
+		const TestHash canonical{0, 0, 0, 0};
+		const int fileID = 42;
+		assert(SelectActiveHashRefresh(true, Action::Native, remembered, pending,
+			fileID, hotfixOne, canonical) == ActiveHashRefreshAction::Native);
+		RememberNativeHash(remembered, fileID, hotfixOne);
+		assert(SelectActiveHashRefresh(true, Action::Native, remembered, pending,
+			fileID, hotfixOne, canonical) == ActiveHashRefreshAction::None);
+		assert(SelectActiveHashRefresh(true, Action::Native, remembered, pending,
+			fileID, hotfixTwo, canonical) == ActiveHashRefreshAction::Native);
+		RememberNativeHash(pending, fileID, hotfixTwo);
+		assert(SelectActiveHashRefresh(true, Action::Native, remembered, pending,
+			fileID, hotfixTwo, canonical) == ActiveHashRefreshAction::None);
+
+		// H1 -> pending H2 -> H1 must restore without forced recovery. The body
+		// sender uses this same latest-advertisement comparison before retiring H2.
+		assert(!LatestAdvertisedHashMatches(remembered, pending, fileID, hotfixOne));
+		assert(SelectActiveHashRefresh(true, Action::Native, remembered, pending,
+			fileID, hotfixOne, canonical) == ActiveHashRefreshAction::Native);
+		RememberNativeHash(pending, fileID, hotfixOne);
+		assert(LatestAdvertisedHashMatches(remembered, pending, fileID, hotfixOne));
+		assert(SelectActiveHashRefresh(true, Action::Native, remembered, pending,
+			fileID, hotfixOne, canonical) == ActiveHashRefreshAction::None);
+		assert(SelectActiveHashRefresh(true, Action::Native, remembered, pending,
+			fileID, hotfixOne, canonical, true) == ActiveHashRefreshAction::Native);
+
+		// A canonical baseline has no remembered native marker. A staged native
+		// delta still requires canonical restoration before any body request.
+		remembered.clear();
+		pending.clear();
+		assert(SelectActiveHashRefresh(true, Action::CanonicalStub, remembered, pending,
+			fileID, hotfixOne, canonical) == ActiveHashRefreshAction::None);
+		RememberNativeHash(pending, fileID, hotfixTwo);
+		assert(SelectActiveHashRefresh(true, Action::CanonicalStub, remembered, pending,
+			fileID, hotfixOne, canonical) == ActiveHashRefreshAction::Canonical);
+		RememberNativeHash(pending, fileID, canonical);
+		assert(SelectActiveHashRefresh(true, Action::CanonicalStub, remembered, pending,
+			fileID, hotfixOne, canonical) == ActiveHashRefreshAction::None);
+		assert(SelectActiveHashRefresh(true, Action::CanonicalStub, remembered, pending,
+			fileID, hotfixOne, canonical, true) == ActiveHashRefreshAction::Canonical);
+
+		pending.clear();
+		RememberNativeHash(pending, fileID + 1, hotfixTwo);
+		assert(SelectActiveHashRefresh(true, Action::CanonicalStub, remembered, pending,
+			fileID, hotfixOne, canonical) == ActiveHashRefreshAction::None);
+		RememberNativeHash(remembered, fileID, hotfixOne);
+		assert(SelectActiveHashRefresh(true, Action::CanonicalStub, remembered, pending,
+			fileID, hotfixOne, canonical) == ActiveHashRefreshAction::Canonical);
+		assert(SelectActiveHashRefresh(false, Action::Native, remembered, pending,
+			fileID, hotfixTwo, canonical, true) == ActiveHashRefreshAction::None);
+		assert(SelectActiveHashRefresh(true, Action::Reject, remembered, pending,
+			fileID, hotfixTwo, canonical, true) == ActiveHashRefreshAction::None);
+	}
 	assert(!ShouldRequestActiveLuaScan(0));
 	assert(ShouldRequestActiveLuaScan(1));
 	assert(ShouldRequestActiveLuaScan(64));
