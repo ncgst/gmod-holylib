@@ -663,6 +663,21 @@ namespace HolyLib::LuaPack::Policy
 		return optedOut ? Lane::NativeOptOut : (required ? Lane::Required : Lane::NativeRescue);
 	}
 
+	template <typename ClientPointer>
+	struct ResolvedClientLane
+	{
+		ClientPointer client;
+		Lane lane;
+	};
+
+	template <typename ClientLookup>
+	auto ResolveClientLane(int slot, bool required, bool allowOptOut, ClientLookup lookup)
+	{
+		auto* client = lookup(slot);
+		return ResolvedClientLane<decltype(client)>{client, ResolveLane(required, allowOptOut,
+			client ? client->GetUserSetting("tv_nochat") : nullptr)};
+	}
+
 	constexpr bool CanConsumeRequiredRecovery(bool recoveryEnabled,
 		bool resolvedIdentity)
 	{

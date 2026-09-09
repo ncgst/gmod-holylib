@@ -1,4 +1,5 @@
 #include "modules/gmoddatapack_luapack_policy.h"
+#include "client_slot_lookup.h"
 
 #include <cassert>
 #include <array>
@@ -1199,6 +1200,64 @@ int main()
 	assert(!RegisterExactKey(exactKeys, "0123456789abcdef"));
 
 	// Opt-out is exact and remains native for the whole connection.
+	{
+		struct Connection
+		{
+			int m_nClientSlot;
+			const char* tvNoChat;
+			std::uint64_t account;
+			const char* GetUserSetting(const char* name)
+			{
+				assert(std::strcmp(name, "tv_nochat") == 0);
+				return tvNoChat;
+			}
+		};
+		struct PhysicalServer
+		{
+			std::vector<Connection*> clients;
+			int GetClientCount() const { return static_cast<int>(clients.size()); }
+			Connection* GetClient(int index)
+			{
+				assert(index >= 0 && index < GetClientCount());
+				return clients[static_cast<std::size_t>(index)];
+			}
+		};
+		Connection physical{0, "", 11};
+		Connection otherParked{129, "", 22};
+		Connection parked{128, "no_gluapack", 33};
+		PhysicalServer server{{&physical}};
+		std::vector<Connection*> queue{nullptr, &otherParked, &parked};
+		auto lookup = [&](int slot) {
+			// This is the collection lookup used by Gameserver_GetClientBySlot.
+			return Util::FindClientBySlot<Connection>(slot, &server, queue);
+		};
+		assert(parked.m_nClientSlot >= server.GetClientCount());
+		assert(!Util::FindPhysicalClientBySlot<Connection>(128, &server));
+		const auto selected = ResolveClientLane(128, true, true, lookup);
+		assert(selected.client == &parked && selected.client->account == 33);
+		assert(selected.lane == Lane::NativeOptOut);
+		assert(SelectBaseline(selected.lane, true, BaseAvailability::Ready) == Action::Native);
+		assert(SelectBaseline(selected.lane, false, BaseAvailability::Missing) == Action::Native);
+		assert(ResolveClientLane(0, true, true, lookup).client == &physical);
+		assert(ResolveClientLane(0, true, true, lookup).lane == Lane::Required);
+		assert(ResolveClientLane(129, true, true, lookup).client == &otherParked);
+		assert(ResolveClientLane(128, true, false, lookup).lane == Lane::Required);
+		parked.tvNoChat = "no_gluapack ";
+		assert(ResolveClientLane(128, true, true, lookup).lane == Lane::Required);
+		assert(!lookup(-1) && !lookup(127) && !lookup(130));
+		assert(Util::FindClientBySlot<Connection>(128,
+			static_cast<PhysicalServer*>(nullptr), queue) == &parked);
+
+		// A physical array entry with a different actual slot must not shadow the
+		// connection owning that slot in the queue, or supply its identity/userinfo.
+		physical.m_nClientSlot = 7;
+		parked.m_nClientSlot = 0;
+		parked.tvNoChat = "no_gluapack";
+		const auto replacement = ResolveClientLane(0, true, true, lookup);
+		assert(replacement.client == &parked && replacement.lane == Lane::NativeOptOut);
+		queue.clear();
+		assert(!lookup(0));
+	}
 	assert(ResolveLane(true, true, "no_gluapack") == Lane::NativeOptOut);
 	assert(ResolveLane(true, true, "NO_GLUAPACK") == Lane::Required);
 	assert(ResolveLane(true, true, "no_gluapack ") == Lane::Required);

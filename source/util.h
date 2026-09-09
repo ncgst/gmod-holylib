@@ -281,6 +281,8 @@ namespace Util
 	extern CBaseClient* GetClientByUserID(int userID);
 	extern CBaseClient* GetClientByPlayer(const CBasePlayer* ply);
 	extern CBaseClient* GetClientByIndex(int index);
+	// Includes parked queue connections and validates the object's actual slot.
+	extern CBaseClient* GetClientBySlot(int slot);
 	extern std::vector<CBaseClient*> GetClients();
 	extern CBasePlayer* GetPlayerByClient(CBaseClient* client);
 	

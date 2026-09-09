@@ -819,9 +819,8 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		client.joinNativeBytes += nativeSourceBytes;
 	}
 
-	static bool BindResolvedIdentity(int slot, ClientPin& client)
+	static bool BindResolvedIdentity(CBaseClient* baseClient, ClientPin& client)
 	{
-		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
 		if (!baseClient || !baseClient->m_SteamID.IsValid())
 			return false;
 
@@ -836,8 +835,8 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 
 	static bool BindAuthenticatedIdentity(int slot, ClientPin& client)
 	{
-		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
-		if (!baseClient || !BindResolvedIdentity(slot, client) || !baseClient->IsFullyAuthenticated())
+		CBaseClient* baseClient = Util::GetClientBySlot(slot);
+		if (!baseClient || !BindResolvedIdentity(baseClient, client) || !baseClient->IsFullyAuthenticated())
 			return false;
 
 		client.authenticatedIdentity = true;
@@ -855,7 +854,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		if (!IsEnabled())
 			return;
 
-		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		CBaseClient* baseClient = Util::GetClientBySlot(slot);
 		const char* networkID = baseClient ? baseClient->GetNetworkIDString() : nullptr;
 		if (networkID && networkID[0] != '\0' &&
 			V_stricmp(networkID, "BOT") != 0 && V_stricmp(networkID, "UNKNOWN") != 0)
@@ -866,7 +865,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 
 	static const char* BeginPendingRecoveryBaseline(int slot)
 	{
-		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		CBaseClient* baseClient = Util::GetClientBySlot(slot);
 		const std::uint64_t account = baseClient && baseClient->m_SteamID.IsValid()
 			? baseClient->m_SteamID.ConvertToUint64() : 0;
 		const bool authenticated = baseClient && baseClient->IsFullyAuthenticated();
@@ -912,7 +911,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		// atomically. No old-join request can observe this new native lane.
 		StartClientEpoch(slot);
 		ClientPin& recovery = state.clients[slot];
-		if (!BindResolvedIdentity(slot, recovery) || recovery.steamID64 != expectedAccount ||
+		if (!BindResolvedIdentity(baseClient, recovery) || recovery.steamID64 != expectedAccount ||
 			!baseClient->IsFullyAuthenticated())
 		{
 			return "SteamID64 ownership changed while the engine reconnect entered ServerInfo";
@@ -978,7 +977,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			return false;
 
 		ClientPin& client = state.clients[slot];
-		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		CBaseClient* baseClient = Util::GetClientBySlot(slot);
 		const std::uint64_t account = baseClient && baseClient->m_SteamID.IsValid()
 			? baseClient->m_SteamID.ConvertToUint64() : 0;
 		const bool identityMatches = account != 0 && client.resolvedIdentity &&
@@ -999,7 +998,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 				continue;
 
 			ClientPin& client = state.clients[slot];
-			CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+			CBaseClient* baseClient = Util::GetClientBySlot(slot);
 			const std::uint64_t account = baseClient && baseClient->m_SteamID.IsValid()
 				? baseClient->m_SteamID.ConvertToUint64() : 0;
 			const std::uint64_t expectedAccount = handoff.Account();
@@ -1019,7 +1018,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 					baseClient->Reconnect();
 					// Reconnect may synchronously run disconnect/connect callbacks. Re-resolve the
 					// slot instead of dereferencing the pre-reconnect client pointer afterward.
-					if (CBaseClient* restarted = Util::server ? Util::GetClientByIndex(slot) : nullptr)
+					if (CBaseClient* restarted = Util::GetClientBySlot(slot))
 					{
 						Msg(PROJECT_NAME " - luapack: engine reconnect returned for slot %i (%llu): signon=%i send_server_info=%s channel=%s authenticated=%s\n",
 							slot, static_cast<unsigned long long>(account),
@@ -1093,10 +1092,10 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			return;
 
 		const Config& currentConfig = GetConfig();
-		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
-		const char* optOutValue = baseClient ? baseClient->GetUserSetting("tv_nochat") : nullptr;
-		const Policy::Lane lane = Policy::ResolveLane(currentConfig.requiredStubbing,
-			currentConfig.allowOptOut, optOutValue);
+		const auto resolved = Policy::ResolveClientLane(slot, currentConfig.requiredStubbing,
+			currentConfig.allowOptOut, Util::GetClientBySlot);
+		CBaseClient* baseClient = resolved.client;
+		const Policy::Lane lane = resolved.lane;
 		client.optOut = lane == Policy::Lane::NativeOptOut;
 		client.requiredLane = lane == Policy::Lane::Required;
 		client.nativeLane = lane != Policy::Lane::Required;
@@ -1108,7 +1107,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			// identity when available so a successful manual recovery can heal a pending
 			// automatic latch, but never reject opt-out for an authentication race.
 			if (client.optOut)
-				BindResolvedIdentity(slot, client);
+				BindResolvedIdentity(baseClient, client);
 			MarkFallback(client);
 			if (client.optOut)
 				Msg(PROJECT_NAME " - luapack: client slot %i selected native delivery with tv_nochat=no_gluapack\n", slot);
@@ -1117,7 +1116,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			return;
 		}
 
-		const bool resolvedIdentity = BindResolvedIdentity(slot, client);
+		const bool resolvedIdentity = BindResolvedIdentity(baseClient, client);
 		if (Policy::CanConsumeRequiredRecovery(currentConfig.requiredRecovery,
 			resolvedIdentity))
 		{
@@ -2408,7 +2407,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 
 		Warning(PROJECT_NAME " - luapack: disconnecting required-pack client slot %i: %s\n",
 			slot, failure ? failure : "unspecified required-pack failure");
-		CBaseClient* baseClient = Util::server ? Util::GetClientByIndex(slot) : nullptr;
+		CBaseClient* baseClient = Util::GetClientBySlot(slot);
 		if (baseClient)
 		{
 			baseClient->Disconnect("%s",

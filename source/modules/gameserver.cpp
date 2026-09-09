@@ -1,4 +1,5 @@
 #include "module.h"
+#include "client_slot_lookup.h"
 #include "LuaInterface.h"
 #include "lua.h"
 #include "detours.h"
@@ -81,23 +82,7 @@ static Symbols::CNetChan_SendNetMsg g_pEngineCNetChanSendNetMsg = nullptr;
 // Client-list mutation and Lua delivery both run on the main thread.
 CBaseClient* Gameserver_GetClientBySlot(int slot)
 {
-	if (slot < 0)
-		return nullptr;
-
-	if (Util::server && slot < Util::server->GetClientCount())
-	{
-		CBaseClient* client = static_cast<CBaseClient*>(Util::server->GetClient(slot));
-		if (client && client->m_nClientSlot == slot)
-			return client;
-	}
-
-	for (CGameClient* queueClient : g_pQueueClients)
-	{
-		if (queueClient && queueClient->m_nClientSlot == slot)
-			return static_cast<CBaseClient*>(queueClient);
-	}
-
-	return nullptr;
+	return Util::FindClientBySlot<CBaseClient>(slot, Util::server, g_pQueueClients);
 }
 
 /*

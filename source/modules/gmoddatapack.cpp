@@ -80,7 +80,6 @@ IModule* pGModDataPackModule = &g_pGModDataPackModule;
 
 #if MODULE_EXISTS_GAMESERVER
 extern bool Gameserver_HasExactGModSender();
-extern CBaseClient* Gameserver_GetClientBySlot(int slot);
 #endif
 
 // Linux connections begin from globally canonical hashes. Remember the exact
@@ -2185,11 +2184,7 @@ static bool hook_CBaseClient_SendServerInfo(CBaseClient* client)
 
 static CBaseClient* ResolveQueuedLuaPackServerInfoClient(int slot)
 {
-#if MODULE_EXISTS_GAMESERVER
-	return Gameserver_GetClientBySlot(slot);
-#else
-	return Util::server ? Util::GetClientByIndex(slot) : nullptr;
-#endif
+	return Util::GetClientBySlot(slot);
 }
 
 static void DrainQueuedLuaPackServerInfos()
@@ -2533,12 +2528,7 @@ static HolyLib::LuaPack::Policy::RequiredStubDrainAction PrepareCanonicalLuaStub
 		"LuaPack reliable capacity math must match the engine message type width");
 	channel = nullptr;
 
-	CBaseClient* client = nullptr;
-#if MODULE_EXISTS_GAMESERVER
-	client = Gameserver_GetClientBySlot(clientIdx);
-#else
-	client = Util::server ? Util::GetClientByIndex(clientIdx) : nullptr;
-#endif
+	CBaseClient* client = Util::GetClientBySlot(clientIdx);
 	INetChannel* engineChannel = client ? client->GetNetChannel() : nullptr;
 	CNetChan* candidate = static_cast<CNetChan*>(engineChannel);
 	const bool clientConnected = client && engineChannel && candidate &&
@@ -2612,11 +2602,7 @@ static void SendOriginalLuaFile(GModDataPack* pDataPack, int clientIdx, int file
 
 static CBaseClient* ResolveLuaPackClientBySlot(int clientIdx)
 {
-#if MODULE_EXISTS_GAMESERVER
-	return Gameserver_GetClientBySlot(clientIdx);
-#else
-	return Util::server ? Util::GetClientByIndex(clientIdx) : nullptr;
-#endif
+	return Util::GetClientBySlot(clientIdx);
 }
 
 static HolyLib::LuaPack::Policy::ActiveLuaRescanOwner CaptureActiveLuaRescanOwner(CBaseClient* client)
@@ -3065,12 +3051,7 @@ static void DisconnectLuaHashFailure(int clientIdx, const char* fileName, const 
 {
 	Warning(PROJECT_NAME " - luapack: disconnecting client slot %i because %s for %s\n",
 		clientIdx, failure ? failure : "Lua hash identity failed", fileName ? fileName : "?");
-	CBaseClient* client = nullptr;
-#if MODULE_EXISTS_GAMESERVER
-	client = Gameserver_GetClientBySlot(clientIdx);
-#else
-	client = Util::server ? Util::GetClientByIndex(clientIdx) : nullptr;
-#endif
+	CBaseClient* client = Util::GetClientBySlot(clientIdx);
 	if (client)
 		client->Disconnect("Lua delivery identity failed for %s", fileName ? fileName : "an unknown file");
 }
@@ -3334,7 +3315,7 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 		{
 			auto& nativeHashes = g_clientNativeLuaHashes[clientIdx];
 			auto nativeHash = nativeHashes.find(fileID);
-			CBaseClient* client = Util::server ? Util::GetClientByIndex(clientIdx) : nullptr;
+			CBaseClient* client = Util::GetClientBySlot(clientIdx);
 			const bool clientActive = client && client->IsActive();
 			auto& pendingHashes = g_clientHashUpdatesPending[clientIdx];
 			auto pendingHash = pendingHashes.find(fileID);

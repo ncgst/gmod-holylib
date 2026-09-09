@@ -98,6 +98,8 @@ A player who needs native Lua must set this Garry's Mod launch option and restar
 
 Only the exact value `no_gluapack` opts out, and `holylib_gmoddatapack_luapack_allow_optout 0` disables the exception. The lane is fixed before Requesting Lua and a late READY cannot move an opt-out connection onto stubs.
 
+Lane selection resolves the actual connection by slot, including parked clients outside the physical server array. Userinfo and identity binding use that same connection. Recovery, refresh delivery, and disconnect lookup also include the parked collection.
+
 Source's `downloadables` table is global, not per connection. Therefore an opt-out client may still download the globally registered base object during the resource phase even though its Lua delivery is wholly native. Avoiding that unused HTTP transfer would conflict with keeping the base engine-downloadable for required clients.
 
 ## FastDL layout
@@ -130,6 +132,8 @@ The slow-baseline telemetry separates `published`, `cached`, and `computed` iden
 12. Restore server configuration, binary, Lua files, CDN test object state, and client launch/cache state; verify no test players or test artifacts remain.
 
 Explicit disk refresh also updates the existing engine Lua-file cache and invalidates its compressed payload before publishing the captured source. This keeps the later native hash and body on the refreshed revision. A registration whose engine Lua-file cache is unavailable returns `not_eligible`; it is not reported as captured. Updating this cache does not establish that a connected client requested or executed the revision.
+
+Active refresh compares the desired identity against the latest successfully staged per-client hash before the remembered native body hash. Returning from H1 through a pending H2 to H1, or from canonical through a pending native delta to canonical, therefore stages the restoration without explicit forced recovery. A native body response also corrects a different pending identity before retiring it.
 
 ## Kill switch
 
