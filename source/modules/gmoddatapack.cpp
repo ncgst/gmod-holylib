@@ -2337,6 +2337,9 @@ static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
 		fileRelPath, fileName, fileID, registeredName);
 	if (resolved != LuaPackDiskRefreshResult::Resolved)
 		return resolved;
+	GarrysMod::Lua::LuaFile* nativeFile = Lua::GetShared()->GetCache(registeredName);
+	if (!nativeFile)
+		return LuaPackDiskRefreshResult::NotEligible;
 
 	std::string source;
 	const bool sourceReadable = ReadLuaAutoRefreshSource(
@@ -2352,6 +2355,18 @@ static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
 	}
 	const bool captureAndRescan = HolyLib::LuaPack::Policy::ShouldCaptureAutoRefresh(
 		true, true, true, sourceReadable, sourceChanged);
+	auto refreshNativeSource = [&]() {
+		// SendOriginalLuaFile reads this separate engine cache, including its lazy
+		// compressed payload. Keep it on the captured revision before advertising
+		// that revision or a later native request would restore and send old bytes.
+		if (nativeFile->contents != source)
+		{
+			nativeFile->SetContents(source);
+			// Retain engine-owned storage; the native sender rebuilds an empty payload.
+			nativeFile->compressed.SetWritten(0);
+			nativeFile->compressed.SetPos(0);
+		}
+	};
 	if (!captureAndRescan)
 	{
 		if (!sourceReadable)
@@ -2363,6 +2378,7 @@ static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
 		if (HolyLib::LuaPack::Policy::ShouldQueueExplicitRefreshRecovery(
 			recoverUnchanged, true, true, true, sourceReadable, sourceChanged))
 		{
+			refreshNativeSource();
 			g_pLuaDataPack.AddFileContents(registeredName, source, true);
 			Msg(PROJECT_NAME " - luapack: queued explicit refresh recovery for existing client Lua registration \"%s\"\n",
 				registeredName.c_str());
@@ -2371,6 +2387,7 @@ static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
 		return LuaPackDiskRefreshResult::Unchanged;
 	}
 
+	refreshNativeSource();
 	HolyLib::LuaPack::CaptureFileContents(registeredName, source);
 	// A current server-side shared cache does not prove that a connected client
 	// received or executed the changed bytes. If the trampoline already reached

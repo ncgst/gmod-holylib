@@ -129,6 +129,8 @@ The slow-baseline telemetry separates `published`, `cached`, and `computed` iden
 11. Exercise the master kill switch. Confirm an immediate request repairs its stale registration before send, the next server frame reprocesses every remaining registered path from canonical to native identity, and subsequent requests use matching ordinary native hashes and bodies.
 12. Restore server configuration, binary, Lua files, CDN test object state, and client launch/cache state; verify no test players or test artifacts remain.
 
+Explicit disk refresh also updates the existing engine Lua-file cache and invalidates its compressed payload before publishing the captured source. This keeps the later native hash and body on the refreshed revision. A registration whose engine Lua-file cache is unavailable returns `not_eligible`; it is not reported as captured. Updating this cache does not establish that a connected client requested or executed the revision.
+
 ## Kill switch
 
 Run this from server console/RCON, or as a superadmin player:
