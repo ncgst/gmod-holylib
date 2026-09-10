@@ -14,6 +14,7 @@
 #include "modules/autorefresh_shared.h"
 #include "networkstringtable.h"
 #include "networkstringtableitem.h"
+#include "irecipientfilter.h"
 #include "picosha2/picosha2.h"
 #include <algorithm>
 #include <array>
@@ -22,6 +23,7 @@
 #include <limits>
 #include <deque>
 #include <unordered_map>
+#include <memory>
 
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
@@ -88,10 +90,34 @@ extern bool Gameserver_HasExactGModSender();
 using ClientLuaHash = std::array<unsigned char, 32>;
 static std::array<std::unordered_map<int, ClientLuaHash>, ABSOLUTE_PLAYER_LIMIT> g_clientNativeLuaHashes;
 static std::array<std::unordered_map<int, ClientLuaHash>, ABSOLUTE_PLAYER_LIMIT> g_clientHashUpdatesPending;
-static std::array<HolyLib::LuaPack::Policy::PendingActiveLuaRescan, ABSOLUTE_PLAYER_LIMIT>
-	g_pendingActiveLuaRescans;
+using ActiveLuaRefreshTargets = HolyLib::LuaPack::Policy::ActiveLuaRefreshTargets<ABSOLUTE_PLAYER_LIMIT>;
+static HolyLib::LuaPack::Policy::ActiveLuaRefreshOwner CaptureActiveLuaRefreshOwner(CBaseClient* client)
+{
+	if (!client || !client->IsActive() || !client->GetNetChannel())
+		return {};
+	return {client, client->GetNetChannel(), client->GetUserID(), client->m_clientChallenge};
+}
 static unsigned int g_activeHashRefreshNativeAcknowledgements = 0;
 static unsigned int g_activeHashRefreshCanonicalAcknowledgements = 0;
+#if defined(SYSTEM_LINUX)
+static Detouring::Hook detour_CVEngineServer_GMOD_SendToClientFilter;
+static thread_local const std::string* g_engineLuaRefreshName = nullptr;
+// Engine Linux x64 Bootil uses size_t metadata, unlike our bundled uint32_t
+// Buffer. Never call bundled accessors or destructors on the engine allocation.
+struct NativeLuaBufferAccess
+{
+	using ReadSize = std::size_t (*)(const void*);
+	using ReadBase = void* (*)(const void*, std::size_t);
+	using SetWritten = void (*)(void*, std::size_t);
+	using SetPosition = bool (*)(void*, std::size_t);
+	ReadSize size = nullptr, position = nullptr, written = nullptr;
+	ReadBase base = nullptr;
+	SetWritten setWritten = nullptr;
+	SetPosition setPosition = nullptr;
+	bool Ready() const { return size && position && written && base && setWritten && setPosition; }
+};
+static NativeLuaBufferAccess g_nativeLuaBuffer;
+#endif
 static constexpr double ACTIVE_HASH_REFRESH_RETRY_DELAY_SECONDS = 0.25;
 static constexpr std::size_t MAX_TRACKED_LUA_FILES = 1u << 13u;
 using PinnedCanonicalFiles = HolyLib::LuaPack::Policy::PinnedCanonicalFileSet<MAX_TRACKED_LUA_FILES>;
@@ -329,7 +355,6 @@ static void ClearClientLuaDeliveryState(int slot)
 		ClearQueuedLuaPackServerInfo(slot);
 		g_clientNativeLuaHashes[slot].clear();
 		g_clientHashUpdatesPending[slot].clear();
-		g_pendingActiveLuaRescans[slot].Reset();
 		ClearClientPinnedRequiredDeliveryState(slot);
 	}
 }
@@ -1129,6 +1154,9 @@ public:
 			sourceContent = "";
 			content = "";
 			compressed.Clear();
+			activeRefreshCompressed.reset();
+			activeRefreshRequested = false;
+			activeRefreshFailed = false;
 			processed = false;
 			hashPublished = false;
 			sourceHashReady = false;
@@ -1144,6 +1172,11 @@ public:
 		std::string sourceContent = "";
 		std::string content = "";
 		Bootil::AutoBuffer compressed;
+		// Built on demand by the worker from immutable captured source. This is
+		// HolyLib-owned storage; never copy or free the engine LuaFile's buffer.
+		std::shared_ptr<const Bootil::AutoBuffer> activeRefreshCompressed;
+		bool activeRefreshRequested = false;
+		bool activeRefreshFailed = false;
 		ClientLuaHash sourceHash{};
 		ClientLuaHash contentHash{};
 		std::shared_mutex mutex; // Per entry instead of a global mutex to avoid blocking the main thread for other entries while compressing
@@ -1160,9 +1193,29 @@ public:
 		bool forceActiveHashRefreshPending = false;
 	};
 
-	void QueueActiveHashRefresh(int fileID, bool forceRefresh = false)
+	void QueueActiveHashRefresh(int fileID, bool forceRefresh = false,
+		const ActiveLuaRefreshTargets* selectedTargets = nullptr)
 	{
+		::ActiveLuaRefreshTargets targets;
+		if (selectedTargets)
+			targets = *selectedTargets;
+		else
+			for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
+				targets.Capture(slot, CaptureActiveLuaRefreshOwner(Util::GetClientBySlot(slot)));
 		std::lock_guard<std::mutex> lock(m_pActiveHashRefreshQueueMutex);
+		if (targets.Empty())
+		{
+			if (selectedTargets)
+			{
+				m_pActiveHashRefreshTargets.erase(fileID);
+				m_pForcedActiveHashRefreshes.erase(fileID);
+				m_pActiveHashRefreshNextSlots.erase(fileID);
+				m_pActiveHashRefreshFailedSlots.erase(fileID);
+				m_pActiveHashRefreshRetryAfter.erase(fileID);
+			}
+			return;
+		}
+		m_pActiveHashRefreshTargets[fileID] = std::move(targets);
 		m_pActiveHashRefreshQueue.push_back(fileID);
 		// A newer publication supersedes any partially drained retry state. Restart
 		// from the first slot so every eligible client is evaluated against the new
@@ -1315,6 +1368,9 @@ public:
 		// ordered canonical restoration.
 		InvalidatePinnedCanonicalFileForAllClients(fileID);
 		pEntry.compressed.Clear();
+		pEntry.activeRefreshCompressed.reset();
+		pEntry.activeRefreshRequested = false;
+		pEntry.activeRefreshFailed = false;
 		pEntry.hasSourceContent = true;
 		pEntry.sourceContent = content;
 		pEntry.content = HolyLib::LuaPack::PrepareVanillaFile(fileName, content);
@@ -1432,6 +1488,51 @@ public:
 		return bSuccess;
 	}
 
+	std::shared_ptr<const Bootil::AutoBuffer> ActiveRefreshPayload(int fileID, bool& failed)
+	{
+		LuaPackEntry* entry = GetPackEntry(fileID);
+		if (!entry) { failed = true; return {}; }
+		std::lock_guard<std::shared_mutex> lock(entry->mutex);
+		failed = entry->activeRefreshFailed;
+		if (entry->activeRefreshCompressed || failed)
+			return entry->activeRefreshCompressed;
+		if (!entry->activeRefreshRequested)
+		{
+			entry->activeRefreshRequested = true;
+			std::lock_guard<std::mutex> queueLock(m_pCompressQueueMutex);
+			m_pCompressQueue.push_back(fileID);
+		}
+		return {};
+	}
+
+	void CompressActiveRefreshPayload(LuaPackEntry* entry)
+	{
+		std::string source;
+		ClientLuaHash hash{};
+		{
+			std::shared_lock<std::shared_mutex> lock(entry->mutex);
+			if (!entry->activeRefreshRequested || !entry->hasSourceContent || !entry->sourceHashReady)
+				return;
+			source = entry->sourceContent;
+			hash = entry->sourceHash;
+		}
+		// Compression does not hold the entry lock, so a newer disk publication
+		// cannot stall behind it. A stale result is discarded under the lock below.
+		auto payload = std::make_shared<Bootil::AutoBuffer>();
+		payload->Write(hash.data(), hash.size());
+		const bool success = source.size() < (std::numeric_limits<unsigned int>::max)() &&
+			Bootil::Compression::LZMA::Compress(source.c_str(), source.size() + 1, *payload, 9) &&
+			payload->GetWritten() <= HolyLib::LuaPack::Policy::ActiveLuaRefreshMaximumPayloadBytes;
+		std::lock_guard<std::shared_mutex> lock(entry->mutex);
+		if (!entry->activeRefreshRequested || !entry->sourceHashReady ||
+			entry->sourceHash != hash || entry->sourceContent != source)
+			return;
+		entry->activeRefreshRequested = false;
+		entry->activeRefreshFailed = !success;
+		if (success)
+			entry->activeRefreshCompressed = std::move(payload);
+	}
+
 	inline LuaPackEntry* GetPackEntry(int fileID)
 	{
 		if (fileID < 0 || fileID >= MAX_LUA_FILES)
@@ -1533,6 +1634,7 @@ public:
 	std::vector<int> m_pStringTableUpdateQueue;
 	std::mutex m_pStringTableUpdateQueueMutex;
 	std::vector<int> m_pActiveHashRefreshQueue;
+	std::unordered_map<int, ActiveLuaRefreshTargets> m_pActiveHashRefreshTargets;
 	// Explicit recovery bypasses stale delivery bookkeeping exactly once per slot;
 	// budget or send retries retain only the slots that did not receive an update.
 	std::unordered_map<int, std::bitset<ABSOLUTE_PLAYER_LIMIT>> m_pForcedActiveHashRefreshes;
@@ -1609,16 +1711,15 @@ static SIMPLETHREAD_RETURNVALUE WorkerThread(void* pData)
 				break;
 
 			LuaDataPack::LuaPackEntry* pEntry = &g_pLuaDataPack.m_pLuaFileCache[fileID];
-			std::lock_guard<std::shared_mutex> lock(pEntry->mutex);
-			if (!pEntry->IsContentReady())
-				continue;
-			// Source identity readiness is independent from compressed-body readiness.
-			// Repair it before treating an already-compressed entry as terminal.
-			g_pLuaDataPack.EnsureSourceHash(pEntry);
-			if (pEntry->IsReady()) // Already done? Either we did it, or the main thread.
-				continue;
-
-			g_pLuaDataPack.CompressFile(pEntry, fileID);
+			{
+				std::lock_guard<std::shared_mutex> lock(pEntry->mutex);
+				if (!pEntry->IsContentReady())
+					continue;
+				g_pLuaDataPack.EnsureSourceHash(pEntry);
+				if (!pEntry->IsReady())
+					g_pLuaDataPack.CompressFile(pEntry, fileID);
+			}
+			g_pLuaDataPack.CompressActiveRefreshPayload(pEntry);
 		}
 	}
 
@@ -1669,6 +1770,7 @@ void LuaDataPack::Shutdown()
 	{
 		std::lock_guard<std::mutex> lock(m_pActiveHashRefreshQueueMutex);
 		m_pActiveHashRefreshQueue.clear();
+		m_pActiveHashRefreshTargets.clear();
 		m_pForcedActiveHashRefreshes.clear();
 		m_pActiveHashRefreshNextSlots.clear();
 		m_pActiveHashRefreshFailedSlots.clear();
@@ -2284,7 +2386,7 @@ enum class LuaPackDiskRefreshResult
 	Resolved,
 	Unreadable,
 	Unchanged,
-	RescanQueued,
+	RefreshQueued,
 	Captured,
 };
 
@@ -2348,7 +2450,7 @@ static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
 			sourceChanged = !entry->hasSourceContent || entry->sourceContent != source;
 		}
 	}
-	const bool captureAndRescan = HolyLib::LuaPack::Policy::ShouldCaptureAutoRefresh(
+	const bool captureAndRefresh = HolyLib::LuaPack::Policy::ShouldCaptureAutoRefresh(
 		true, true, true, sourceReadable, sourceChanged);
 	auto refreshNativeSource = [&]() {
 		// SendOriginalLuaFile reads this separate engine cache, including its lazy
@@ -2358,11 +2460,13 @@ static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
 		{
 			nativeFile->SetContents(source);
 			// Retain engine-owned storage; the native sender rebuilds an empty payload.
-			nativeFile->compressed.SetWritten(0);
-			nativeFile->compressed.SetPos(0);
+#if defined(SYSTEM_LINUX)
+			g_nativeLuaBuffer.setWritten(&nativeFile->compressed, 0);
+			g_nativeLuaBuffer.setPosition(&nativeFile->compressed, 0);
+#endif
 		}
 	};
-	if (!captureAndRescan)
+	if (!captureAndRefresh)
 	{
 		if (!sourceReadable)
 		{
@@ -2377,7 +2481,7 @@ static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
 			g_pLuaDataPack.AddFileContents(registeredName, source, true);
 			Msg(PROJECT_NAME " - luapack: queued explicit refresh recovery for existing client Lua registration \"%s\"\n",
 				registeredName.c_str());
-			return LuaPackDiskRefreshResult::RescanQueued;
+			return LuaPackDiskRefreshResult::RefreshQueued;
 		}
 		return LuaPackDiskRefreshResult::Unchanged;
 	}
@@ -2387,7 +2491,7 @@ static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
 	// A current server-side shared cache does not prove that a connected client
 	// received or executed the changed bytes. If the trampoline already reached
 	// AddOrUpdateFile, sourceChanged above is false because that hook updated the
-	// LuaPack entry; otherwise this bypass path must always stage an active rescan.
+	// LuaPack entry; otherwise this bypass path must stage a complete active refresh.
 	g_pLuaDataPack.AddFileContents(registeredName, source);
 	Msg(PROJECT_NAME " - luapack: captured %s refresh for existing client Lua registration \"%s\"\n",
 		telemetryKind ? telemetryKind : "disk", registeredName.c_str());
@@ -2405,12 +2509,33 @@ static bool hook_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack(
 		return true;
 #endif
 
-	const bool originalHandled = trampoline(fileRelPath, fileName, fileExt);
+	std::string sourcePath;
+	if (fileRelPath && fileName && fileExt)
+		HolyLib::LuaPack::Policy::BuildLuaAutoRefreshSourcePath(
+			*fileRelPath, *fileName, *fileExt, sourcePath);
+	bool originalHandled = false;
+#if defined(SYSTEM_LINUX)
+	{
+		std::string registeredName;
+		int fileID = INVALID_STRING_INDEX;
+		if (!sourcePath.empty())
+			ResolveExistingLuaRegistration(sourcePath, sourcePath, fileID, registeredName);
+		struct ScopedWatcherName
+		{
+			const std::string* previous = g_engineLuaRefreshName;
+			explicit ScopedWatcherName(const std::string& name) { g_engineLuaRefreshName = &name; }
+			~ScopedWatcherName() { g_engineLuaRefreshName = previous; }
+		} scope(registeredName);
+		originalHandled = trampoline(fileRelPath, fileName, fileExt);
+	}
+#else
+	originalHandled = trampoline(fileRelPath, fileName, fileExt);
+#endif
 	LuaPackDiskRefreshResult luaPackResult = LuaPackDiskRefreshResult::NotEligible;
-	if (fileRelPath && fileName && fileExt && fileExt->compare(0, 3, "lua") == 0)
+	if (!sourcePath.empty())
 	{
 		luaPackResult = CaptureExistingLuaPackDiskRefresh(
-			*fileRelPath, *fileName, "auto", false);
+			sourcePath, sourcePath, "auto", false);
 	}
 	const bool luaPackHandled = luaPackResult == LuaPackDiskRefreshResult::Unchanged ||
 		luaPackResult == LuaPackDiskRefreshResult::Captured;
@@ -2454,11 +2579,85 @@ bool HolyLib::LuaPack::SupportsCanonicalRegistration()
 		DETOUR_ISENABLED(detour_GModDataPack_SendFileToClient) &&
 		DETOUR_ISVALID(detour_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack) &&
 		DETOUR_ISENABLED(detour_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack) &&
+		DETOUR_ISVALID(detour_CVEngineServer_GMOD_SendToClientFilter) &&
+		DETOUR_ISENABLED(detour_CVEngineServer_GMOD_SendToClientFilter) &&
+		g_nativeLuaBuffer.Ready() &&
 		Gameserver_HasExactGModSender();
 #else
 	return false;
 #endif
 }
+
+#if defined(SYSTEM_LINUX)
+static void hook_CVEngineServer_GMOD_SendToClientFilter(void* engine,
+	IRecipientFilter* filter, void* data, int dataBits)
+{
+	auto original = detour_CVEngineServer_GMOD_SendToClientFilter.GetTrampoline<
+		Symbols::CVEngineServer_GMOD_SendToClientFilter>();
+	using namespace HolyLib::LuaPack::Policy;
+	ActiveLuaRefreshPayloadView payload;
+	if (!g_engineLuaRefreshName || g_engineLuaRefreshName->empty() || !filter ||
+		!filter->IsReliable() || filter->IsInitMessage() ||
+		filter->GetRecipientCount() < 0 || filter->GetRecipientCount() > ABSOLUTE_PLAYER_LIMIT ||
+		!HolyLib::LuaPack::IsEnabled() || !HolyLib::LuaPack::SupportsCanonicalRegistration() ||
+		!ReadActiveLuaRefreshPayload(data, dataBits, payload) ||
+		payload.filename != *g_engineLuaRefreshName)
+	{
+		original(engine, filter, data, dataBits);
+		return;
+	}
+	const int fileID = g_pDataPack->m_pClientLuaFiles->FindStringIndex(payload.filename.c_str());
+	LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID);
+	if (!entry || HolyLib::LuaPack::IsInitFile(payload.filename) ||
+		!g_pLuaDataPack.PublishRegistrationHash(fileID))
+	{
+		original(engine, filter, data, dataBits);
+		return;
+	}
+	{
+		std::lock_guard<std::shared_mutex> lock(entry->mutex);
+		if (!entry->hasSourceContent || !g_pLuaDataPack.EnsureSourceHash(entry) ||
+			!ActiveLuaRefreshBodyMatches(payload.filename, entry->sourceHash.data(),
+				entry->sourceHash.size(), payload.body, payload.bodyBytes))
+		{
+			original(engine, filter, data, dataBits);
+			return;
+		}
+		// Copy the engine's finished body into HolyLib-owned storage. The engine
+		// destroys its temporary after this call; its allocation is never borrowed.
+		auto owned = std::make_shared<Bootil::AutoBuffer>();
+		owned->Write(payload.body, static_cast<unsigned int>(payload.bodyBytes));
+		entry->activeRefreshCompressed = std::move(owned);
+		entry->activeRefreshRequested = false;
+		entry->activeRefreshFailed = false;
+	}
+	class JoiningRecipients final : public IRecipientFilter
+	{
+	public:
+		bool IsReliable() const override { return true; }
+		bool IsInitMessage() const override { return false; }
+		int GetRecipientCount() const override { return static_cast<int>(indices.size()); }
+		int GetRecipientIndex(int index) const override { return indices[index]; }
+		std::vector<int> indices;
+	} joining;
+	::ActiveLuaRefreshTargets targets;
+	for (int index = 0; index < filter->GetRecipientCount(); ++index)
+	{
+		const int recipient = filter->GetRecipientIndex(index);
+		const int slot = recipient - 1; // engine filters contain one-based player indices
+		const auto owner = CaptureActiveLuaRefreshOwner(Util::GetClientBySlot(slot));
+		if (slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT && owner.IsValid())
+			targets.Capture(slot, owner);
+		else
+			joining.indices.push_back(recipient);
+	}
+	// The watcher still performs its server reload. Its active recipients receive
+	// exactly one bounded transaction; joining recipients retain native delivery.
+	g_pLuaDataPack.QueueActiveHashRefresh(fileID, true, &targets);
+	if (joining.GetRecipientCount() != 0)
+		original(engine, &joining, data, dataBits);
+}
+#endif
 
 static void hook_GModDataPack_AddOrUpdateFile(GModDataPack* pDataPack, GarrysMod::Lua::LuaFile* file, bool bReCompress)
 {
@@ -2605,15 +2804,8 @@ static CBaseClient* ResolveLuaPackClientBySlot(int clientIdx)
 	return Util::GetClientBySlot(clientIdx);
 }
 
-static HolyLib::LuaPack::Policy::ActiveLuaRescanOwner CaptureActiveLuaRescanOwner(CBaseClient* client)
-{
-	if (!client || !client->IsActive() || !client->GetNetChannel())
-		return {};
-	return {client, client->GetNetChannel(), client->GetUserID(), client->m_clientChallenge};
-}
-
 static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned char* hash,
-	size_t hashLength, bool requestActiveScan = false)
+	size_t hashLength)
 {
 	if (!g_pDataPack || !g_pDataPack->m_pClientLuaFiles || !hash || hashLength != 32)
 		return false;
@@ -2622,10 +2814,6 @@ static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned ch
 	INetChannel* engineChannel = client ? client->GetNetChannel() : nullptr;
 	CNetChan* channel = static_cast<CNetChan*>(engineChannel);
 	if (!client || !channel)
-		return false;
-	const auto scanOwner = CaptureActiveLuaRescanOwner(client);
-	if (requestActiveScan && (clientIdx < 0 || clientIdx >= ABSOLUTE_PLAYER_LIMIT ||
-		!scanOwner.IsValid()))
 		return false;
 
 	INetworkStringTable* table = g_pDataPack->m_pClientLuaFiles;
@@ -2652,63 +2840,53 @@ static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned ch
 		channel->m_StreamReliable,
 		static_cast<std::uint32_t>(svc_UpdateStringTable), NETMSG_TYPE_BITS,
 		static_cast<std::uint32_t>(table->GetTableId()), Q_log2(MAX_TABLES),
-		static_cast<std::uint32_t>(fileID), table->GetEntryBits(), hash, hashLength,
-		requestActiveScan ? HolyLib::LuaPack::Policy::ClientLuaRescanWireBits(NETMSG_TYPE_BITS) : 0u);
-	if (appended && requestActiveScan)
-		g_pendingActiveLuaRescans[clientIdx].Mark(scanOwner);
+		static_cast<std::uint32_t>(fileID), table->GetEntryBits(), hash, hashLength);
 	return appended;
 }
 
-static bool RequestActiveClientLuaFiles(CBaseClient* client)
+static void DisconnectLuaHashFailure(int clientIdx, const char* fileName, const char* failure);
+
+enum class ActiveLuaRefreshResult { Appended, Retry, Reject };
+
+static ActiveLuaRefreshResult SendActiveLuaRefresh(CBaseClient* client, int fileID,
+	const std::string& fileName, const ClientLuaHash& hash, const Bootil::AutoBuffer& body,
+	std::size_t& remainingFrameBits)
 {
-	if (!client || !client->IsActive() || !client->GetNetChannel())
-		return false;
-
-	// bf_write requires dword-sized, dword-aligned storage and truncates smaller
-	// buffers to zero bytes. Keep the wire payload at one byte while providing
-	// the aligned scratch space its writer requires.
-	std::uint32_t requestBuffer = 0;
-	static_assert(HolyLib::LuaPack::Policy::IsSourceBitWriterStorageSizeValid(
-		sizeof(requestBuffer), HolyLib::LuaPack::Policy::ClientLuaRescanRequestBits),
-		"RequestLuaFiles scratch storage must satisfy Source bf_write alignment");
-	bf_write request(&requestBuffer, static_cast<int>(sizeof(requestBuffer)),
-		static_cast<int>(HolyLib::LuaPack::Policy::ClientLuaRescanRequestBits));
-	request.WriteByte(GarrysMod::NetworkMessage::RequestLuaFiles);
-	if (request.IsOverflowed() || request.GetNumBitsWritten() !=
-		static_cast<int>(HolyLib::LuaPack::Policy::ClientLuaRescanRequestBits))
-		return false;
-
-	// A string-table update changes the advertised identity, but active GMod clients
-	// do not rescan client_lua_files until this message asks them to compare the table.
-	// It shares the reliable stream with the preceding hash updates, preserving order.
+	static_assert(GarrysMod::NetworkMessage::LuaFileRefresh ==
+		HolyLib::LuaPack::Policy::ActiveLuaRefreshMessageType, "Native refresh opcode mismatch");
+	using namespace HolyLib::LuaPack::Policy;
+	INetworkStringTable* table = g_pDataPack ? g_pDataPack->m_pClientLuaFiles : nullptr;
+	if (!table || !CaptureActiveLuaRefreshOwner(client).IsValid() ||
+		fileID <= 0 || fileID >= table->GetNumStrings() ||
+		!ActiveLuaRefreshBodyMatches(fileName, hash.data(), hash.size(), body.GetBase(), body.GetWritten()))
+		return ActiveLuaRefreshResult::Reject;
+	int publishedLength = 0;
+	if (!table->GetStringUserData(fileID, &publishedLength) || publishedLength != 32)
+		return ActiveLuaRefreshResult::Reject;
 	CNetChan* channel = static_cast<CNetChan*>(client->GetNetChannel());
-	return HolyLib::LuaPack::Policy::AppendClientLuaRescanWire(channel->m_StreamReliable,
-		svc_GMod_ServerToClient, NETMSG_TYPE_BITS, request.GetData(), request.GetNumBitsWritten());
-}
-
-static unsigned int DrainActiveLuaRescans()
-{
-	const bool enabled = HolyLib::LuaPack::IsEnabled() &&
-		HolyLib::LuaPack::SupportsCanonicalRegistration();
-	unsigned int sent = 0;
-	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
-	{
-		auto& pending = g_pendingActiveLuaRescans[slot];
-		if (!pending.IsPending())
-			continue;
-		CBaseClient* client = enabled ? ResolveLuaPackClientBySlot(slot) : nullptr;
-		if (pending.TryAppend(CaptureActiveLuaRescanOwner(client), [client]() {
-			return RequestActiveClientLuaFiles(client);
-		}))
-			++sent;
-	}
-	return sent;
+	bf_write& output = channel->m_StreamReliable;
+	const std::size_t bits = ClientLuaHashUpdateWireBits(NETMSG_TYPE_BITS, Q_log2(MAX_TABLES), table->GetEntryBits()) +
+		ActiveLuaRefreshWireBits(NETMSG_TYPE_BITS, fileName.size(), body.GetWritten());
+	const int bitsLeft = output.GetNumBitsLeft();
+	const int bitsWritten = output.GetNumBitsWritten();
+	if (output.IsOverflowed() || bitsLeft < 0 || bitsWritten < 0 ||
+		bits > static_cast<std::size_t>(bitsLeft) + static_cast<std::size_t>(bitsWritten))
+		return ActiveLuaRefreshResult::Reject;
+	if (bits > static_cast<std::size_t>(bitsLeft) || bits > remainingFrameBits)
+		return ActiveLuaRefreshResult::Retry;
+	if (!AppendActiveLuaRefreshTransaction(output, svc_UpdateStringTable, svc_GMod_ServerToClient,
+		NETMSG_TYPE_BITS, table->GetTableId(), Q_log2(MAX_TABLES), fileID, table->GetEntryBits(),
+		fileName, hash.data(), hash.size(), body.GetBase(), body.GetWritten()))
+		return ActiveLuaRefreshResult::Reject;
+	remainingFrameBits -= bits;
+	return ActiveLuaRefreshResult::Appended;
 }
 
 static void DrainActiveLuaHashRefreshes()
 {
 	using ActiveHashRefreshSlots = std::bitset<ABSOLUTE_PLAYER_LIMIT>;
 	std::vector<int> pending;
+	std::unordered_map<int, ActiveLuaRefreshTargets> targetsPending;
 	std::unordered_map<int, ActiveHashRefreshSlots> forcedPending;
 	std::unordered_map<int, int> nextSlotsPending;
 	std::unordered_map<int, ActiveHashRefreshSlots> failedSlotsPending;
@@ -2716,11 +2894,13 @@ static void DrainActiveLuaHashRefreshes()
 	{
 		std::lock_guard<std::mutex> lock(g_pLuaDataPack.m_pActiveHashRefreshQueueMutex);
 		pending = std::move(g_pLuaDataPack.m_pActiveHashRefreshQueue);
+		targetsPending = std::move(g_pLuaDataPack.m_pActiveHashRefreshTargets);
 		forcedPending = std::move(g_pLuaDataPack.m_pForcedActiveHashRefreshes);
 		nextSlotsPending = std::move(g_pLuaDataPack.m_pActiveHashRefreshNextSlots);
 		failedSlotsPending = std::move(g_pLuaDataPack.m_pActiveHashRefreshFailedSlots);
 		retryAfterPending = std::move(g_pLuaDataPack.m_pActiveHashRefreshRetryAfter);
 		g_pLuaDataPack.m_pActiveHashRefreshQueue.clear();
+		g_pLuaDataPack.m_pActiveHashRefreshTargets.clear();
 		g_pLuaDataPack.m_pForcedActiveHashRefreshes.clear();
 		g_pLuaDataPack.m_pActiveHashRefreshNextSlots.clear();
 		g_pLuaDataPack.m_pActiveHashRefreshFailedSlots.clear();
@@ -2789,13 +2969,16 @@ static void DrainActiveLuaHashRefreshes()
 	unsigned int nativeUpdates = 0;
 	unsigned int canonicalUpdates = 0;
 	unsigned int updatedFiles = 0;
-	unsigned int requestedScans = 0;
+	std::size_t remainingFrameBits = HolyLib::LuaPack::Policy::ActiveLuaRefreshFrameBits;
 	unsigned int forcedWithoutRecipient = 0;
 	unsigned int failedAttempts = 0;
 	std::size_t processed = 0;
 	for (std::size_t index = 0; index < pending.size(); ++index)
 	{
 		const int fileID = pending[index];
+		auto targets = targetsPending.find(fileID);
+		if (targets == targetsPending.end())
+			continue;
 		ActiveHashRefreshSlots forcedSlots = pendingForcedSlots(fileID);
 		ActiveHashRefreshSlots failedSlots = pendingFailedSlots(fileID);
 		const int startSlot = pendingNextSlot(fileID);
@@ -2869,7 +3052,7 @@ static void DrainActiveLuaHashRefreshes()
 		for (int slot = startSlot; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
 		{
 			CBaseClient* client = ResolveLuaPackClientBySlot(slot);
-			if (!client || !client->IsActive() || !client->GetNetChannel())
+			if (!targets->second.Matches(slot, CaptureActiveLuaRefreshOwner(client)))
 			{
 				forcedSlots.reset(slot);
 				failedSlots.reset(slot);
@@ -2904,35 +3087,51 @@ static void DrainActiveLuaHashRefreshes()
 			}
 			resumeSlot = HolyLib::LuaPack::Policy::NextActiveHashRefreshSlot(
 				slot, ABSOLUTE_PLAYER_LIMIT);
-			if (refresh == HolyLib::LuaPack::Policy::ActiveHashRefreshAction::Native)
+			const bool native = refresh == HolyLib::LuaPack::Policy::ActiveHashRefreshAction::Native;
+			bool payloadFailed = false;
+			std::shared_ptr<const Bootil::AutoBuffer> nativePayload;
+			const Bootil::AutoBuffer* payload = nullptr;
+			if (native)
 			{
-				if (!SendClientLuaHashUpdate(slot, fileID, sourceHash.data(), sourceHash.size(), true))
-				{
-					failedSlots.set(slot);
-					++failedAttempts;
-					continue;
-				}
-				HolyLib::LuaPack::Policy::RememberNativeHash(pendingHashes, fileID, sourceHash);
+				nativePayload = g_pLuaDataPack.ActiveRefreshPayload(fileID, payloadFailed);
+				payload = nativePayload.get();
+			}
+			else
+				payload = HolyLib::LuaPack::RequiredStubPayloadForClient(slot);
+			const ClientLuaHash& desiredHash = native ? sourceHash : canonicalHash;
+			const ActiveLuaRefreshResult result = payload
+				? SendActiveLuaRefresh(client, fileID, fileName, desiredHash, *payload, remainingFrameBits)
+				: (payloadFailed || !native ? ActiveLuaRefreshResult::Reject : ActiveLuaRefreshResult::Retry);
+			if (result == ActiveLuaRefreshResult::Retry)
+			{
+				failedSlots.set(slot);
+				++failedAttempts;
+				continue;
+			}
+			if (result == ActiveLuaRefreshResult::Reject)
+			{
+				DisconnectLuaHashFailure(slot, fileName.c_str(), "the complete native refresh payload could not be staged safely");
+				forcedSlots.reset(slot);
+				failedSlots.reset(slot);
+				continue;
+			}
+			// Retire earlier advertisements only after both hash and matching body were
+			// appended. No file request is expected on this native refresh protocol.
+			pendingHashes.erase(fileID);
+			if (native)
+			{
+				HolyLib::LuaPack::Policy::RememberNativeHash(nativeHashes, fileID, desiredHash);
 				++nativeUpdates;
-				updatedFile = true;
-				forcedSlots.reset(slot);
-				failedSlots.reset(slot);
 			}
-			else if (refresh == HolyLib::LuaPack::Policy::ActiveHashRefreshAction::Canonical)
+			else
 			{
-				if (!SendClientLuaHashUpdate(slot, fileID,
-					canonicalHash.data(), canonicalHash.size(), true))
-				{
-					failedSlots.set(slot);
-					++failedAttempts;
-					continue;
-				}
-				HolyLib::LuaPack::Policy::RememberNativeHash(pendingHashes, fileID, canonicalHash);
+				HolyLib::LuaPack::Policy::RestoreCanonicalHash(nativeHashes, fileID);
 				++canonicalUpdates;
-				updatedFile = true;
-				forcedSlots.reset(slot);
-				failedSlots.reset(slot);
 			}
+			updatedFile = true;
+			forcedSlots.reset(slot);
+			failedSlots.reset(slot);
+
 		}
 		if (deferredForBudget || failedSlots.any())
 		{
@@ -2947,13 +3146,18 @@ static void DrainActiveLuaHashRefreshes()
 		else if (forcedFile && !deferredForBudget && !failedSlots.any())
 			++forcedWithoutRecipient;
 	}
-	requestedScans = DrainActiveLuaRescans();
 
 	if (!retry.empty())
 	{
 		std::lock_guard<std::mutex> lock(g_pLuaDataPack.m_pActiveHashRefreshQueueMutex);
 		g_pLuaDataPack.m_pActiveHashRefreshQueue.insert(
 			g_pLuaDataPack.m_pActiveHashRefreshQueue.end(), retry.begin(), retry.end());
+		for (int fileID : retry)
+		{
+			auto targets = targetsPending.find(fileID);
+			if (targets != targetsPending.end())
+				g_pLuaDataPack.m_pActiveHashRefreshTargets.try_emplace(fileID, std::move(targets->second));
+		}
 		for (const auto& forced : forcedRetry)
 			g_pLuaDataPack.m_pForcedActiveHashRefreshes[forced.first] |= forced.second;
 		for (const auto& nextSlot : nextSlotsRetry)
@@ -2968,8 +3172,8 @@ static void DrainActiveLuaHashRefreshes()
 	}
 	if (nativeUpdates != 0 || canonicalUpdates != 0)
 	{
-		Msg(PROJECT_NAME " - luapack: active hot refresh staged %u native and %u canonical per-client hash update(s) across %u file(s), then requested %u client Lua rescan(s)\n",
-			nativeUpdates, canonicalUpdates, updatedFiles, requestedScans);
+		Msg(PROJECT_NAME " - luapack: active hot refresh staged %u native and %u canonical hash/body transaction(s) across %u file(s)\n",
+			nativeUpdates, canonicalUpdates, updatedFiles);
 	}
 	if (forcedWithoutRecipient != 0)
 	{
@@ -2985,7 +3189,7 @@ static void DrainActiveLuaHashRefreshes()
 		{
 			// Deliberately aggregate this operational signal. File paths and slot IDs
 			// are unnecessary for pacing diagnosis and can identify live workload.
-			Warning(PROJECT_NAME " - luapack: active hot refresh deferred %u reliable hash update attempt(s); retries remain budgeted and paced\n",
+			Warning(PROJECT_NAME " - luapack: active hot refresh deferred %u payload or reliable-capacity attempt(s); retries remain budgeted and paced\n",
 				deferredAttemptReport);
 			deferredAttemptReport = 0;
 			nextDeferredAttemptReport = now + 5.0;
@@ -3627,8 +3831,8 @@ LUA_FUNCTION_STATIC(gmoddatapack_RefreshExistingLuaFile)
 		case LuaPackDiskRefreshResult::Unchanged:
 			status = "unchanged";
 			break;
-		case LuaPackDiskRefreshResult::RescanQueued:
-			status = "rescan_queued";
+		case LuaPackDiskRefreshResult::RefreshQueued:
+			status = "refresh_queued";
 			break;
 		case LuaPackDiskRefreshResult::Captured:
 			status = "captured";
@@ -3638,7 +3842,7 @@ LUA_FUNCTION_STATIC(gmoddatapack_RefreshExistingLuaFile)
 	}
 
 	LUA->PushBool(result == LuaPackDiskRefreshResult::Captured ||
-		result == LuaPackDiskRefreshResult::RescanQueued);
+		result == LuaPackDiskRefreshResult::RefreshQueued);
 	LUA->PushString(status);
 	return 2;
 }
@@ -3919,10 +4123,6 @@ void CGModDataPackModule::Think(bool bSimulating)
 			g_pLuaDataPack.PublishEntryHash(fileID, *pEntry);
 		}
 	}
-	// Retried rescans get first use of this frame's space, even with no new hashes.
-	const unsigned int deferredScans = DrainActiveLuaRescans();
-	if (deferredScans != 0)
-		Msg(PROJECT_NAME " - luapack: active hot refresh completed %u deferred client Lua rescan(s)\n", deferredScans);
 	DrainActiveLuaHashRefreshes();
 	ReportActiveLuaHashRefreshAcknowledgements();
 
@@ -4105,6 +4305,30 @@ void CGModDataPackModule::InitDetour(bool bPreServer)
 	DETOUR_PREPARE_THISCALL();
 #if defined(SYSTEM_LINUX)
 	SourceSDK::FactoryLoader engine_loader("engine");
+	SourceSDK::FactoryLoader lua_shared_loader("lua_shared");
+	g_nativeLuaBuffer.size = reinterpret_cast<NativeLuaBufferAccess::ReadSize>(Detour::GetFunction(
+		lua_shared_loader.GetModule(), Symbol::FromName("_ZNK6Bootil6Buffer7GetSizeEv")));
+	g_nativeLuaBuffer.position = reinterpret_cast<NativeLuaBufferAccess::ReadSize>(Detour::GetFunction(
+		lua_shared_loader.GetModule(), Symbol::FromName("_ZNK6Bootil6Buffer6GetPosEv")));
+	g_nativeLuaBuffer.written = reinterpret_cast<NativeLuaBufferAccess::ReadSize>(Detour::GetFunction(
+		lua_shared_loader.GetModule(), Symbol::FromName("_ZNK6Bootil6Buffer10GetWrittenEv")));
+#if defined(ARCHITECTURE_X86_64)
+	constexpr const char* sizeSuffix = "m";
+#else
+	constexpr const char* sizeSuffix = "j";
+#endif
+	g_nativeLuaBuffer.base = reinterpret_cast<NativeLuaBufferAccess::ReadBase>(Detour::GetFunction(
+		lua_shared_loader.GetModule(), Symbol::FromName((std::string("_ZNK6Bootil6Buffer7GetBaseE") + sizeSuffix).c_str())));
+	g_nativeLuaBuffer.setWritten = reinterpret_cast<NativeLuaBufferAccess::SetWritten>(Detour::GetFunction(
+		lua_shared_loader.GetModule(), Symbol::FromName((std::string("_ZN6Bootil6Buffer10SetWrittenE") + sizeSuffix).c_str())));
+	g_nativeLuaBuffer.setPosition = reinterpret_cast<NativeLuaBufferAccess::SetPosition>(Detour::GetFunction(
+		lua_shared_loader.GetModule(), Symbol::FromName((std::string("_ZN6Bootil6Buffer6SetPosE") + sizeSuffix).c_str())));
+	Detour::CheckValue("resolve", "native Lua buffer accessors", g_nativeLuaBuffer.Ready());
+	Detour::Create(
+		&detour_CVEngineServer_GMOD_SendToClientFilter, "CVEngineServer::GMOD_SendToClient (filter)",
+		engine_loader.GetModule(), Symbols::CVEngineServer_GMOD_SendToClientFilterSym,
+		(void*)hook_CVEngineServer_GMOD_SendToClientFilter, m_pID
+	);
 	Detour::Create(
 		&detour_CBaseClient_SendServerInfo, "CBaseClient::SendServerInfo",
 		engine_loader.GetModule(), Symbols::CBaseClient_SendServerInfoSym,

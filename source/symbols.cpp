@@ -1021,6 +1021,11 @@ namespace Symbols
 		Symbol::FromSignature("\x55\x48\x63\xF6\x48\x89\xE5\x41\x57"), // 55 48 63 F6 48 89 E5 41 57 (x64 260706; reverified 260709, _ZTV14CVEngineServer slot 120; movslq esi = arg handling)
 	};
 
+	const std::vector<Symbol> CVEngineServer_GMOD_SendToClientFilterSym = {
+		Symbol::FromName("_ZN14CVEngineServer17GMOD_SendToClientEP16IRecipientFilterPvi"),
+		Symbol::FromSignature("\x55\x48\x89\xE5\x41\x57\x49\x89\xD7\x41\x56\x49\x89\xF6\x41\x55\x41\x54\x4C\x8D\xA5\x40\xFF\xFF\xFF\x53\x4D\x8D\x6C\x24\x60\x89\xCB"), // Linux x64 engine 260803, unique; CVEngineServer slot 119, engine.so+0xA8790. Broadcasts the complete GMod payload through IRecipientFilter.
+	};
+
 	const std::vector<Symbol> CBaseClient_SetSignonStateSym = {
 		Symbol::FromName("_ZN11CBaseClient14SetSignonStateEii"),
 		Symbol::FromSignature("\x55\x8B\x87\xA0\x01\x00\x00\x48"), // 55 8B 87 A0 01 00 00 48 (x64 260706; reverified 260709, m_nSignonState [rdi+0x1A0]; was +0x1A8)

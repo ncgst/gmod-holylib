@@ -914,6 +914,21 @@ int main()
 	assert(refreshPath.empty());
 	assert(existingRefreshRegistrations.size() == 1);
 	assert(fullPathRefreshRegistrations.size() == 1);
+	std::string watcherPath;
+	assert(BuildLuaAutoRefreshSourcePath("lua/holylib_canary_20260910/", "refresh_gate", "lua", watcherPath));
+	assert(watcherPath == "lua/holylib_canary_20260910/refresh_gate.lua");
+	assert(ResolveExistingLuaRefreshPath(watcherPath, watcherPath,
+		[](const std::string& name) { return name == "lua/holylib_canary_20260910/refresh_gate.lua"; }, refreshPath)
+		== LuaRefreshPathResolution::ExistingRegistration);
+	assert(BuildLuaAutoRefreshSourcePath("addons/ncg/lua/ncg/modules/patchs/", "cl_init", "lua", watcherPath));
+	assert(ResolveExistingLuaRefreshPath(watcherPath, watcherPath, registrationExists, refreshPath)
+		== LuaRefreshPathResolution::ExistingRegistration);
+	assert(refreshPath == "ncg/modules/patchs/cl_init.lua");
+	assert(!BuildLuaAutoRefreshSourcePath("lua/../", "outside", "lua", watcherPath));
+	assert(!BuildLuaAutoRefreshSourcePath("lua/", "../outside", "lua", watcherPath));
+	assert(!BuildLuaAutoRefreshSourcePath("lua/", "fixture", "txt", watcherPath));
+	assert(!BuildLuaAutoRefreshSourcePath("lua/", "", "lua", watcherPath));
+	assert(watcherPath.empty());
 	{
 		std::unordered_map<int, TestHash> remembered;
 		std::unordered_map<int, TestHash> pending;
@@ -969,12 +984,9 @@ int main()
 		assert(SelectActiveHashRefresh(true, Action::Reject, remembered, pending,
 			fileID, hotfixTwo, canonical, true) == ActiveHashRefreshAction::None);
 	}
-	assert(!ShouldRequestActiveLuaScan(0));
-	assert(ShouldRequestActiveLuaScan(1));
-	assert(ShouldRequestActiveLuaScan(64));
-	assert(!IsSourceBitWriterStorageSizeValid(1, ClientLuaRescanRequestBits));
+	assert(!IsSourceBitWriterStorageSizeValid(1, 8u));
 	assert(IsSourceBitWriterStorageSizeValid(sizeof(std::uint32_t),
-		ClientLuaRescanRequestBits));
+		8u));
 	assert(!IsSourceBitWriterStorageSizeValid(sizeof(std::uint32_t), 33));
 	assert(SelectActiveHashRefreshEntryAction(false, true, true, true, true, true) ==
 		ActiveHashRefreshEntryAction::Ready);
@@ -1005,7 +1017,7 @@ int main()
 	assert(NextActiveHashRefreshSlot(254, 255) == 0);
 
 	// Decode GMod's variable-size userdata framing, including its 19-bit byte
-	// count. An active rescan is a separate GMod message;
+	// count. Active refresh is a separate filename/body GMod message;
 	// the string-table record alone is deliberately not treated as execution proof.
 	std::array<unsigned char, ClientLuaHashBytes> clientLuaHash{};
 	for (std::size_t index = 0; index < clientLuaHash.size(); ++index)
@@ -1102,100 +1114,128 @@ int main()
 		0x1234, clientLuaEntryBits, clientLuaHash.data(), clientLuaHash.size()));
 	assert(invalidClientLuaWire.bits.empty());
 
-	// An active hash and its mandatory rescan must both fit. Exercise every
-	// capacity where the old hash-only check succeeded but the rescan could not.
-	const std::size_t rescanWireBits = ClientLuaRescanWireBits(serviceTypeBits);
-	assert(rescanWireBits == 34);
+	// The replacement carries the complete native filename/body message after
+	// its hash. Every insufficient combined capacity must leave the stream intact.
+	const std::string refreshFilename = "lua/refresh-fixture.lua";
+	std::vector<unsigned char> refreshBody(clientLuaHash.begin(), clientLuaHash.end());
+	refreshBody.insert(refreshBody.end(), {0x5d, 0, 0, 1, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0xaa});
+	constexpr std::uint32_t refreshService = 33;
+	const std::size_t refreshBits = ActiveLuaRefreshWireBits(serviceTypeBits, refreshFilename.size(), refreshBody.size());
+	const std::size_t transactionBits = clientLuaWireBits + refreshBits;
 	assert(clientLuaWireBits == 323);
-	constexpr std::uint32_t rescanServiceType = 33;
-	const std::uint32_t rescanPayload = 0xad;
-	int testClient = 0, replacementClient = 0, testChannel = 0, replacementChannel = 0;
-	const ActiveLuaRescanOwner scanOwner{&testClient, &testChannel, 17, 99};
-	PendingActiveLuaRescan pendingScan;
-	auto stageActiveHash = [&](TestBitWriter& output) {
-		if (!AppendClientLuaHashUpdateWire(output, updateStringTableType, serviceTypeBits,
-			clientLuaTableID, tableIDBits, 0x1234, clientLuaEntryBits,
-			clientLuaHash.data(), clientLuaHash.size(), rescanWireBits))
-			return false;
-		pendingScan.Mark(scanOwner);
-		return true;
+	assert(refreshBits == 6 + 20 + (1 + refreshFilename.size() + 1 + 4 + refreshBody.size()) * 8);
+	auto appendRefresh = [&](TestBitWriter& output) {
+		return AppendActiveLuaRefreshTransaction(output, updateStringTableType, refreshService,
+			serviceTypeBits, clientLuaTableID, tableIDBits, 0x1234, clientLuaEntryBits,
+			refreshFilename, clientLuaHash.data(), clientLuaHash.size(), refreshBody.data(), refreshBody.size());
 	};
-	auto appendRescan = [&](TestBitWriter& output) {
-		return AppendClientLuaRescanWire(output, rescanServiceType, serviceTypeBits,
-			&rescanPayload, ClientLuaRescanRequestBits);
-	};
-	for (std::size_t remaining = clientLuaWireBits;
-		remaining < clientLuaWireBits + rescanWireBits; ++remaining)
+	for (std::size_t remaining = 0; remaining < transactionBits; ++remaining)
 	{
-		TestBitWriter shortCombined(remaining);
-		assert(!stageActiveHash(shortCombined));
-		assert(shortCombined.bits.empty());
+		TestBitWriter shortCombined(3 + remaining);
+		shortCombined.WriteUBitLong(5, 3);
+		assert(!appendRefresh(shortCombined));
+		assert(shortCombined.GetNumBitsWritten() == 3 && shortCombined.ReadUBitLong(0, 3) == 5);
 		assert(!shortCombined.IsOverflowed());
-		assert(!pendingScan.IsPending());
 	}
-	TestBitWriter combinedRetry(3 + clientLuaWireBits + rescanWireBits);
-	combinedRetry.WriteUBitLong(5, 3); // an unaligned existing reliable prefix
-	assert(stageActiveHash(combinedRetry));
-	assert(pendingScan.TryAppend(scanOwner, [&]() { return appendRescan(combinedRetry); }));
-	assert(!pendingScan.IsPending());
-	assert(!combinedRetry.IsOverflowed());
-	assert(combinedRetry.GetNumBitsLeft() == 0);
-	assert(combinedRetry.ReadUBitLong(0, 3) == 5);
-	const std::size_t rescanStart = 3 + clientLuaWireBits;
-	assert(combinedRetry.ReadUBitLong(rescanStart, serviceTypeBits) == rescanServiceType);
-	assert(combinedRetry.ReadUBitLong(rescanStart + serviceTypeBits,
-		ClientLuaRescanLengthBits) == ClientLuaRescanRequestBits);
-	assert(combinedRetry.ReadUBitLong(rescanStart + serviceTypeBits +
-		ClientLuaRescanLengthBits, ClientLuaRescanRequestBits) == rescanPayload);
-
-	// Multiple staged hashes coalesce into one ordered rescan.
-	TestBitWriter coalesced(2 * clientLuaWireBits + rescanWireBits);
-	assert(stageActiveHash(coalesced));
-	assert(stageActiveHash(coalesced));
-	assert(pendingScan.TryAppend(scanOwner, [&]() { return appendRescan(coalesced); }));
-	assert(!pendingScan.TryAppend(scanOwner, [&]() { return appendRescan(coalesced); }));
-	assert(!coalesced.IsOverflowed() && coalesced.GetNumBitsLeft() == 0);
-
-	// If another writer consumes reserved space, retain the rescan independently
-	// of the hash deduplication queue and complete it on the next available frame.
-	TestBitWriter interrupted(clientLuaWireBits + rescanWireBits);
-	assert(stageActiveHash(interrupted));
-	interrupted.WriteOneBit(0);
-	const auto interruptedSize = interrupted.bits.size();
-	assert(!pendingScan.TryAppend(scanOwner, [&]() { return appendRescan(interrupted); }));
-	assert(pendingScan.IsPending());
-	assert(!interrupted.IsOverflowed() && interrupted.bits.size() == interruptedSize);
-	TestBitWriter nextFrame(rescanWireBits);
-	assert(pendingScan.TryAppend(scanOwner, [&]() { return appendRescan(nextFrame); }));
-	assert(!pendingScan.IsPending() && nextFrame.GetNumBitsLeft() == 0);
-	assert(!nextFrame.IsOverflowed());
-
-	// No inherited work on disconnect, pointer reuse, or a replacement connection.
-	for (const auto& replacement : {
-		ActiveLuaRescanOwner{},
-		ActiveLuaRescanOwner{&replacementClient, &testChannel, 17, 99},
-		ActiveLuaRescanOwner{&testClient, &replacementChannel, 17, 99},
-		ActiveLuaRescanOwner{&testClient, &testChannel, 18, 99},
-		ActiveLuaRescanOwner{&testClient, &testChannel, 17, 100}})
+	TestBitWriter exactRefresh(3 + transactionBits);
+	exactRefresh.WriteUBitLong(5, 3);
+	assert(appendRefresh(exactRefresh));
+	assert(!exactRefresh.IsOverflowed() && exactRefresh.GetNumBitsLeft() == 0);
+	std::size_t cursor = 3 + clientLuaWireBits;
+	assert(exactRefresh.ReadUBitLong(cursor, 6) == refreshService); cursor += 6;
+	assert(exactRefresh.ReadUBitLong(cursor, 20) == (refreshBits - 26)); cursor += 20;
+	assert(exactRefresh.ReadUBitLong(cursor, 8) == 1); cursor += 8;
+	for (unsigned char byte : refreshFilename)
+	{ assert(exactRefresh.ReadUBitLong(cursor, 8) == byte); cursor += 8; }
+	assert(exactRefresh.ReadUBitLong(cursor, 8) == 0); cursor += 8;
+	assert(exactRefresh.ReadUBitLong(cursor, 32) == refreshBody.size()); cursor += 32;
+	for (unsigned char byte : refreshBody)
+	{ assert(exactRefresh.ReadUBitLong(cursor, 8) == byte); cursor += 8; }
+	assert(cursor == exactRefresh.bits.size());
+	std::vector<unsigned char> watcherPayload;
+	for (std::size_t bit = 3 + clientLuaWireBits + 26; bit < cursor; bit += 8)
+		watcherPayload.push_back(static_cast<unsigned char>(exactRefresh.ReadUBitLong(bit, 8)));
+	ActiveLuaRefreshPayloadView watcherView;
+	assert(ReadActiveLuaRefreshPayload(watcherPayload.data(), static_cast<int>(watcherPayload.size() * 8), watcherView));
+	assert(watcherView.filename == refreshFilename && watcherView.bodyBytes == refreshBody.size());
+	assert(std::equal(refreshBody.begin(), refreshBody.end(), watcherView.body));
+	for (std::size_t truncated = 0; truncated < watcherPayload.size() * 8; ++truncated)
 	{
-		pendingScan.Mark(scanOwner);
-		bool attempted = false;
-		assert(!pendingScan.TryAppend(replacement, [&]() { attempted = true; return true; }));
-		assert(!attempted && !pendingScan.IsPending());
+		assert(!ReadActiveLuaRefreshPayload(watcherPayload.data(), static_cast<int>(truncated), watcherView));
+		assert(watcherView.filename.empty() && !watcherView.body && watcherView.bodyBytes == 0);
 	}
-	pendingScan.Mark(scanOwner);
-	pendingScan.Reset();
-	assert(!pendingScan.IsPending());
-	TestBitWriter invalidRescan(rescanWireBits);
-	assert(!AppendClientLuaRescanWire(invalidRescan, rescanServiceType,
-		serviceTypeBits, &rescanPayload, 7));
-	assert(!AppendClientLuaRescanWire(invalidRescan, rescanServiceType,
-		serviceTypeBits, &rescanPayload, 9));
-	assert(!AppendClientLuaRescanWire(invalidRescan, 64,
-		serviceTypeBits, &rescanPayload, ClientLuaRescanRequestBits));
-	assert(!AppendClientLuaRescanWire(invalidRescan, rescanServiceType,
-		serviceTypeBits, nullptr, ClientLuaRescanRequestBits));
-	assert(invalidRescan.bits.empty() && !invalidRescan.IsOverflowed());
+	auto malformedWatcher = watcherPayload;
+	malformedWatcher[0] = 3;
+	assert(!ReadActiveLuaRefreshPayload(malformedWatcher.data(), static_cast<int>(malformedWatcher.size() * 8), watcherView));
+	malformedWatcher = watcherPayload;
+	malformedWatcher[refreshFilename.size() + 2] ^= 1; // u32 byte count disagrees with the actual body
+	assert(!ReadActiveLuaRefreshPayload(malformedWatcher.data(), static_cast<int>(malformedWatcher.size() * 8), watcherView));
+	malformedWatcher.assign(watcherPayload.size(), 0x7f); malformedWatcher[0] = 1;
+	assert(!ReadActiveLuaRefreshPayload(malformedWatcher.data(), static_cast<int>(malformedWatcher.size() * 8), watcherView));
+	assert(!ReadActiveLuaRefreshPayload(nullptr, 8, watcherView));
+	assert(!ReadActiveLuaRefreshPayload(watcherPayload.data(), -8, watcherView));
+
+	// There is no independently retired rescan. Space taken by another writer
+	// postpones the entire transaction; a subsequent frame includes both records.
+	TestBitWriter occupied(transactionBits);
+	occupied.WriteOneBit(1);
+	assert(!appendRefresh(occupied));
+	assert(occupied.bits.size() == 1 && !occupied.IsOverflowed());
+	TestBitWriter nextFrame(transactionBits);
+	assert(appendRefresh(nextFrame) && nextFrame.GetNumBitsLeft() == 0);
+	TestBitWriter twoFiles(transactionBits * 2);
+	assert(appendRefresh(twoFiles) && appendRefresh(twoFiles));
+	assert(twoFiles.GetNumBitsLeft() == 0 && !twoFiles.IsOverflowed());
+
+	// Reject malformed or oversized transactions before the hash is published.
+	TestBitWriter invalidRefresh(transactionBits * 2);
+	for (const std::string& filename : {std::string(), std::string("lua/a\0b", 7)})
+		assert(!AppendActiveLuaRefreshTransaction(invalidRefresh, updateStringTableType, refreshService,
+			serviceTypeBits, clientLuaTableID, tableIDBits, 0x1234, clientLuaEntryBits,
+			filename, clientLuaHash.data(), clientLuaHash.size(), refreshBody.data(), refreshBody.size()));
+	refreshBody[0] ^= 1;
+	assert(!appendRefresh(invalidRefresh));
+	refreshBody[0] ^= 1;
+	assert(!AppendActiveLuaRefreshTransaction(invalidRefresh, updateStringTableType, 64,
+		serviceTypeBits, clientLuaTableID, tableIDBits, 0x1234, clientLuaEntryBits,
+		refreshFilename, clientLuaHash.data(), clientLuaHash.size(), refreshBody.data(), refreshBody.size()));
+	assert(!ActiveLuaRefreshBodyMatches(refreshFilename, nullptr, 32, refreshBody.data(), refreshBody.size()));
+	assert(!ActiveLuaRefreshBodyMatches(refreshFilename, clientLuaHash.data(), 31, refreshBody.data(), refreshBody.size()));
+	assert(!ActiveLuaRefreshBodyMatches(refreshFilename, clientLuaHash.data(), 32, nullptr, refreshBody.size()));
+	assert(invalidRefresh.bits.empty() && !invalidRefresh.IsOverflowed());
+	const auto sizeMaximum = (std::numeric_limits<std::size_t>::max)();
+	assert(ActiveLuaRefreshPayloadBits(sizeMaximum, refreshBody.size()) == 0);
+	assert(ActiveLuaRefreshPayloadBits(refreshFilename.size(), sizeMaximum) == 0);
+	assert(ActiveLuaRefreshPayloadBits(1, 32) == 0);
+	assert(ActiveLuaRefreshWireBits(0, 1, 40) == 0);
+	assert(ActiveLuaRefreshWireBits(32, 1, 40) == 0);
+	assert(ActiveLuaRefreshPayloadBits(1, ActiveLuaRefreshMaximumPayloadBytes - 7) == 65536u * 8u);
+	assert(ActiveLuaRefreshPayloadBits(1, ActiveLuaRefreshMaximumPayloadBytes - 6) == 0);
+	assert(ActiveLuaRefreshWireBits(6, 1, ActiveLuaRefreshMaximumPayloadBytes - 7) + clientLuaWireBits < ActiveLuaRefreshFrameBits);
+
+	int testClient = 0, replacementClient = 0, testChannel = 0, replacementChannel = 0;
+	const ActiveLuaRefreshOwner refreshOwner{&testClient, &testChannel, 17, 99};
+	ActiveLuaRefreshTargets<255> refreshTargets;
+	refreshTargets.Capture(-1, refreshOwner);
+	refreshTargets.Capture(255, refreshOwner);
+	refreshTargets.Capture(1, {});
+	assert(refreshTargets.Empty());
+	refreshTargets.Capture(200, refreshOwner); // parked/out-of-array slots remain valid
+	assert(!refreshTargets.Empty() && refreshTargets.Matches(200, refreshOwner));
+	assert(!refreshTargets.Matches(201, refreshOwner));
+	for (const auto& replacement : {
+		ActiveLuaRefreshOwner{},
+		ActiveLuaRefreshOwner{&replacementClient, &testChannel, 17, 99},
+		ActiveLuaRefreshOwner{&testClient, &replacementChannel, 17, 99},
+		ActiveLuaRefreshOwner{&testClient, &testChannel, 18, 99},
+		ActiveLuaRefreshOwner{&testClient, &testChannel, 17, 100}})
+		assert(!refreshTargets.Matches(200, replacement));
+	// Only a new publication can capture the new owner. Old pending targets do not change.
+	auto oldTargets = refreshTargets;
+	const ActiveLuaRefreshOwner replacementOwner{&replacementClient, &replacementChannel, 18, 100};
+	refreshTargets.Capture(200, replacementOwner);
+	assert(refreshTargets.Matches(200, replacementOwner));
+	assert(!oldTargets.Matches(200, replacementOwner));
 
 	// Exact-key duplicates are rejected by the same registry used by pack validation.
 	std::unordered_set<std::string> exactKeys;

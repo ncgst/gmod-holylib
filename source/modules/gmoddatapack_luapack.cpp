@@ -406,7 +406,9 @@ do
 		local function compilePacked(pack, path, allowAliases, showError)
 			local source, resolvedPath = findSource(pack, path, allowAliases)
 			if not source then return nil, false end
-			local chunkName = "@" .. resolvedPath
+			-- GMod CompileString adds the Lua source marker itself. An extra @
+			-- breaks the engine's include-parent/autorefresh filename identity.
+			local chunkName = resolvedPath
 			local compiled = CompileString(source, chunkName, showError ~= false)
 			if type(compiled) ~= "function" then
 				warn("failed to compile packed file " .. tostring(resolvedPath) .. ": " .. tostring(compiled))

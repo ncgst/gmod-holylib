@@ -21,6 +21,7 @@ class Vector;
 class CBaseEntity;
 class CBasePlayer;
 class IClient;
+class IRecipientFilter;
 class IHandleEntity;
 class CCheckTransmitInfo;
 class CFileOpenInfo;
@@ -689,6 +690,8 @@ namespace Symbols
 
 	using CVEngineServer_GMOD_SendToClient = void (GMCOMMON_CALLING_CONVENTION*)(void*, int client, void *data, int dataSize);
 	extern const std::vector<Symbol> CVEngineServer_GMOD_SendToClientSym;
+	using CVEngineServer_GMOD_SendToClientFilter = void (*)(void*, IRecipientFilter*, void*, int);
+	extern const std::vector<Symbol> CVEngineServer_GMOD_SendToClientFilterSym;
 
 	using CSteam3Server_SendUpdatedServerDetails = void (GMCOMMON_CALLING_CONVENTION*)(void*);
 	extern const std::vector<Symbol> CSteam3Server_SendUpdatedServerDetailsSym;

@@ -835,7 +835,7 @@ namespace HolyLib::LuaPack::Policy
 
 	// Some filesystem autorefresh paths bypass GModDataPack::AddOrUpdateFile.
 	// Capture only changed existing registrations; unknown paths must never become
-	// client registrations. Every captured change needs LuaPack's active rescan:
+	// client registrations. Every captured change needs LuaPack's active refresh:
 	// vanilla's post-refresh server cache does not prove delivery or execution on a
 	// connected client.
 	constexpr bool ShouldCaptureAutoRefresh(bool enabled,
@@ -970,9 +970,19 @@ namespace HolyLib::LuaPack::Policy
 			: LuaRefreshPathResolution::InvalidPath;
 	}
 
-	constexpr bool ShouldRequestActiveLuaScan(std::size_t stagedHashUpdates)
+	// HandleChange_Lua receives a directory, a leaf stem without its extension,
+	// and the extension separately. Do not pass the stem to a complete-path lookup.
+	inline bool BuildLuaAutoRefreshSourcePath(const std::string& directory,
+		const std::string& stem, const std::string& extension, std::string& output)
 	{
-		return stagedHashUpdates != 0;
+		output.clear();
+		if (extension != "lua" || stem.empty() || stem.find_first_of("/\\") != std::string::npos)
+			return false;
+		std::string path = directory;
+		if (!path.empty() && path.back() != '/' && path.back() != '\\')
+			path += '/';
+		path += stem + "." + extension;
+		return NormalizeExistingLuaRefreshRegistrationPath(path, output);
 	}
 
 	// Source's bf_write truncates backing storage to a four-byte boundary.
@@ -987,16 +997,7 @@ namespace HolyLib::LuaPack::Policy
 			payloadBits != 0 && payloadBytes <= storageBytes;
 	}
 
-	constexpr std::size_t ClientLuaRescanRequestBits = 8u;
-	constexpr int ClientLuaRescanLengthBits = 20;
-
-	constexpr std::size_t ClientLuaRescanWireBits(int serviceTypeBits)
-	{
-		return serviceTypeBits > 0 ? static_cast<std::size_t>(serviceTypeBits) +
-			ClientLuaRescanLengthBits + ClientLuaRescanRequestBits : 0u;
-	}
-
-	struct ActiveLuaRescanOwner
+	struct ActiveLuaRefreshOwner
 	{
 		const void* client = nullptr;
 		const void* channel = nullptr;
@@ -1004,65 +1005,33 @@ namespace HolyLib::LuaPack::Policy
 		int challenge = 0;
 
 		bool IsValid() const { return client && channel; }
-		bool Matches(const ActiveLuaRescanOwner& other) const
+		bool Matches(const ActiveLuaRefreshOwner& other) const
 		{
 			return IsValid() && other.IsValid() && client == other.client &&
 				channel == other.channel && userID == other.userID && challenge == other.challenge;
 		}
 	};
 
-	// One coalesced operation per connection. A staged hash remains pending even
-	// if its rescan cannot be appended until a later frame with reliable capacity.
-	class PendingActiveLuaRescan
+	// A publication targets only connections that were active when it was queued.
+	// Replacement occupants must not inherit forced recovery or backpressure retries.
+	template <int SlotCount>
+	class ActiveLuaRefreshTargets
 	{
 	public:
-		bool IsPending() const { return owner.IsValid(); }
-		void Reset() { owner = {}; }
-		void Mark(const ActiveLuaRescanOwner& current) { owner = current; }
-
-		template <typename Append>
-		bool TryAppend(const ActiveLuaRescanOwner& current, Append append)
+		void Capture(int slot, const ActiveLuaRefreshOwner& owner)
 		{
-			if (!IsPending())
-				return false;
-			if (!owner.Matches(current))
-			{
-				Reset();
-				return false;
-			}
-			if (!append())
-				return false;
-			Reset();
-			return true;
+			if (slot >= 0 && slot < SlotCount && owner.IsValid())
+				owners[slot] = owner;
 		}
-
+		bool Empty() const { return owners.empty(); }
+		bool Matches(int slot, const ActiveLuaRefreshOwner& current) const
+		{
+			auto found = owners.find(slot);
+			return found != owners.end() && found->second.Matches(current);
+		}
 	private:
-		ActiveLuaRescanOwner owner;
+		std::unordered_map<int, ActiveLuaRefreshOwner> owners;
 	};
-
-	// GMOD_SendToClient returns void. Append its exact reliable envelope here so
-	// insufficient capacity is a non-mutating retry, rather than assumed delivery.
-	template <typename BitWriter>
-	bool AppendClientLuaRescanWire(BitWriter& output, std::uint32_t serviceType,
-		int serviceTypeBits, const void* request, std::size_t requestBits)
-	{
-		if (!request || requestBits != ClientLuaRescanRequestBits || serviceTypeBits <= 0 ||
-			serviceTypeBits >= static_cast<int>(sizeof(std::uint32_t) * 8u) ||
-			serviceType >= (1u << serviceTypeBits))
-			return false;
-		const std::size_t wireBits = ClientLuaRescanWireBits(serviceTypeBits);
-		const int bitsBefore = output.GetNumBitsWritten();
-		const int bitsLeft = output.GetNumBitsLeft();
-		if (bitsBefore < 0 || bitsLeft < 0 || output.IsOverflowed() ||
-			wireBits > static_cast<std::size_t>(bitsLeft))
-			return false;
-
-		output.WriteUBitLong(serviceType, serviceTypeBits);
-		output.WriteUBitLong(static_cast<std::uint32_t>(requestBits), ClientLuaRescanLengthBits);
-		output.WriteBits(request, static_cast<int>(requestBits));
-		return !output.IsOverflowed() && output.GetNumBitsWritten() - bitsBefore ==
-			static_cast<int>(wireBits);
-	}
 
 	constexpr std::size_t ClientLuaHashBytes = 32u;
 	constexpr std::size_t ClientLuaHashBits = ClientLuaHashBytes * 8u;
@@ -1128,7 +1097,7 @@ namespace HolyLib::LuaPack::Policy
 
 	// Append the complete svc_UpdateStringTable record directly to a reliable
 	// stream. The active-refresh path already owns ordering with the following
-	// RequestLuaFiles message; avoiding a temporary INetMessage also avoids
+	// native filename/body message; avoiding a temporary INetMessage also avoids
 	// treating engine-side message rejection as reliable-channel backpressure.
 	template <typename BitWriter>
 	bool AppendClientLuaHashUpdateWire(BitWriter& output,
@@ -1175,6 +1144,113 @@ namespace HolyLib::LuaPack::Policy
 
 		return !output.IsOverflowed() && output.GetNumBitsWritten() - bitsBefore ==
 			static_cast<int>(wireBits);
+	}
+
+	// Native AutoRefresh sends opcode 1, a NUL-terminated registered filename,
+	// a u32 BYTE count, then SHA-256(source + NUL) followed by Bootil LZMA bytes.
+	// The GMod outer envelope contains the payload's BIT count. Keep the native
+	// sender's 64 KiB payload ceiling, including the filename and every field.
+	constexpr std::size_t ActiveLuaRefreshMaximumPayloadBytes = 64u * 1024u;
+	constexpr std::size_t ActiveLuaRefreshFrameBits = 256u * 1024u * 8u;
+	constexpr int ActiveLuaRefreshLengthBits = 20;
+	constexpr std::uint32_t ActiveLuaRefreshMessageType = 1;
+
+	constexpr std::size_t ActiveLuaRefreshPayloadBits(std::size_t filenameBytes,
+		std::size_t bodyBytes)
+	{
+		constexpr std::size_t fields = 1u + 1u + sizeof(std::uint32_t);
+		return filenameBytes == 0 || filenameBytes > ActiveLuaRefreshMaximumPayloadBytes - fields ||
+			bodyBytes <= ClientLuaHashBytes ||
+			bodyBytes > ActiveLuaRefreshMaximumPayloadBytes - fields - filenameBytes
+			? 0u : (fields + filenameBytes + bodyBytes) * 8u;
+	}
+
+	constexpr std::size_t ActiveLuaRefreshWireBits(int serviceTypeBits,
+		std::size_t filenameBytes, std::size_t bodyBytes)
+	{
+		const std::size_t payloadBits = ActiveLuaRefreshPayloadBits(filenameBytes, bodyBytes);
+		return serviceTypeBits <= 0 || serviceTypeBits >= 32 || payloadBits == 0
+			? 0u : static_cast<std::size_t>(serviceTypeBits) + ActiveLuaRefreshLengthBits + payloadBits;
+	}
+
+	inline bool ActiveLuaRefreshBodyMatches(const std::string& filename,
+		const unsigned char* hash, std::size_t hashBytes,
+		const void* body, std::size_t bodyBytes)
+	{
+		return filename.find('\0') == std::string::npos && hash &&
+			hashBytes == ClientLuaHashBytes && body &&
+			ActiveLuaRefreshPayloadBits(filename.size(), bodyBytes) != 0 &&
+			std::equal(hash, hash + hashBytes, static_cast<const unsigned char*>(body));
+	}
+
+	struct ActiveLuaRefreshPayloadView
+	{
+		std::string filename;
+		const unsigned char* body = nullptr;
+		std::size_t bodyBytes = 0;
+	};
+
+	// Inspect the byte-aligned native watcher payload without trusting its NUL or
+	// body length. The returned view borrows storage only for this sender call.
+	inline bool ReadActiveLuaRefreshPayload(const void* data, int dataBits,
+		ActiveLuaRefreshPayloadView& result)
+	{
+		result = {};
+		if (!data || dataBits <= 0 || dataBits % 8 != 0 ||
+			static_cast<std::size_t>(dataBits / 8) > ActiveLuaRefreshMaximumPayloadBytes)
+			return false;
+		const auto* bytes = static_cast<const unsigned char*>(data);
+		const std::size_t size = static_cast<std::size_t>(dataBits / 8);
+		if (size < 7 || bytes[0] != ActiveLuaRefreshMessageType)
+			return false;
+		std::size_t end = 1;
+		while (end < size && bytes[end] != 0)
+			++end;
+		if (end == 1 || end >= size || size - end - 1 < sizeof(std::uint32_t))
+			return false;
+		const auto* length = bytes + end + 1;
+		const std::uint32_t bodyBytes = static_cast<std::uint32_t>(length[0]) |
+			(static_cast<std::uint32_t>(length[1]) << 8u) |
+			(static_cast<std::uint32_t>(length[2]) << 16u) |
+			(static_cast<std::uint32_t>(length[3]) << 24u);
+		const std::size_t bodyOffset = end + 1 + sizeof(std::uint32_t);
+		if (bodyBytes != size - bodyOffset || ActiveLuaRefreshPayloadBits(end - 1, bodyBytes) == 0)
+			return false;
+		result.filename.assign(reinterpret_cast<const char*>(bytes + 1), end - 1);
+		result.body = bytes + bodyOffset;
+		result.bodyBytes = bodyBytes;
+		return true;
+	}
+
+	// Preflight both records before touching the engine-owned stream. A capacity
+	// retry publishes neither a hash nor a partial body. A successful append stages
+	// the complete transaction in reliable order; it is not a client execution ACK.
+	template <typename BitWriter>
+	bool AppendActiveLuaRefreshTransaction(BitWriter& output,
+		std::uint32_t hashServiceType, std::uint32_t refreshServiceType, int serviceTypeBits,
+		std::uint32_t tableID, int tableBits, std::uint32_t fileID, int entryBits,
+		const std::string& filename, const unsigned char* hash, std::size_t hashBytes,
+		const void* body, std::size_t bodyBytes)
+	{
+		const std::size_t refreshBits = ActiveLuaRefreshWireBits(serviceTypeBits, filename.size(), bodyBytes);
+		if (!ActiveLuaRefreshBodyMatches(filename, hash, hashBytes, body, bodyBytes) ||
+			refreshBits == 0 || refreshServiceType >= (1u << serviceTypeBits))
+			return false;
+		const int bitsBefore = output.GetNumBitsWritten();
+		if (!AppendClientLuaHashUpdateWire(output, hashServiceType, serviceTypeBits,
+			tableID, tableBits, fileID, entryBits, hash, hashBytes, refreshBits))
+			return false;
+
+		output.WriteUBitLong(refreshServiceType, serviceTypeBits);
+		output.WriteUBitLong(static_cast<std::uint32_t>(ActiveLuaRefreshPayloadBits(filename.size(), bodyBytes)),
+			ActiveLuaRefreshLengthBits);
+		output.WriteUBitLong(ActiveLuaRefreshMessageType, 8);
+		output.WriteBytes(filename.data(), static_cast<int>(filename.size()));
+		output.WriteUBitLong(0, 8);
+		output.WriteUBitLong(static_cast<std::uint32_t>(bodyBytes), 32);
+		output.WriteBytes(body, static_cast<int>(bodyBytes));
+		return !output.IsOverflowed() && output.GetNumBitsWritten() - bitsBefore ==
+			static_cast<int>(ClientLuaHashUpdateWireBits(serviceTypeBits, tableBits, entryBits) + refreshBits);
 	}
 
 	// GMod asks for every missing Lua ID in one request. Required delivery retains that

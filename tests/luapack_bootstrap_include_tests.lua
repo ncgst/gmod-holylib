@@ -96,8 +96,9 @@ local function newRuntime(nativeFiles)
 			identifier = identifier,
 			handleError = handleError,
 		}
-		local chunk, compileError = loadstring(code,
-			string.sub(identifier, 1, 1) == "@" and identifier or ("@" .. normalize(identifier)))
+		-- The real GMod CompileString always adds @, even to an already-prefixed
+		-- identifier. Do not silently repair that production input in the model.
+		local chunk, compileError = loadstring(code, "@" .. identifier)
 		if not chunk then
 			return handleError == false and compileError or nil
 		end
@@ -191,6 +192,17 @@ local function newRuntime(nativeFiles)
 	end
 
 	return runtime
+end
+
+-- Match the live GMod CompileString contract: one source marker, with the exact
+-- registered filename after it. The previous explicit prefix produces @@ here.
+do
+	local runtime = newRuntime()
+	runtime:installPack({
+		["lua/autorun/client/refresh_root.lua"] = [[return debug.getinfo(1, "S").source]],
+	})
+	equal(runtime:runStub("lua/autorun/client/refresh_root.lua"),
+		"@lua/autorun/client/refresh_root.lua", "packed source identity has one marker")
 end
 
 -- The production incident: the loader's config, language, and nested helper are all
