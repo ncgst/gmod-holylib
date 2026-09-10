@@ -116,6 +116,8 @@ Mirror `garrysmod/data/<packdir>/` into the same relative path below the configu
 
 ## Rollout and verification
 
+The September 10 controlled-client follow-up leaves active refresh blocked on the inspected Windows client: the hash update reaches the client after the 19-bit userdata framing correction, but server-to-client GMod opcode `3` returns without requesting files. The steps below remain acceptance requirements, not a current pass. See [the receiver evidence and open gates](luapack-gluapack-re.md#14-active-rescan-opcode--blocking-on-the-inspected-windows-client).
+
 1. Deploy to one staging server with both module and feature flags off. Verify ordinary native joins first.
 2. Configure reachable `sv_downloadurl`/mirroring and use `downloadurl_policy=require` during validation.
 3. Set `holylib_enable_gmoddatapack 1`, keep LuaPack off, and verify the existing native path. A restart is recommended for staging parity; runtime enable defers its all-registration sweep until the engine datapack is bound. The module cannot be removed during a live level because it owns the registered Lua hash/body hooks.
@@ -134,6 +136,8 @@ The slow-baseline telemetry separates `published`, `cached`, and `computed` iden
 Explicit disk refresh also updates the existing engine Lua-file cache and invalidates its compressed payload before publishing the captured source. This keeps the later native hash and body on the refreshed revision. A registration whose engine Lua-file cache is unavailable returns `not_eligible`; it is not reported as captured. Updating this cache does not establish that a connected client requested or executed the revision.
 
 Active refresh compares the desired identity against the latest successfully staged per-client hash before the remembered native body hash. Returning from H1 through a pending H2 to H1, or from canonical through a pending native delta to canonical, therefore stages the restoration without explicit forced recovery. A native body response also corrects a different pending identity before retiring it.
+
+The per-client hash update uses GMod's variable-size string-table userdata format: a 19-bit byte count of 32 precedes the SHA-256 bytes. A currently published 32-byte hash does not imply a fixed-size table. Omitting the byte count makes the receiver consume the hash prefix as a length and replace the client entry with invalid userdata. Capacity accounting includes this field and reserves the following rescan. See the engine-parser evidence in [the interoperability notes](luapack-gluapack-re.md#13-active-string-table-userdata-length--confirmed-for-the-inspected-engines).
 
 ## Kill switch
 

@@ -2635,7 +2635,8 @@ static bool SendClientLuaHashUpdate(int clientIdx, int fileID, const unsigned ch
 	// Validate the published entry through the engine interface. The concrete
 	// CNetworkStringTable layout is engine-build-specific; reading its fixed-size
 	// fields directly can reject a healthy 32-byte client_lua_files entry before
-	// the reliable stream is touched.
+	// the reliable stream is touched. Its current 32-byte value does not imply
+	// fixed-size wire userdata; GMod still requires the 19-bit byte-length field.
 	int publishedLength = 0;
 	if (!table->GetStringUserData(fileID, &publishedLength) ||
 		publishedLength != static_cast<int>(hashLength))

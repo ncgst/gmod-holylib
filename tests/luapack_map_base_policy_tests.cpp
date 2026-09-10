@@ -1004,8 +1004,8 @@ int main()
 	assert(NextActiveHashRefreshSlot(127, 255) == 128);
 	assert(NextActiveHashRefreshSlot(254, 255) == 0);
 
-	// The production helper emits the exact fixed-size payload parsed by
-	// CNetworkStringTable::ParseUpdate. An active rescan is a separate GMod message;
+	// Decode GMod's variable-size userdata framing, including its 19-bit byte
+	// count. An active rescan is a separate GMod message;
 	// the string-table record alone is deliberately not treated as execution proof.
 	std::array<unsigned char, ClientLuaHashBytes> clientLuaHash{};
 	for (std::size_t index = 0; index < clientLuaHash.size(); ++index)
@@ -1026,6 +1026,8 @@ int main()
 	++clientLuaStart;
 	assert(clientLuaUpdate.ReadUBitLong(clientLuaStart, 1) == 1);
 	++clientLuaStart;
+	assert(clientLuaUpdate.ReadUBitLong(clientLuaStart, 19) == 32);
+	clientLuaStart += 19;
 	for (std::size_t index = 0; index < clientLuaHash.size(); ++index)
 		assert(clientLuaUpdate.ReadUBitLong(clientLuaStart + index * 8u, 8) == clientLuaHash[index]);
 	TestBitWriter shortClientLuaUpdate(clientLuaUpdateBits - 1u);
@@ -1080,6 +1082,8 @@ int main()
 	++clientLuaWireStart;
 	assert(clientLuaWire.ReadUBitLong(clientLuaWireStart, 1) == 1);
 	++clientLuaWireStart;
+	assert(clientLuaWire.ReadUBitLong(clientLuaWireStart, 19) == 32);
+	clientLuaWireStart += 19;
 	for (std::size_t index = 0; index < clientLuaHash.size(); ++index)
 		assert(clientLuaWire.ReadUBitLong(clientLuaWireStart + index * 8u, 8) ==
 			clientLuaHash[index]);
@@ -1102,7 +1106,7 @@ int main()
 	// capacity where the old hash-only check succeeded but the rescan could not.
 	const std::size_t rescanWireBits = ClientLuaRescanWireBits(serviceTypeBits);
 	assert(rescanWireBits == 34);
-	assert(clientLuaWireBits == 304);
+	assert(clientLuaWireBits == 323);
 	constexpr std::uint32_t rescanServiceType = 33;
 	const std::uint32_t rescanPayload = 0xad;
 	int testClient = 0, replacementClient = 0, testChannel = 0, replacementChannel = 0;

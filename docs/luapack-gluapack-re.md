@@ -111,6 +111,22 @@ The incumbent signatures for those functions, `CLuaInterface::Init`, `CLuaManage
 
 What would settle it: provide both stripped plugin architectures plus the exact target `lua_shared.so`; record hook setup xrefs and compare patterns byte-for-byte against these target modules.
 
+### 13. Active string-table userdata length — CONFIRMED for the inspected engines
+
+The September 10 controlled-client follow-up found that the direct hash writer incorrectly assumed fixed-size `client_lua_files` userdata. At `c42f26c`, an update with hash prefix `fb bf a8` left the Windows client's entry reporting 49,147 bytes instead of 32. A diagnostic 16-bit length field was also insufficient. This was a receiver-framing failure, separate from reliable-stream capacity and source-cache coherence.
+
+The actual variable-size `CNetworkStringTable::ParseUpdate` branch consumes **19 bits** for the userdata byte count and checks it against `0x80000`. This is visible in Linux `engine.so` (SHA-256 `333dae74032f7b0b29c6694b3440f1131e6361cd576d9be074744cf47f6596cf`) at virtual addresses `0x175965`–`0x1759c2`, and Windows client `engine.dll` (SHA-256 `c537406de4195fdaf6fa116e0d9535077ffc7011c6fe289584fe0bdde6e17731`) at image-relative addresses `0x20027d`–`0x20039d`. Both readers subtract/shift by `0x13`; the Windows branch reaches the `CNetworkStringTableClient::ParseUpdate: message too large` diagnostic. These addresses describe the inspected builds, not signatures to reuse in production.
+
+HolyLib writes the 19-bit value `32` before the hash and includes it in all payload, envelope, and trailing-rescan capacity calculations. The regression decodes this field explicitly, fails against the old production header, and checks every insufficient combined capacity. Parser inspection and policy tests establish framing agreement; active request, native response, cache contents, and execution remain distinct runtime observations.
+
+### 14. Active rescan opcode — BLOCKING on the inspected Windows client
+
+The current server's `RequestActiveClientLuaFiles` writes server-to-client GMod opcode `3`. In Windows `client.dll` SHA-256 `e00f3b7513af81ca2b964b684b2004edda864ad8eeea306d656d978912aa881c`, the actual `IBaseClientDLL::GMOD_ReceiveServerMessage` implementation reads the opcode at RVA `0x204250`. Its opcode-3 branch at `0x204401` jumps directly to the return block at `0x2046d9`. It does not call the separate `GMOD_RequestLuaFiles` implementation at RVA `0x204700`.
+
+With the corrected 19-bit hash framing and the engine watcher blocked only for the canary fixture, the controlled client received the exact new 32-byte hash but did not request the changed ID. Calling the client's actual request function as a separate diagnostic control produced one matching server-side request, but no observed file dispatch or native response. Neither transport staging nor that control request proves refresh completion. The ordinary native H1 -> pending H2 -> H1 restoration did replace the pending map entry and the actual client-visible hash without forced recovery; this is selection/advertisement evidence only.
+
+The active-refresh path therefore remains a merge blocker. It needs a bounded delivery mechanism that the current client actually processes, followed through cache installation and execution. The receiver also has a filename/body refresh path, but that path has not been adopted or certified by this change. Allocated-cache invalidation/recompression/reuse, canonical restoration, and parked-client lifecycle acceptance remain separate gates.
+
 ## Design traceability
 
 | HolyLib choice | Evidence |
@@ -129,5 +145,7 @@ What would settle it: provide both stripped plugin architectures plus the exact 
 ## Remaining evidence boundary
 
 HolyLib's current init ordering, canonical hash/body pairing, required cold and cached joins, native recovery, exact opt-out, hot deltas, canonical restoration, bounded request delivery, and connection-flood behavior have runtime evidence on the reviewed candidate. This note does not claim binary equivalence with the incumbent.
+
+Those earlier observations do not certify the current explicit disk-refresh/hash-rescan transaction. Findings 13 and 14 record the later controlled-client failure and the remaining merge hold.
 
 If both stripped incumbent plugin architectures are supplied, findings 2, 3 (incumbent half), 4 (exact stub), 5 (producer), 7 (registration), 8 (set timing), 9 (pinning), 10 (detours), and 12 (signature comparison) can be completed before making any binary-equivalence claim. That comparison is not a HolyLib runtime-readiness gate.

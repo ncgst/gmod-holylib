@@ -1067,17 +1067,21 @@ namespace HolyLib::LuaPack::Policy
 	constexpr std::size_t ClientLuaHashBytes = 32u;
 	constexpr std::size_t ClientLuaHashBits = ClientLuaHashBytes * 8u;
 	constexpr int ClientLuaHashUpdateLengthBits = 20;
+	constexpr int ClientLuaUserDataLengthBits = 19;
 
 	constexpr std::size_t ClientLuaHashUpdateBits(int entryBits)
 	{
 		return entryBits > 0
-			? 1u + static_cast<std::size_t>(entryBits) + 1u + 1u + ClientLuaHashBits
+			? 1u + static_cast<std::size_t>(entryBits) + 1u + 1u +
+				ClientLuaUserDataLengthBits + ClientLuaHashBits
 			: 0u;
 	}
 
-	// Encode one existing fixed-size client_lua_files entry exactly as
-	// CNetworkStringTable::WriteUpdate: explicit index, no string body, and one
-	// 32-byte SHA-256 userdata value. The surrounding SVC_UpdateStringTable owns
+	// client_lua_files uses GMod's variable-size userdata framing: explicit index,
+	// no string body, a 19-bit byte length, then the 32-byte SHA-256 value. A
+	// 32-byte published hash does not make the table fixed-size. Omitting the length
+	// makes the client interpret the hash prefix as its userdata byte count.
+	// The surrounding SVC_UpdateStringTable owns
 	// the table ID, changed-entry count, and payload length.
 	template <typename BitWriter>
 	bool AppendClientLuaHashUpdate(BitWriter& output, std::uint32_t fileID,
@@ -1104,6 +1108,7 @@ namespace HolyLib::LuaPack::Policy
 		output.WriteUBitLong(fileID, entryBits);
 		output.WriteOneBit(0);
 		output.WriteOneBit(1);
+		output.WriteUBitLong(static_cast<std::uint32_t>(hashBytes), ClientLuaUserDataLengthBits);
 		output.WriteBits(hash, static_cast<int>(ClientLuaHashBits));
 
 		return !output.IsOverflowed() && output.GetNumBitsWritten() - bitsBefore ==
@@ -1165,6 +1170,7 @@ namespace HolyLib::LuaPack::Policy
 		output.WriteUBitLong(fileID, entryBits);
 		output.WriteOneBit(0); // unchanged string body
 		output.WriteOneBit(1); // replacement userdata follows
+		output.WriteUBitLong(static_cast<std::uint32_t>(hashBytes), ClientLuaUserDataLengthBits);
 		output.WriteBits(hash, static_cast<int>(ClientLuaHashBits));
 
 		return !output.IsOverflowed() && output.GetNumBitsWritten() - bitsBefore ==
