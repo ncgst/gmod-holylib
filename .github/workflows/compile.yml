@@ -17,6 +17,16 @@ env:
   LOKI_PUBLIC: https://loki-public.raphaelit7.com # A completely seperate public loki server with bare minimum resources exposed for forks to use. (Yes anyone could abuse it but fk em, it doesn't have resources for any useful shit other than this.)
 
 jobs:
+  teleport_guard_tests:
+    name: "Teleport recursion guard tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Exercise recursive touch lifetimes under sanitizers
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -pedantic -pthread -fsanitize=address,undefined -Isource tests/teleport_guard_tests.cpp -o /tmp/teleport_guard_tests
+          /tmp/teleport_guard_tests
+
   luapack_policy_tests:
     name: "LuaPack map-base policy tests"
     runs-on: ubuntu-latest
