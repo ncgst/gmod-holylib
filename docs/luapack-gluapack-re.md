@@ -152,6 +152,12 @@ The controlled Windows client showed that GMod's `CompileString` adds its own `@
 
 The bootstrap now supplies the resolved logical filename without an explicit marker. The repository test model follows the observed engine behavior, and a regression checks the resulting exact debug source. Restoring only the old prefix in a separate negative control fails that assertion. This preserves the engine's global `include` and `CompileFile` functions. The model does not establish the engine's reload behavior; the controlled transaction records remain the runtime evidence.
 
+### 18. Abandoned worker request across map shutdown
+
+An independent follow-up found that a worker could move an active-compression ID into its private batch and abandon it on shutdown, leaving the retained entry's request flag set without a payload or queued task. Shutdown now clears that flag after the worker stops, while preserving completed payloads. Unchanged recovery can therefore enqueue replacement work after initialization.
+
+The lifecycle regression compiles the actual production request, worker, shutdown, and initialization methods with deterministic engine/thread adapters. It pauses after the worker claims its private batch, shuts down before compression, reinitializes the unchanged ready entry, and requires recovery to finish while a second entry reuses its completed payload. The old production shutdown fails this test. Compression bytes and live engine registration remain outside this focused harness.
+
 ## Design traceability
 
 | HolyLib choice | Evidence |
@@ -175,6 +181,6 @@ The September 10 replacement canary used the production changes plus a separatel
 
 On that final canary, a separate fixture-only control called the actual production native response and original engine sender to prime a 587-byte engine allocation with 180 written bytes. Explicit source capture reset the engine written length and cursor to zero while preserving its pointer and capacity. The original sender then recompressed version 2 to 181 written bytes with the expected digest and decoded source; unchanged recovery and another native send retained the same allocation and valid payload. This verifies the observed retained-allocation path, not request-decoder acceptance. The control bypassed the request decoder and is excluded from production.
 
-These are author-run observations for the identified binaries and fixture, not independent external execution or acceptance of every engine lifecycle. Shared-helper tests cover serialization capacity, owner replacement, and parked collection selection; the complete parked opt-out/authentication/promotion/disconnect lifecycle and current CI matrix remain open. The original server module/settings and owned client configuration were restored after testing. The merge hold remains.
+These are author-run observations for the identified binaries and fixture, not independent external execution or acceptance of every engine lifecycle. Shared-helper tests cover serialization capacity, owner replacement, and parked collection selection; the complete parked opt-out/authentication/promotion/disconnect lifecycle and newer-dependency CI coverage remain follow-up work. The original server module/settings and owned client configuration were restored after testing. The separate shutdown-request defect above has focused production-method regression coverage.
 
 If both stripped incumbent plugin architectures are supplied, findings 2, 3 (incumbent half), 4 (exact stub), 5 (producer), 7 (registration), 8 (set timing), 9 (pinning), 10 (detours), and 12 (signature comparison) can be completed before making any binary-equivalence claim. That comparison is not a HolyLib runtime-readiness gate.

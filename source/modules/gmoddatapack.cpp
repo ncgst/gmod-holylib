@@ -1779,6 +1779,9 @@ void LuaDataPack::Shutdown()
 	for (LuaPackEntry& entry : m_pLuaFileCache)
 	{
 		std::lock_guard<std::shared_mutex> lock(entry.mutex);
+		// The stopped worker may have abandoned IDs already moved into its private
+		// batch. Release their request latch; completed payloads remain reusable.
+		entry.activeRefreshRequested = false;
 		entry.activeHashRefreshPending = false;
 		entry.forceActiveHashRefreshPending = false;
 	}
