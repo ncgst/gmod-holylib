@@ -21,6 +21,7 @@ class Vector;
 class CBaseEntity;
 class CBasePlayer;
 class IClient;
+class IRecipientFilter;
 class IHandleEntity;
 class CCheckTransmitInfo;
 class CFileOpenInfo;
@@ -689,12 +690,17 @@ namespace Symbols
 
 	using CVEngineServer_GMOD_SendToClient = void (GMCOMMON_CALLING_CONVENTION*)(void*, int client, void *data, int dataSize);
 	extern const std::vector<Symbol> CVEngineServer_GMOD_SendToClientSym;
+	using CVEngineServer_GMOD_SendToClientFilter = void (*)(void*, IRecipientFilter*, void*, int);
+	extern const std::vector<Symbol> CVEngineServer_GMOD_SendToClientFilterSym;
 
 	using CSteam3Server_SendUpdatedServerDetails = void (GMCOMMON_CALLING_CONVENTION*)(void*);
 	extern const std::vector<Symbol> CSteam3Server_SendUpdatedServerDetailsSym;
 
 	using CBaseClient_SetSignonState = bool (GMCOMMON_CALLING_CONVENTION*)(void* client, int state, int spawncount);
 	extern const std::vector<Symbol> CBaseClient_SetSignonStateSym;
+
+	using CBaseClient_SendServerInfo = bool (GMCOMMON_CALLING_CONVENTION*)(void* client);
+	extern const std::vector<Symbol> CBaseClient_SendServerInfoSym;
 
 	using CGameClient_SetSignonState = bool (GMCOMMON_CALLING_CONVENTION*)(void* client, int state, int spawncount);
 	extern const std::vector<Symbol> CGameClient_SetSignonStateSym;
@@ -901,6 +907,9 @@ namespace Symbols
 	//---------------------------------------------------------------------------------
 	using GModDataPack_SendFileToClient = void (*)(void* dataPack, int userID, int fileID);
 	extern const std::vector<Symbol> GModDataPack_SendFileToClientSym;
+
+	using GModDataPack_OnFilesRequested = void (*)(void* dataPack, int userID, bf_read* message, int bits);
+	extern const std::vector<Symbol> GModDataPack_OnFilesRequestedSym;
 
 	using GModDataPack_AddOrUpdateFile = void (*)(void* dataPack, void* luaFile, bool);
 	extern const std::vector<Symbol> GModDataPack_AddOrUpdateFileSym;

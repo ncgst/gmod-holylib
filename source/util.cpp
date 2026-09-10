@@ -4,6 +4,7 @@
 
 #include "httplib.h"
 #include "util.h"
+#include "client_slot_lookup.h"
 #include "GarrysMod/Lua/LuaObject.h"
 #include <string>
 #include "GarrysMod/InterfacePointers.hpp"
@@ -266,6 +267,19 @@ CBaseClient* Util::GetClientByIndex(int index)
 		return nullptr;
 
 	return (CBaseClient*)server->GetClient(index);
+}
+
+#if MODULE_EXISTS_GAMESERVER
+extern CBaseClient* Gameserver_GetClientBySlot(int slot);
+#endif
+
+CBaseClient* Util::GetClientBySlot(int slot)
+{
+#if MODULE_EXISTS_GAMESERVER
+	return Gameserver_GetClientBySlot(slot);
+#else
+	return FindPhysicalClientBySlot<CBaseClient>(slot, server);
+#endif
 }
 
 std::vector<CBaseClient*> Util::GetClients()

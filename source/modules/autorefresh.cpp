@@ -2,6 +2,7 @@
 #include "LuaInterface.h"
 #include "lua.h"
 #include "detours.h"
+#include "modules/autorefresh_shared.h"
 
 #include "tier0/memdbgon.h"
 
@@ -137,18 +138,38 @@ static void hook_Bootil_File_ChangeMonitor_CheckForChanges(Bootil::File::ChangeM
 }
 
 static unordered_set<Bootil::BString> pBlacklistedFiles = {};
+#if !defined(MODULE_EXISTS_GMODDATAPACK)
 static Detouring::Hook detour_GarrysMod_AutoRefresh_HandleChange_Lua;
 static bool hook_GarrysMod_AutoRefresh_HandleChange_Lua(const std::string* pfileRelPath, const std::string* pfileName, const std::string* pfileExt)
 {
 	auto trampoline = detour_GarrysMod_AutoRefresh_HandleChange_Lua.GetTrampoline<Symbols::GarrysMod_AutoRefresh_HandleChange_Lua>();
-	if (!g_Lua || !pfileRelPath || !pfileName || !pfileExt)
-		return trampoline(pfileRelPath, pfileName, pfileExt);
+	if (HolyLib::AutoRefresh::RunPreLuaChange(pfileRelPath, pfileName, pfileExt))
+		return true;
 
-	// Is this really needed? Yes it is since AutoRefresh::Cycle calls all HandleChange functions expecting them to first check the file extension... Why...
-	if (std::string(pfileExt->substr(0, 3)) != "lua")
-		return trampoline(pfileRelPath, pfileName, pfileExt);
+	bool originalResult = trampoline(pfileRelPath, pfileName, pfileExt);
+	HolyLib::AutoRefresh::RunPostLuaChange(pfileRelPath, pfileName, pfileExt);
+	return originalResult;
+};
+#endif
 
-	bool bDenyRefresh = false;
+static bool IsAutoRefreshModuleEnabled()
+{
+	IModuleWrapper* module = g_pModuleManager.GetModuleByID(HOLYLIB_MODULEID_AUTOREFRESH);
+	return module && module->IsEnabled();
+}
+
+bool HolyLib::AutoRefresh::RunPreLuaChange(const std::string* pfileRelPath,
+	const std::string* pfileName, const std::string* pfileExt)
+{
+	if (!IsAutoRefreshModuleEnabled() || !g_Lua || !pfileRelPath || !pfileName || !pfileExt)
+		return false;
+
+	// AutoRefresh::Cycle calls all HandleChange functions and expects each to
+	// ignore extensions it does not own.
+	if (pfileExt->compare(0, 3, "lua") != 0)
+		return false;
+
+	bool denyRefresh = false;
 	if (Lua::PushHook("HolyLib:PreLuaAutoRefresh"))
 	{
 		g_Lua->PushString(pfileRelPath->c_str());
@@ -156,31 +177,30 @@ static bool hook_GarrysMod_AutoRefresh_HandleChange_Lua(const std::string* pfile
 
 		if (g_Lua->CallFunctionProtected(3, 1, true))
 		{
-			bDenyRefresh = g_Lua->GetBool(-1);
+			denyRefresh = g_Lua->GetBool(-1);
 			g_Lua->Pop(1);
 		}
 	}
 
-	if (pBlacklistedFiles.find(*pfileRelPath) != pBlacklistedFiles.end())
+	return denyRefresh || pBlacklistedFiles.find(*pfileRelPath) != pBlacklistedFiles.end();
+}
+
+void HolyLib::AutoRefresh::RunPostLuaChange(const std::string* pfileRelPath,
+	const std::string* pfileName, const std::string* pfileExt)
+{
+	if (!IsAutoRefreshModuleEnabled() || !g_Lua || !pfileRelPath || !pfileName || !pfileExt ||
+		pfileExt->compare(0, 3, "lua") != 0)
 	{
-		bDenyRefresh = true;
+		return;
 	}
-
-	if (bDenyRefresh)
-		return true;
-
-	bool originalResult = trampoline(pfileRelPath, pfileName, pfileExt);
 
 	if (Lua::PushHook("HolyLib:PostLuaAutoRefresh"))
 	{
 		g_Lua->PushString(pfileRelPath->c_str());
 		g_Lua->PushString(pfileName->c_str());
-
 		g_Lua->CallFunctionProtected(3, 0, true);
 	}
-
-	return originalResult;
-};
+}
 
 LUA_FUNCTION_STATIC(autorefresh_AddFileToRefresh)
 {
@@ -317,11 +337,15 @@ void CAutoRefreshModule::InitDetour(bool bPreServer)
 		return;
 
 	SourceSDK::FactoryLoader server_loader("server");
+#if defined(MODULE_EXISTS_GMODDATAPACK)
+	HolyLib::GModDataPack::InstallLuaAutoRefreshDetour();
+#else
 	Detour::Create(
 		&detour_GarrysMod_AutoRefresh_HandleChange_Lua, "GarrysMod::AutoRefresh::HandleChange_Lua",
 		server_loader.GetModule(), Symbols::GarrysMod_AutoRefresh_HandleChange_LuaSym,
 		(void*)hook_GarrysMod_AutoRefresh_HandleChange_Lua, m_pID
 	);
+#endif
 
 	DETOUR_PREPARE_THISCALL();
 	Detour::Create(

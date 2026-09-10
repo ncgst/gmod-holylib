@@ -36,9 +36,9 @@ enum ThreadState
 namespace GarrysMod::NetworkMessage
 {
 	constexpr int LuaFileDownload = 4; // Client told us which files he needs, so we must provide (IDs are sent in shorts / 2 bytes and the last one is ID 0!)
-	constexpr int RequestLuaFiles = 3; // Calls GModDataPack::OnFilesRequested - Tells the client to check the client_lua_files stringtable and to tell us which files they need
+	constexpr int RequestLuaFiles = 3; // Client-to-server requested-ID list; ignored in the server-to-client direction
 	constexpr int ClientLuaError = 2;
-	// 1 does not exist
+	constexpr int LuaFileRefresh = 1; // Server-to-client registered filename, u32 body byte count, SHA256 + LZMA payload
 	constexpr int LuaNetMessage = 0;
 }
 
@@ -281,6 +281,8 @@ namespace Util
 	extern CBaseClient* GetClientByUserID(int userID);
 	extern CBaseClient* GetClientByPlayer(const CBasePlayer* ply);
 	extern CBaseClient* GetClientByIndex(int index);
+	// Includes parked queue connections and validates the object's actual slot.
+	extern CBaseClient* GetClientBySlot(int slot);
 	extern std::vector<CBaseClient*> GetClients();
 	extern CBasePlayer* GetPlayerByClient(CBaseClient* client);
 	
