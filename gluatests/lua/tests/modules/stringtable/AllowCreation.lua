@@ -33,9 +33,10 @@ return {
             when = HolyLib_IsModuleEnabled("stringtable"),
             func = function()
                 stringtable.AllowCreation( false )
-                local table = stringtable.CreateStringTable( GetTestStringTableName(), 4192, 0, 0 )
-
-                expect( table:IsValid() ).to.beFalse()
+                local name = GetTestStringTableName()
+                expect(function()
+                    stringtable.CreateStringTable( name, 4096, 0, 0 )
+                end).to.errWith("Tried to create string table '" .. name .. "' at the wrong time!")
             end
         },
     }

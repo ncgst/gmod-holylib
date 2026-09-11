@@ -1,3 +1,5 @@
+require("jit.util")
+
 return {
     groupName = "HolyLib manages to properly Get HolyLib Referenced UserData to Lua",
     cases = {
@@ -42,13 +44,19 @@ return {
             name = "LuaJIT traces do not create a crash",
             async = true,
             timeout = 5,
-            func = function()
+            cleanup = function(state)
+                if state.wasJITEnabled == nil then return end
+                jit.flush()
+                if state.wasJITEnabled then jit.on() else jit.off() end
+            end,
+            func = function(state)
                 --[[
                     Very specific crash caused by LuaJIT generating a GCtrace which then for very magical reasons can lead to memory corruption of userdata
                 ]]
 
-                function generate_trace()
-                    jit.opt.start("hotloop=1", "hotexit=1")
+                state.wasJITEnabled = jit.status()
+                jit.on()
+                local function generate_trace()
                     jit.flush()
 
                     --[[jit.attach(function(what, traceno, func, pc, exitno)
@@ -81,15 +89,18 @@ return {
                     for n = 1, 1e4 do -- Generate those sweet GCtrace
                         trace_userdata(userData)
                     end
+                    return jit.util.traceinfo(1)
                 end
 
-                generate_trace()
+                expect( generate_trace() ).to.beA( "table" )
 
                 timer.Simple(1, function()
                     collectgarbage("collect")
 
                     timer.Simple(1, function()
-                        generate_trace() -- If this crashes, we got a problem...
+                        -- Keep verifying that the userdata path actually traces,
+                        -- including after collection, without leaking hotloop=1.
+                        expect( generate_trace() ).to.beA( "table" )
 
                         done()
                     end)

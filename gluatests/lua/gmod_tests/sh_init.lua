@@ -110,7 +110,7 @@ local github_repo = string.Trim(file.Read("_workflow/github_repo.txt", "MOD") or
 local loki_public_host = string.Trim(file.Read("_workflow/loki_public_host.txt", "MOD") or "")
 local loki_host = string.Trim(file.Read("_workflow/loki_host.txt", "MOD") or "")
 local loki_api = string.Trim(file.Read("_workflow/loki_api.txt", "MOD") or "")
-function HolyLib_RunPerformanceTest(name, callback)
+local function RunPerformanceTest(name, callback)
     local usingPublic = (string.len(loki_host) < 3 or string.len(loki_api) < 3)
     if usingPublic and (string.len(loki_public_host) < 3) or string.len(github_repo) < 3 then
         print("Skipping performance test \"" .. name .. "\" since were missing Loki.")
@@ -127,7 +127,8 @@ function HolyLib_RunPerformanceTest(name, callback)
             jit.on()
         end
 
-        jit.opt.start("hotloop=1", "hotexit=1")
+        -- The warmup already makes the callback hot. Leave global optimizer
+        -- thresholds alone so they cannot change how later test cases run.
         jit.flush()
 
         local totalTime, totalCalls = PerformanceTest(callback)
@@ -189,6 +190,19 @@ function HolyLib_RunPerformanceTest(name, callback)
         })
     end
     rec = false
+end
+
+function HolyLib_RunPerformanceTest(name, callback)
+    local wasJITEnabled = jit.status()
+    local success, err = pcall(RunPerformanceTest, name, callback)
+    jit.flush()
+    if wasJITEnabled then
+        jit.on()
+    else
+        jit.off()
+    end
+    rec = false
+    if not success then error(err, 0) end
 end
 
 if SERVER then
