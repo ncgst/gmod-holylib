@@ -1,5 +1,3 @@
-require("jit.util")
-
 return {
     groupName = "HolyLib manages to properly Get HolyLib Referenced UserData to Lua",
     cases = {
@@ -45,6 +43,7 @@ return {
             async = true,
             timeout = 5,
             cleanup = function(state)
+                if state.traceCallback then jit.attach(state.traceCallback) end
                 if state.wasJITEnabled == nil then return end
                 jit.flush()
                 if state.wasJITEnabled then jit.on() else jit.off() end
@@ -56,8 +55,13 @@ return {
 
                 state.wasJITEnabled = jit.status()
                 jit.on()
+                state.traceCallback = function(what)
+                    if what == "stop" then state.traceCompleted = true end
+                end
+                jit.attach(state.traceCallback, "trace")
                 local function generate_trace()
                     jit.flush()
+                    state.traceCompleted = false
 
                     --[[jit.attach(function(what, traceno, func, pc, exitno)
                         if exitno ~= nil then what = "abort" end
@@ -89,10 +93,10 @@ return {
                     for n = 1, 1e4 do -- Generate those sweet GCtrace
                         trace_userdata(userData)
                     end
-                    return jit.util.traceinfo(1)
+                    return state.traceCompleted
                 end
 
-                expect( generate_trace() ).to.beA( "table" )
+                expect( generate_trace() ).to.beTrue()
 
                 timer.Simple(1, function()
                     collectgarbage("collect")
@@ -100,7 +104,7 @@ return {
                     timer.Simple(1, function()
                         -- Keep verifying that the userdata path actually traces,
                         -- including after collection, without leaking hotloop=1.
-                        expect( generate_trace() ).to.beA( "table" )
+                        expect( generate_trace() ).to.beTrue()
 
                         done()
                     end)
