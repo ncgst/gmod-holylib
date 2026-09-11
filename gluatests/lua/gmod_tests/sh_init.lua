@@ -82,7 +82,12 @@ local function PerformanceTest(callback)
         callback()
     end
     local avgTime = (SysTime() - avgStartTime) / avgTimeTest
-    local loopAmount = math.max(1 / 20 / avgTime, 1) -- We do 1 / 20 so that it at wose will run 1/20 of a second longer than wanted
+    -- A very fast callback can finish within the clock's resolution. Never
+    -- divide by zero or spend an unbounded time in a batch before checking time.
+    local loopAmount = 1000
+    if avgTime > 0 then
+        loopAmount = math.max(1, math.min(math.floor(1 / 20 / avgTime), 10000))
+    end
     local callsPerLoop = loopAmount * 10
 
     local totalCalls = 0

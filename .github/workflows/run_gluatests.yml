@@ -246,6 +246,7 @@ jobs:
 
       - name: Run GLuaTest
         shell: bash
+        timeout-minutes: ${{ fromJSON(inputs.timeout) }}
         env:
           REQUIREMENTS: "${{ github.workspace }}/project/${{ inputs.requirements }}"
           CUSTOM_SERVER_CONFIG: "${{ github.workspace }}/project/${{ inputs.server-cfg }}"

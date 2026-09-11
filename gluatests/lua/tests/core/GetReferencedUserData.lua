@@ -43,7 +43,7 @@ return {
             async = true,
             timeout = 5,
             cleanup = function(state)
-                if state.traceCallback then jit.attach(state.traceCallback) end
+                if state.traceAttached then jit.attach(state.traceCallback) end
                 if state.wasJITEnabled == nil then return end
                 jit.flush()
                 if state.wasJITEnabled then jit.on() else jit.off() end
@@ -58,7 +58,11 @@ return {
                 state.traceCallback = function(what)
                     if what == "stop" then state.traceCompleted = true end
                 end
-                jit.attach(state.traceCallback, "trace")
+                local traceError
+                state.traceAttached, traceError = pcall(jit.attach, state.traceCallback, "trace")
+                if not state.traceAttached and not string.find(tostring(traceError), "vmevent API disabled", 1, true) then
+                    error(traceError)
+                end
                 local function generate_trace()
                     jit.flush()
                     state.traceCompleted = false
@@ -90,13 +94,23 @@ return {
                     end
 
                     local userData = _HOLYLIB_CORE.PushReferencedTestUserData()
+                    userData.test = 123
+                    local total = 0
                     for n = 1, 1e4 do -- Generate those sweet GCtrace
-                        trace_userdata(userData)
+                        total = total + trace_userdata(userData)
                     end
-                    return state.traceCompleted
+                    return total
                 end
 
-                expect( generate_trace() ).to.beTrue()
+                local function verify_trace()
+                    expect( jit.status() ).to.beTrue()
+                    expect( generate_trace() ).to.equal( 1230000 )
+                    -- Stock GMod disables vmevent. Keep the same hot userdata
+                    -- loop there; also observe compilation where supported.
+                    if state.traceAttached then expect( state.traceCompleted ).to.beTrue() end
+                end
+
+                verify_trace()
 
                 timer.Simple(1, function()
                     collectgarbage("collect")
@@ -104,7 +118,7 @@ return {
                     timer.Simple(1, function()
                         -- Keep verifying that the userdata path actually traces,
                         -- including after collection, without leaking hotloop=1.
-                        expect( generate_trace() ).to.beTrue()
+                        verify_trace()
 
                         done()
                     end)

@@ -33,8 +33,10 @@ jobs:
         run: |
           chmod +x source/_prebuildtools/luajit_64
           find gluatests -type f -name '*.lua' -print | sort | source/_prebuildtools/luajit_64 tests/gluatest_syntax.lua
-      - name: Check benchmark JIT state isolation
+      - name: Check benchmark state and timing bounds
         run: source/_prebuildtools/luajit_64 tests/gluatest_jit_state_tests.lua
+      - name: Check trace fixture with and without VM events
+        run: source/_prebuildtools/luajit_64 tests/gluatest_trace_fixture_tests.lua
 
   teleport_guard_tests:
     name: "Teleport recursion guard tests"

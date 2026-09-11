@@ -42,5 +42,26 @@ for _, enabled in ipairs({true, false}) do
     assert(not success and err == "benchmark callback failed", "benchmark swallowed the callback error")
     assert(jit.status() == enabled, "failed benchmark leaked JIT state")
 end
+
+-- Simulate clocks that cannot resolve the warmup, or report an extremely
+-- small positive interval. The callback budget makes the old infinite batch
+-- fail promptly instead of hanging this regression test too.
+for _, warmupInterval in ipairs({0, 1e-12}) do
+    local reads, calls = 0, 0
+    env.SysTime = function()
+        reads = reads + 1
+        if reads == 1 then return 0 end
+        if reads == 2 then return warmupInterval end
+        return (reads - 2) * 0.1
+    end
+    env.HolyLib_RunPerformanceTest("clock resolution", function()
+        calls = calls + 1
+        assert(calls < 500000, "calibration produced an unbounded batch")
+    end)
+    assert(calls > 0, "clock resolution test skipped the callback")
+end
+
+env.SysTime = os.clock
+env.HolyLib_RunPerformanceTest("real clock", function() end)
 if initiallyEnabled then jit.on() else jit.off() end
-print("Benchmark JIT state and error propagation checks passed")
+print("Benchmark JIT state, error propagation and timing bounds passed")
