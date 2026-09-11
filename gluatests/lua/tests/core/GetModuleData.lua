@@ -1,5 +1,5 @@
 return {
-    groupName = "HolyLib manages to properly Push Entities to Lua",
+    groupName = "HolyLib module data",
     cases = {
         {
             name = "Is _HOLYLIB_CORE.GetModuleData function existent",
@@ -17,7 +17,7 @@ return {
         {
             name = "Performance",
             func = function()
-                HolyLib_RunPerformanceTest("_HOLYLIB_CORE.GetModuleData", function() _HOLYLIB_CORE.RawGetModuleData end)
+                HolyLib_RunPerformanceTest("_HOLYLIB_CORE.GetModuleData", function() _HOLYLIB_CORE.RawGetModuleData() end)
             end
         },
     }

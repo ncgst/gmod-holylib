@@ -6,6 +6,7 @@
 #include "detours.h"
 #include "module.h"
 #include "lua.h"
+#include "filesystem_searchpath_layout.h"
 #include <algorithm>
 #include <cstring>
 #include "edict.h"
@@ -1840,6 +1841,9 @@ void CFileSystemModule::Init(CreateInterfaceFn* appfn, CreateInterfaceFn* gamefn
 }
 
 static CUtlSymbolTableMT* g_pPathIDTable;
+#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86)
+static std::size_t g_nSearchPathPathIDOffset = 0;
+#endif
 inline const char* CPathIDInfo::GetPathIDString() const
 {
 	/*
@@ -1856,8 +1860,16 @@ inline const char* CPathIDInfo::GetPathIDString() const
 
 inline const char* CSearchPath::GetPathIDString() const
 {
-	if (m_pPathIDInfo)
-		return m_pPathIDInfo->GetPathIDString(); // When can we nuke it :>
+	const CPathIDInfo* pathIDInfo = nullptr;
+#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86)
+	if (g_nSearchPathPathIDOffset == 0)
+		return nullptr;
+	std::memcpy(&pathIDInfo, reinterpret_cast<const unsigned char*>(this) + g_nSearchPathPathIDOffset, sizeof(pathIDInfo));
+#else
+	pathIDInfo = m_pPathIDInfo;
+#endif
+	if (pathIDInfo)
+		return pathIDInfo->GetPathIDString();
 
 	return nullptr;
 }
@@ -1905,6 +1917,17 @@ void CFileSystemModule::InitDetour(bool bPreServer)
 		SourceSDK::FactoryLoader filesystem_loader("filesystem_stdio");
 	#else
 		SourceSDK::FactoryLoader filesystem_loader("dedicated");
+	#endif
+
+	#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86)
+		void* pSetTrustedSource = Detour::GetFunction(filesystem_loader.GetModule(),
+			Symbol::FromName("_ZN15CBaseFileSystem28SetSearchPathIsTrustedSourceEPNS_11CSearchPathE"));
+		g_nSearchPathPathIDOffset = FileSystemLayout::Linux32PathIDOffset(pSetTrustedSource, 19);
+		if (g_nSearchPathPathIDOffset == 0)
+		{
+			Warning(PROJECT_NAME " - filesystem: unrecognized Linux32 search-path layout; leaving engine filesystem hooks disabled\n");
+			return;
+		}
 	#endif
 
 	// A total abomination to get the vtable so that we can pass the functions to use as hooks

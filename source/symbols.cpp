@@ -363,7 +363,7 @@ namespace Symbols
 
 	const std::vector<Symbol> CBaseFileSystem_IsDirectorySym = { // Search for "Unable to rename %s to %s!\n" to get CBaseFileSystem::RenameFile then xref and get the vtable and 2 bellow
 		Symbol::FromName("_ZN15CBaseFileSystem11IsDirectoryEPKcS1_"),
-		Symbol::FromSignature("\x55\x48\x89\xE5\x41\x57\x41\x56\x41\x55\x4C\x8D\xAD\x38***\x41\x54"), // 55 48 89 E5 41 57 41 56 41 55 4C 8D AD 38 ?? ?? ?? 41 54
+		Symbol::FromSignature("\x55\x48\x89\xE5\x41\x57\x41\x56\x41\x55\x41\x54\x49\x89\xFC\x53\x48\x81\xEC\xD8\x05\x00\x00"), // Linux64 dedicated.so: unwind entry containing the CBaseFileSystem::IsDirectory profiler string
 		Symbol::FromSignature("\x55\x8B\xEC\x81\xEC\x90\x04\x00\x00"), // 55 8B EC 81 EC 90 04 00 00
 		Symbol::FromSignature("\x40\x55\x53\x56\x57\x41\x57\x48\x8D\xAC\x24\x90\xFB\xFF\xFF"), // 40 55 53 56 57 41 57 48 8D AC 24 90 FB FF FF
 		Symbol::FromSignature("\x55\x8B\xEC\x81\xEC\x9C\x04\x00\x00") // 55 8B EC 81 EC 9C 04 00 00

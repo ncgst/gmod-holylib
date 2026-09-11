@@ -1,5 +1,12 @@
 return {
     groupName = "FileSystem:EasyDirCheck",
+    beforeEach = function(state)
+        state.easyDirCheck = GetConVar("holylib_filesystem_easydircheck"):GetString()
+    end,
+    afterEach = function(state)
+        RunConsoleCommand("holylib_filesystem_easydircheck", state.easyDirCheck)
+        HolyLib.ServerExecute()
+    end,
     cases = {
         {
             name = "Skips directory check if folder name contains a dot after the last /",
@@ -17,8 +24,6 @@ return {
                 expect(file.IsDir("addons/gluatests/test.folder", "MOD")).to.beFalse() -- It's expected behavior for this to fail.
                 expect(file.IsDir("addons/gluatests/test.folder/folder2", "MOD")).to.beTrue()
 
-                RunConsoleCommand("holylib_filesystem_easydircheck", GetConVar("holylib_filesystem_easydircheck"):GetDefault()) -- Restoring to default
-                HolyLib.ServerExecute()
             end,
         },
     }

@@ -23,6 +23,17 @@ env:
   LOKI_PUBLIC: https://loki-public.raphaelit7.com # A completely seperate public loki server with bare minimum resources exposed for forks to use. (Yes anyone could abuse it but fk em, it doesn't have resources for any useful shit other than this.)
 
 jobs:
+  gluatest_syntax:
+    name: "GLuaTest syntax"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Parse all GLuaTest files with the bundled GLua compiler
+        shell: bash
+        run: |
+          chmod +x source/_prebuildtools/luajit_64
+          find gluatests -type f -name '*.lua' -print | sort | source/_prebuildtools/luajit_64 tests/gluatest_syntax.lua
+
   teleport_guard_tests:
     name: "Teleport recursion guard tests"
     runs-on: ubuntu-latest
@@ -32,6 +43,16 @@ jobs:
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror -pedantic -pthread -fsanitize=address,undefined -Isource tests/teleport_guard_tests.cpp -o /tmp/teleport_guard_tests
           /tmp/teleport_guard_tests
+
+  filesystem_layout_tests:
+    name: "Filesystem search-path ABI tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check supported layouts and reject unknown engine code
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined -Isource tests/filesystem_searchpath_layout_tests.cpp -o /tmp/filesystem_searchpath_layout_tests
+          /tmp/filesystem_searchpath_layout_tests
 
   luapack_policy_tests:
     name: "LuaPack map-base policy tests"
@@ -51,6 +72,7 @@ jobs:
 
   build_plugin_windows:
     name: "Build Plugin"
+    needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
       PROJECT_NAME: "holylib"
@@ -70,6 +92,7 @@ jobs:
 
   build_plugin_windows_dedicated:
     name: "Build Plugin (Dedicated)"
+    needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
       PROJECT_NAME: "holylib"
@@ -90,6 +113,7 @@ jobs:
 
   build_plugin_windows_64x_main:
     name: "Build Plugin (64x - Main Branch)"
+    needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
       PROJECT_NAME: "holylib"
@@ -110,6 +134,7 @@ jobs:
 
   build_plugin_linux:
     name: "Build Plugin"
+    needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
       PROJECT_NAME: "holylib"
@@ -128,6 +153,7 @@ jobs:
   build_testingarea:
     name: "Build 32x (Testing Area - Dev)"
     if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     secrets:
       PTERODACTYL_KEY: ${{ secrets.PTERODACTYL_KEY }}
@@ -153,6 +179,7 @@ jobs:
   build_testingarea_dev2: # Could make this use the already created artifact but I'm too lazy rn
     name: "Build 32x (Testing Area - Public)"
     if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     secrets:
       PTERODACTYL_KEY: ${{ secrets.PTERODACTYL_KEY }}
@@ -178,6 +205,7 @@ jobs:
   build_testingarea_64x:
     name: "Build 64x (Testing Area - 64x)"
     if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     secrets:
       PTERODACTYL_KEY: ${{ secrets.PTERODACTYL_KEY }}
@@ -203,6 +231,7 @@ jobs:
 
   build_ghostinj:
     name: "Build GhostInj"
+    needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
       PROJECT_PATH: "ghostinj-dll/"
@@ -227,6 +256,7 @@ jobs:
     # Doing this paralle to the main builds gives us at minimim 1min time with ~34 runners available to run parallel
     # needs: build_plugin_linux
     name: "Build Stripped modules"
+    needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     strategy:
       fail-fast: false
@@ -763,6 +793,7 @@ jobs:
 
   build_exampledll_linux:
     name: "Build ExampleDLL"
+    needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
       PROJECT_PATH: "example-module-dll/"
