@@ -1,9 +1,15 @@
 name: Build Plugin
 
+# Cancel superseded PR builds, but never coalesce deployment-bearing pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 on: 
   push:
     paths:
       - '.github/workflows/compile.yml'
+      - '.github/workflows/run_gluatests.yml'
       - 'source/**'
       - 'gluatests/**'
       - 'tests/**'
@@ -328,7 +334,7 @@ jobs:
         with:
           name: gluatest_${{ matrix.arch }}
           path: gluatest.tar.gz
-          compression-level: 9
+          compression-level: 0 # The tarball is already gzip-compressed.
           retention-days: 1
 
       - uses: actions/upload-artifact@v7
@@ -336,7 +342,7 @@ jobs:
         with:
           name: gluatest_no_ghostinj_${{ matrix.arch }}
           path: gluatest_no_ghostinj.tar.gz
-          compression-level: 9
+          compression-level: 0 # The tarball is already gzip-compressed.
           retention-days: 1
 
   test_32bit:
@@ -567,7 +573,7 @@ jobs:
         with:
           name: gmod_tests_${{ matrix.arch }}
           path: gmod_tests.tar.gz
-          compression-level: 9
+          compression-level: 0 # The tarball is already gzip-compressed.
           retention-days: 1
 
       - uses: actions/upload-artifact@v7
@@ -575,7 +581,7 @@ jobs:
         with:
           name: gmod_tests_no_ghostinj_${{ matrix.arch }}
           path: gmod_tests_no_ghostinj.tar.gz
-          compression-level: 9
+          compression-level: 0 # The tarball is already gzip-compressed.
           retention-days: 1
 
   test_gmod_tests_32bit:
@@ -822,7 +828,7 @@ jobs:
         with:
           name: gluatest_exampledll_${{ matrix.arch }}
           path: gluatest_exampledll.tar.gz
-          compression-level: 9
+          compression-level: 0 # The tarball is already gzip-compressed.
           retention-days: 1
 
       - uses: actions/upload-artifact@v7
@@ -830,7 +836,7 @@ jobs:
         with:
           name: gluatest_exampledll_no_ghostinj_${{ matrix.arch }}
           path: gluatest_exampledll_no_ghostinj.tar.gz
-          compression-level: 9
+          compression-level: 0 # The tarball is already gzip-compressed.
           retention-days: 1
 
   test_exampledll_32bit:
