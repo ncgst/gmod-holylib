@@ -139,6 +139,8 @@ Most non-physics HolyLib modules are independent of the replacement physics engi
 
 ## Builds and development
 
+- [September 2026 GMod update readiness](docs/gmod-september-2026.md) tracks CI,
+  staging, real-client acceptance and rollback requirements.
 - [`BUILD.md`](BUILD.md) documents the local build layout.
 - [GitHub Actions](https://github.com/ncgst/gmod-holylib/actions) publishes development
   artifacts for commits and pull requests.
