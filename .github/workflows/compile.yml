@@ -156,7 +156,7 @@ jobs:
 
   build_testingarea:
     name: "Build 32x (Testing Area - Dev)"
-    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
     needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     secrets:
@@ -182,7 +182,7 @@ jobs:
 
   build_testingarea_dev2: # Could make this use the already created artifact but I'm too lazy rn
     name: "Build 32x (Testing Area - Public)"
-    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
     needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     secrets:
@@ -208,7 +208,7 @@ jobs:
 
   build_testingarea_64x:
     name: "Build 64x (Testing Area - 64x)"
-    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
     needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     secrets:
@@ -580,6 +580,7 @@ jobs:
         with:
           sparse-checkout: lua
           repository: 'RaphaelIT7/gmod_tests'
+          ref: f71a7b07406f5655b2b78b106e36646147b4e56f
           path: 'gmod_tests'
 
       - uses: actions/download-artifact@v8
@@ -661,6 +662,9 @@ jobs:
       map: gm_glua_tests
 
   test_gmod_tests_32bit_with_ivpreplacement:
+    # This flag selects embedded IVP, not Jolt. IncludeIVP() is disabled in
+    # premake5.lua, so enabling this job would only retest stock physics.
+    # Track the separate Jolt acceptance gate in docs/gmod-september-2026.md.
     if: false
     name: "Test 32x branches (gmod_tests & VPhysics replacement)"
     needs: setup_gmod_tests_artifacts
@@ -685,6 +689,7 @@ jobs:
       map: gm_glua_tests
 
   test_gmod_tests_64bit_with_ivpreplacement:
+    # Embedded IVP is not compiled into the test artifact; this is not Jolt.
     if: false
     name: "Test x86-64 branch (gmod_tests & VPhysics replacement)"
     needs: setup_gmod_tests_artifacts
@@ -705,11 +710,11 @@ jobs:
       map: gm_glua_tests
 
   test_gmod_tests_32bit_with_luajit:
-    if: false
-    name: "Test 32x branches (gmod_tests & VPhysics replacement)"
+    name: "Test 32x branches (gmod_tests & LuaJIT replacement)"
     needs: setup_gmod_tests_artifacts
     uses: ./.github/workflows/run_gluatests.yml
     strategy:
+      fail-fast: false
       matrix:
         branch:
           - public
@@ -725,15 +730,17 @@ jobs:
       extra-startup-args: "${{ matrix.artifact.args }} -maxplayers 64 -holylib_enable_luajit 1"
       download-artifact: ${{ matrix.artifact.name }}
       no-checkout: true
+      timeout: "10"
+      logs-as-artifact: true
       additional-setup: "curl -L -o gluatest/docker/_gluatest_artifacts/linux.tar.gz https://github.com/RaphaelIT7/gmod-holytest/releases/latest/download/linux.tar.gz"
       map: gm_glua_tests
 
   test_gmod_tests_64bit_with_luajit:
-    if: false
     name: "Test x86-64 branch (gmod_tests & LuaJIT replacement)"
     needs: setup_gmod_tests_artifacts
     uses: ./.github/workflows/run_gluatests.yml
     strategy:
+      fail-fast: false
       matrix:
         artifact:
           - name: gmod_tests_64x
@@ -745,6 +752,8 @@ jobs:
       extra-startup-args: "${{ matrix.artifact.args }} -maxplayers 64 -holylib_enable_luajit 1"
       download-artifact: ${{ matrix.artifact.name }}
       no-checkout: true
+      timeout: "10"
+      logs-as-artifact: true
       additional-setup: "curl -L -o gluatest/docker/_gluatest_artifacts/linux.tar.gz https://github.com/RaphaelIT7/gmod-holytest/releases/latest/download/linux.tar.gz"
       map: gm_glua_tests
 
