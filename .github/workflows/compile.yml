@@ -598,7 +598,7 @@ jobs:
           tar -xzf gluatest.tar.gz
 
           mv gmod_tests garrysmod/addons
-          cp garrysmod/addons/gluatests/lua/tests/modules/luajit/TypeCompatibility.lua garrysmod/addons/gmod_tests/lua/tests/holylib_type_compatibility.lua
+          cp garrysmod/addons/gluatests/lua/tests/modules/luajit/TypeCompatibility.lua garrysmod/addons/gmod_tests/lua/tests/gmod/unit/holylib_type_compatibility.lua
           mkdir -p garrysmod/lua/bin/gmod_tests/maps
           mv garrysmod/addons/gluatests/maps garrysmod/addons/gmod_tests/maps
           rm -rf garrysmod/addons/gluatests

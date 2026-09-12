@@ -1,10 +1,12 @@
 -- Cons of this AngleFFI:
 -- setting x/y/z to a string that contains a number, will error, eg. v.x = "1" won't work but works in gmod
--- cannot grab the metatable of the angtor, nor edit it, so you cannot add custom methods to the angtor
+-- metatable identity differs from native userdata; methods added to the native Angle metatable remain available
 
 -- Collaboration between Raphael & Srlion (https://github.com/Srlion) <3
 
 local CreateAngle, isangle
+---@class Angle
+local gmodAngMeta = FindMetaTable("Angle")
 
 do
     local old_type = type
@@ -99,6 +101,9 @@ local mt = {
         elseif k == 3 or k == "r" or k == "roll" or k == "z" then
             return s.z
         end
+
+        -- Lua extensions such as SnapTo are installed after this FFI script.
+        return gmodAngMeta[k]
     end,
     __newindex = function(s, k, v)
         local num = check_num(v, 3)
@@ -160,9 +165,7 @@ local mt = {
     __unm = function(a)
         return Angle(-a.x, -a.y, -a.z)
     end,
-    __tostring = function(a)
-        return string.format("%f %f %f", a.x, a.y, a.z)
-    end,
+    __tostring = gmodAngMeta.__tostring,
     MetaName = "Angle",
     MetaID = 11,
 }
@@ -190,27 +193,6 @@ function methods:Sub(v)
     self.z = self.z - v.z
 end
 
-function methods:Div(div)
-    local x, y, z = check_ang_or_num(tonumber(div), 1)
-
-    self.x = self.x / x
-    self.y = self.y / y
-    self.z = self.z / z
-end
-
-function methods:Mul(multiplier)
-    local x, y, z = check_ang_or_num(multiplier, 1)
-
-    self.x = self.x * x
-    self.y = self.y * y
-    self.z = self.z * z
-end
-
-function methods:IsEqualTol(compare, tolerance)
-    return math.abs(self.x - compare.x) <= tolerance and math.abs(self.y - compare.y) <= tolerance and
-        math.abs(self.z - compare.z) <= tolerance
-end
-
 function methods:IsZero()
     return self.x == 0 and self.y == 0 and self.z == 0
 end
@@ -236,31 +218,12 @@ function methods:Normalize()
     self.z = AngleNormalize(self.z)
 end
 
-function methods:Random(min, max)
-    min = min or -1
-    max = max or -1
-
-    self.x = math.random(min, max)
-    self.y = math.random(min, max)
-    self.z = math.random(min, max)
-end
-
 function methods:Set(v)
     check_ang(v, 1)
 
     self.x = v.x
     self.y = v.y
     self.z = v.z
-end
-
-function methods:SetUnpacked(x, y, z)
-    check_num(x, 1)
-    check_num(y, 2)
-    check_num(z, 3)
-
-    self.x = x
-    self.y = y
-    self.z = z
 end
 
 function methods:Unpack()
@@ -310,8 +273,13 @@ function methods:Forward()
     return Vector(x, y, z)
 end
 
----@class Angle
-local gmodAngMeta = FindMetaTable("Angle")
+-- The native methods already accept bridged FFI angles. Reuse their numeric
+-- coercion, default arguments and diagnostics instead of approximating them.
+methods.Div = gmodAngMeta.Div
+methods.Mul = gmodAngMeta.Mul
+methods.IsEqualTol = gmodAngMeta.IsEqualTol
+methods.Random = gmodAngMeta.Random
+methods.SetUnpacked = gmodAngMeta.SetUnpacked
 methods.RotateAroundAxis = gmodAngMeta.RotateAroundAxis -- ToDo
 methods.Right = gmodAngMeta.Right -- ToDo
 

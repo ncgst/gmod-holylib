@@ -27,6 +27,7 @@ local function checkTypes()
         assert(isvector(sample.value) == (sample.id == TYPE_VECTOR), "isvector mismatch")
         assert(isangle(sample.value) == (sample.id == TYPE_ANGLE), "isangle mismatch")
     end
+    return true
 end
 
 -- Use a changing argument so the recorder must produce the type ID, not leave
@@ -37,6 +38,7 @@ local function hotPrimitiveTypes()
         sum = sum + TypeID(index) + TypeID(index % 2 == 0)
     end
     assert(sum == 4096 * (TYPE_NUMBER + TYPE_BOOL), "hot TypeID returned the argument instead of its type")
+    return true
 end
 
 return {
@@ -45,7 +47,7 @@ return {
         {
             name = "Loads HolyLib and the requested LuaJIT runtime",
             func = function()
-                assert(_HOLYLIB == true, "HolyLib did not load")
+                expect(_HOLYLIB).to.beTrue()
                 local enabled = GetConVar("holylib_enable_luajit")
                 assert(enabled ~= nil, "HolyLib LuaJIT module configuration is unavailable")
                 if enabled:GetBool() then
@@ -56,7 +58,7 @@ return {
         {
             name = "Preserves stock type contracts for native and replacement values",
             func = function()
-                checkTypes()
+                expect(checkTypes()).to.beTrue()
             end
         },
         {
@@ -74,6 +76,7 @@ return {
                 jit.flush(hotPrimitiveTypes)
                 if not wasEnabled then jit.off() end
                 assert(ok, err)
+                expect(ok).to.beTrue()
             end
         },
         {
@@ -92,6 +95,7 @@ return {
                 end)
                 net.Abort()
                 assert(ok, err)
+                expect(ok).to.beTrue()
             end
         },
     }
