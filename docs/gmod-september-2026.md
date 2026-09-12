@@ -7,6 +7,7 @@ Tracking issue: https://github.com/ncgst/gmod-holylib/issues/20
 The official announcement currently targets September 16, 2026 at 15:00 UTC
 (23:00 Asia/Shanghai) and says updated clients can still join older servers.
 Recheck the announcement and preview on release day:
+
 - https://steamcommunity.com/app/4000/announcements/
 - https://wiki.facepunch.com/gmod/Update_Preview_Changelog
 
@@ -112,3 +113,18 @@ or use Steam validation as the rollback plan.
 Production mutation requires a freshly verified target and artifact set.
 This preparation does not assert that a server has been upgraded.
 
+## Recorded validation
+
+The repaired source at fbd3b03b8de61b380984b5994ebc9dd03c3b3f7c passed all
+44 runtime jobs in run 34695197185, including all eight broader LuaJIT
+replacement jobs. The representative x86-64 broader suite reported 976 passes,
+zero failures, zero empty tests and 12 pre-existing skips on GMod 2026.09.09.
+HolyLib type/GC/serialization checks also passed before and after a map change.
+
+The initial broader run exposed 11 Angle FFI parity failures. The repair reuses
+native argument/formatting semantics and resolves later-added native metatable
+methods such as SnapTo. It keeps the FFI replacements enabled.
+
+The first reporting attempt failed while decoding incomplete performance JSON;
+this was separate from the passing runtime jobs. Issue #20 records reporting
+status and the still-pending staging/Jolt/real-client acceptance gates.
