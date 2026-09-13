@@ -2356,6 +2356,17 @@ static bool IsGModDataPackModuleEnabled()
 static bool ReadLuaAutoRefreshSource(const std::string& fileRelPath,
 	const std::string& fileName, std::string& output)
 {
+	output.clear();
+	std::string sourcePath;
+	std::string registeredPath;
+	using HolyLib::LuaPack::Policy::NormalizeExistingLuaRefreshRegistrationPath;
+	if (!NormalizeExistingLuaRefreshRegistrationPath(fileName, registeredPath) ||
+		(!fileRelPath.empty() &&
+			!NormalizeExistingLuaRefreshRegistrationPath(fileRelPath, sourcePath)))
+	{
+		return false;
+	}
+
 	auto readPath = [&](const std::string& path, const char* pathID) -> bool
 	{
 		FileHandle_t handle = g_pFullFileSystem->Open(path.c_str(), "rb", pathID);
@@ -2373,13 +2384,28 @@ static bool ReadLuaAutoRefreshSource(const std::string& fileRelPath,
 		const int read = size == 0 ? 0 :
 			g_pFullFileSystem->Read(output.data(), static_cast<int>(size), handle);
 		g_pFullFileSystem->Close(handle);
-		return read == static_cast<int>(size);
+		if (read == static_cast<int>(size))
+			return true;
+		output.clear();
+		return false;
 	};
 
-	if (!fileRelPath.empty() && readPath(fileRelPath, "MOD"))
-		return true;
-	return !fileName.empty() && readPath("lua/" + fileName, "GAME");
+	auto isSourcePath = [](const std::string& path) {
+		return path.compare(0, 4, "lua/") == 0 ||
+			path.compare(0, 7, "addons/") == 0 ||
+			path.compare(0, 10, "gamemodes/") == 0;
+	};
+	// Full registrations already identify the owning source. Prefixing them with
+	// lua/ creates invalid paths; stripping the addon root can read a shadowing
+	// addon instead. A transient failure must retry this exact source later.
+	if (isSourcePath(registeredPath))
+		return readPath(registeredPath, "MOD");
+	if (isSourcePath(sourcePath))
+		return readPath(sourcePath, "MOD");
+	return readPath("lua/" + registeredPath, "GAME");
 }
+
+enum class LuaPackDiskRefreshMode { Automatic, Deferred, Explicit };
 
 enum class LuaPackDiskRefreshResult
 {
@@ -2388,10 +2414,56 @@ enum class LuaPackDiskRefreshResult
 	UnknownRegistration,
 	Resolved,
 	Unreadable,
+	ReadQueued,
 	Unchanged,
 	RefreshQueued,
 	Captured,
 };
+
+struct PendingLuaAutoRefreshRead
+{
+	int fileID;
+	std::string sourcePath;
+	std::string registeredName;
+	double nextAttempt;
+	double deadline;
+	unsigned int attempts = 0;
+};
+
+static constexpr std::size_t luaAutoRefreshReadLimit = 256;
+static constexpr unsigned int luaAutoRefreshReadBudget = 8;
+static constexpr unsigned int luaAutoRefreshReadAttempts = 4;
+static constexpr double luaAutoRefreshReadDelay = 0.25;
+static constexpr double luaAutoRefreshReadLifetime = 5.0;
+static std::deque<PendingLuaAutoRefreshRead> g_pendingLuaAutoRefreshReads;
+
+static void CancelLuaAutoRefreshRead(int fileID)
+{
+	g_pendingLuaAutoRefreshReads.erase(std::remove_if(
+		g_pendingLuaAutoRefreshReads.begin(), g_pendingLuaAutoRefreshReads.end(),
+		[fileID](const PendingLuaAutoRefreshRead& read) { return read.fileID == fileID; }),
+		g_pendingLuaAutoRefreshReads.end());
+}
+
+static bool QueueLuaAutoRefreshRead(int fileID, const std::string& sourcePath,
+	const std::string& registeredName)
+{
+	for (const PendingLuaAutoRefreshRead& read : g_pendingLuaAutoRefreshReads)
+	{
+		// Coalescing must not reset the deadline or replenish the attempt budget.
+		if (read.fileID == fileID && read.registeredName == registeredName)
+			return true;
+	}
+	if (g_pendingLuaAutoRefreshReads.size() >= luaAutoRefreshReadLimit)
+		return false;
+
+	const double now = Plat_FloatTime();
+	g_pendingLuaAutoRefreshReads.push_back({fileID, sourcePath, registeredName,
+		now + luaAutoRefreshReadDelay, now + luaAutoRefreshReadLifetime});
+	Warning(PROJECT_NAME " - luapack: could not read auto refresh for existing client Lua registration \"%s\"; queued bounded source rereads\n",
+		registeredName.c_str());
+	return true;
+}
 
 static LuaPackDiskRefreshResult ResolveExistingLuaRegistration(
 	const std::string& fileRelPath, const std::string& fileName,
@@ -2422,10 +2494,10 @@ static LuaPackDiskRefreshResult ResolveExistingLuaRegistration(
 
 static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
 	const std::string& fileRelPath, const std::string& fileName,
-	const char* telemetryKind, bool recoverUnchanged)
+	LuaPackDiskRefreshMode mode)
 {
 	if (!IsGModDataPackModuleEnabled() || !g_pFullFileSystem || !g_pDataPack ||
-		!g_pDataPack->m_pClientLuaFiles || !HolyLib::LuaPack::IsEnabled() ||
+		!g_pDataPack->m_pClientLuaFiles || !Lua::GetShared() || !HolyLib::LuaPack::IsEnabled() ||
 		!HolyLib::LuaPack::SupportsCanonicalRegistration())
 	{
 		return LuaPackDiskRefreshResult::NotEligible;
@@ -2447,12 +2519,16 @@ static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
 	bool sourceChanged = true;
 	if (sourceReadable)
 	{
+		CancelLuaAutoRefreshRead(fileID);
 		if (LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID))
 		{
 			std::shared_lock<std::shared_mutex> lock(entry->mutex);
 			sourceChanged = !entry->hasSourceContent || entry->sourceContent != source;
 		}
 	}
+	const bool recoverUnchanged = mode == LuaPackDiskRefreshMode::Explicit;
+	const char* telemetryKind = recoverUnchanged ? "explicit" :
+		(mode == LuaPackDiskRefreshMode::Deferred ? "deferred auto" : "auto");
 	const bool captureAndRefresh = HolyLib::LuaPack::Policy::ShouldCaptureAutoRefresh(
 		true, true, true, sourceReadable, sourceChanged);
 	auto refreshNativeSource = [&]() {
@@ -2473,8 +2549,16 @@ static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
 	{
 		if (!sourceReadable)
 		{
-			Warning(PROJECT_NAME " - luapack: could not read %s refresh for existing client Lua registration \"%s\"\n",
-				telemetryKind ? telemetryKind : "disk", registeredName.c_str());
+			if (mode == LuaPackDiskRefreshMode::Automatic &&
+				QueueLuaAutoRefreshRead(fileID, fileRelPath, registeredName))
+			{
+				return LuaPackDiskRefreshResult::ReadQueued;
+			}
+			if (mode != LuaPackDiskRefreshMode::Deferred)
+			{
+				Warning(PROJECT_NAME " - luapack: could not read %s refresh for existing client Lua registration \"%s\"; no source reread queued\n",
+					telemetryKind, registeredName.c_str());
+			}
 			return LuaPackDiskRefreshResult::Unreadable;
 		}
 		if (HolyLib::LuaPack::Policy::ShouldQueueExplicitRefreshRecovery(
@@ -2497,8 +2581,67 @@ static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
 	// LuaPack entry; otherwise this bypass path must stage a complete active refresh.
 	g_pLuaDataPack.AddFileContents(registeredName, source);
 	Msg(PROJECT_NAME " - luapack: captured %s refresh for existing client Lua registration \"%s\"\n",
-		telemetryKind ? telemetryKind : "disk", registeredName.c_str());
+		telemetryKind, registeredName.c_str());
 	return LuaPackDiskRefreshResult::Captured;
+}
+
+static void DrainLuaAutoRefreshReads()
+{
+	if (g_pendingLuaAutoRefreshReads.empty())
+		return;
+	if (!IsGModDataPackModuleEnabled() || !HolyLib::LuaPack::IsEnabled() ||
+		!HolyLib::LuaPack::SupportsCanonicalRegistration() || !g_pFullFileSystem ||
+		!g_pDataPack || !g_pDataPack->m_pClientLuaFiles || !Lua::GetShared())
+	{
+		g_pendingLuaAutoRefreshReads.clear();
+		return;
+	}
+
+	const double now = Plat_FloatTime();
+	std::size_t remaining = g_pendingLuaAutoRefreshReads.size();
+	unsigned int attempted = 0;
+	while (remaining > 0 && attempted < luaAutoRefreshReadBudget &&
+		!g_pendingLuaAutoRefreshReads.empty())
+	{
+		--remaining;
+		PendingLuaAutoRefreshRead read = std::move(g_pendingLuaAutoRefreshReads.front());
+		g_pendingLuaAutoRefreshReads.pop_front();
+		if (now >= read.deadline)
+		{
+			Warning(PROJECT_NAME " - luapack: source reread deadline expired for \"%s\"; keeping the last captured revision\n",
+				read.registeredName.c_str());
+			continue;
+		}
+		if (now < read.nextAttempt)
+		{
+			g_pendingLuaAutoRefreshReads.push_back(std::move(read));
+			continue;
+		}
+
+		int fileID = INVALID_STRING_INDEX;
+		std::string registeredName;
+		if (ResolveExistingLuaRegistration(read.sourcePath, read.sourcePath,
+			fileID, registeredName) != LuaPackDiskRefreshResult::Resolved ||
+			fileID != read.fileID || registeredName != read.registeredName)
+		{
+			continue;
+		}
+		++attempted;
+		// Only capture the current complete disk revision. Replaying the engine
+		// watcher would execute shared/server Lua twice and duplicate native refreshes.
+		const auto result = CaptureExistingLuaPackDiskRefresh(read.sourcePath,
+			read.sourcePath, LuaPackDiskRefreshMode::Deferred);
+		if (result != LuaPackDiskRefreshResult::Unreadable)
+			continue;
+		if (++read.attempts >= luaAutoRefreshReadAttempts)
+		{
+			Warning(PROJECT_NAME " - luapack: source reread attempts exhausted for \"%s\"; keeping the last captured revision\n",
+				read.registeredName.c_str());
+			continue;
+		}
+		read.nextAttempt = now + luaAutoRefreshReadDelay * (1u << read.attempts);
+		g_pendingLuaAutoRefreshReads.push_back(std::move(read));
+	}
 }
 
 static bool hook_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack(
@@ -2538,10 +2681,11 @@ static bool hook_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack(
 	if (!sourcePath.empty())
 	{
 		luaPackResult = CaptureExistingLuaPackDiskRefresh(
-			sourcePath, sourcePath, "auto", false);
+			sourcePath, sourcePath, LuaPackDiskRefreshMode::Automatic);
 	}
 	const bool luaPackHandled = luaPackResult == LuaPackDiskRefreshResult::Unchanged ||
-		luaPackResult == LuaPackDiskRefreshResult::Captured;
+		luaPackResult == LuaPackDiskRefreshResult::Captured ||
+		luaPackResult == LuaPackDiskRefreshResult::ReadQueued;
 
 #if defined(MODULE_EXISTS_AUTOREFRESH)
 	HolyLib::AutoRefresh::RunPostLuaChange(fileRelPath, fileName, fileExt);
@@ -3817,7 +3961,7 @@ LUA_FUNCTION_STATIC(gmoddatapack_RefreshExistingLuaFile)
 	const char* requestedPath = LUA->CheckString(1);
 	const LuaPackDiskRefreshResult result = CaptureExistingLuaPackDiskRefresh(
 		requestedPath ? requestedPath : "", requestedPath ? requestedPath : "",
-		"explicit", true);
+		LuaPackDiskRefreshMode::Explicit);
 
 	const char* status = "not_eligible";
 	switch (result)
@@ -3928,6 +4072,7 @@ static double g_nLastSend = 0;
 void CGModDataPackModule::Think(bool bSimulating)
 {
 	HolyLib::LuaPack::Think();
+	DrainLuaAutoRefreshReads();
 	// Do not consume the one-shot refresh until both the engine datapack and shared Lua
 	// cache can supply every registered path. Either detour can bind g_pDataPack later.
 	if (g_pDataPack && g_pDataPack->m_pClientLuaFiles && Lua::GetShared() &&
@@ -4386,11 +4531,13 @@ void CGModDataPackModule::LuaInit(GarrysMod::Lua::ILuaInterface* pLua, bool bSer
 
 void CGModDataPackModule::LuaShutdown(GarrysMod::Lua::ILuaInterface* pLua)
 {
+	g_pendingLuaAutoRefreshReads.clear();
 	Util::NukeTable(pLua, "gmoddatapack");
 }
 
 void CGModDataPackModule::LevelShutdown()
 {
+	g_pendingLuaAutoRefreshReads.clear();
 	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
 		ClearClientLuaDeliveryState(slot);
 	g_requiredStubScheduler.Reset();
@@ -4404,6 +4551,7 @@ void CGModDataPackModule::LevelShutdown()
 
 void CGModDataPackModule::Shutdown()
 {
+	g_pendingLuaAutoRefreshReads.clear();
 	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
 		ClearClientLuaDeliveryState(slot);
 	g_requiredStubScheduler.Reset();
