@@ -26,6 +26,9 @@ public:
 public: // Just to make it easier with the ConVar callback.
 	void HolyLua_Init();
 	void HolyLua_Shutdown();
+
+private:
+	void InitOwnLua(GarrysMod::Lua::ILuaInterface* pLua);
 };
 
 static CHolyLuaModule g_pHolyLuaModule;
@@ -117,6 +120,9 @@ void CHolyLuaModule::HolyLua_Init()
 	// Now add all supported HolyLib modules into the new interface.
 	g_pModuleManager.LuaInit(pHolyLua, false);
 
+	// This interface stays unpublished until its autorun scripts have completed.
+	InitOwnLua(pHolyLua);
+
 	// Finally, load any holylua scripts
 	std::vector<GarrysMod::Lua::LuaFindResult> results;
 	Lua::GetShared()->FindScripts("lua/autorun/_holylua/*.lua", "GAME", results);
@@ -150,6 +156,10 @@ void CHolyLuaModule::HolyLua_Shutdown()
 	// NOTE: Our own mutex supports this style of usage, a normal std::mutex would deadlock!
 	Lua::CriticalThreadAccess pCriticalThreadScope;
 	auto LUA = GetHolyLuaInterface();
+	// The interface may never have been created, or was already disabled.
+	if (!LUA)
+		return;
+
 	g_pModuleManager.LuaShutdown(LUA);
 
 	Lua::DestroyInterface(LUA);
@@ -190,14 +200,17 @@ public:
 		m_pEvent = (CGameEvent*)pEvent;
 	}
 
+	~CLuaGameEventCallbackCall() override
+	{
+		if (m_pEvent)
+			Util::gameeventmanager->FreeEvent(m_pEvent);
+	}
+
 	bool IsDone() { return true; } // Trigger Done call
 	void OnShutdown() { delete this; } // Cleanup ourself
 	void Done(GarrysMod::Lua::ILuaInterface* LUA)
 	{
-		if (!m_pEvent)
-			return;
-
-		if (Lua::PushHook(m_pEvent->GetName(), LUA))
+		if (m_pEvent && Lua::PushHook(m_pEvent->GetName(), LUA))
 		{
 			LUA->CreateTable();
 			PushEvent(LUA, m_pEvent); // Pushes into our table
@@ -205,7 +218,7 @@ public:
 			LUA->CallFunctionProtected(2, 0, true);
 		}
 
-		Util::gameeventmanager->FreeEvent(m_pEvent);
+		delete this;
 	}
 
 private:
@@ -255,8 +268,15 @@ LUA_FUNCTION_STATIC(gameevent_Listen)
 	const char* name = LUA->CheckString(1);
 
 	auto pData = GetHolyLuaLuaData(LUA);
+	if (!pData)
+	{
+		LUA->ThrowError("HolyLua listener data is unavailable");
+		return 0;
+	}
+
 	if (!Util::gameeventmanager->FindListener(&pData->m_pEventListener, name))
-		Util::gameeventmanager->AddListener(&pData->m_pEventListener, name, false);
+		Util::gameeventmanager->AddListener(&pData->m_pEventListener, name,
+			g_pModuleManager.GetModuleRealm() == Module_Realm::SERVER);
  
 	return 0;
 }
@@ -291,12 +311,24 @@ void CHolyLuaModule::LuaInit(GarrysMod::Lua::ILuaInterface* pLua, bool bServerIn
 	if (pLua != GetHolyLuaInterface())
 		return;
 
-	HolyLuaModuleData* pLuaData = new HolyLuaModuleData;
-	Lua::GetLuaData(pLua)->SetModuleData(m_pID, pLuaData);
-	pLuaData->m_pEventListener.SetLua(pLua);
+	InitOwnLua(pLua);
+}
 
-	Util::StartTable(pLua);
-		Util::AddFunc(pLua, gameevent_Listen, "Listen");
+void CHolyLuaModule::InitOwnLua(GarrysMod::Lua::ILuaInterface* pLua)
+{
+	// LuaInit can run for both the initial and server-init passes.
+	HolyLuaModuleData* pLuaData = GetHolyLuaLuaData(pLua);
+	if (!pLuaData)
+	{
+		pLuaData = new HolyLuaModuleData;
+		Lua::GetLuaData(pLua)->SetModuleData(m_pID, pLuaData);
+		pLuaData->m_pEventListener.SetLua(pLua);
+	}
+
+	// Preserve the functions already installed by the gameevent module.
+	if (!Util::PushTable(pLua, "gameevent"))
+		Util::StartTable(pLua);
+	Util::AddFunc(pLua, gameevent_Listen, "Listen");
 	Util::FinishTable(pLua, "gameevent");
 }
 
@@ -307,5 +339,6 @@ void CHolyLuaModule::LuaShutdown(GarrysMod::Lua::ILuaInterface* pLua)
 		return;
 
 	auto pData = GetHolyLuaLuaData(pLua);
-	Util::gameeventmanager->RemoveListener(&pData->m_pEventListener);
+	if (pData)
+		Util::gameeventmanager->RemoveListener(&pData->m_pEventListener);
 }

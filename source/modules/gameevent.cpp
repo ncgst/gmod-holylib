@@ -55,10 +55,78 @@ LUA_FUNCTION_STATIC(gameevent_GetListeners)
 	return 1;
 }
 
-static IGameEventListener2* pLuaGameEventListener = nullptr;
+class GameEventModuleData : public Lua::ModuleData
+{
+public:
+	IGameEventListener2* m_pLuaGameEventListener = nullptr;
+};
+LUA_GetModuleData(GameEventModuleData, g_pGameeventLibModule, GameEvent)
+
+static void FindMainLuaGameEventListener(GarrysMod::Lua::ILuaInterface* pLua, GameEventModuleData* pData)
+{
+	// Module data survives a module toggle, but not the Lua interface itself.
+	if (pData->m_pLuaGameEventListener)
+		return;
+
+	CGameEventDescriptor* descriptor = pGameEventManager->GetEventDescriptor("vote_cast");
+	if (!descriptor)
+	{
+		Warning(PROJECT_NAME ": Cannot identify LuaGameEventListener without vote_cast\n");
+		return;
+	}
+
+	CUtlVector<CGameEventCallback*> previousListeners;
+	FOR_EACH_VEC(descriptor->listeners, i)
+		previousListeners.AddToTail(descriptor->listeners[i]);
+
+	pLua->GetField(-1, "Listen");
+	if (!pLua->IsType(-1, GarrysMod::Lua::Type::Function))
+	{
+		pLua->Pop(1);
+		return;
+	}
+
+	pLua->PushString("vote_cast");
+	if (!pLua->CallFunctionProtected(1, 0, true))
+		return;
+
+	int addedIndex = descriptor->listeners.InvalidIndex();
+	FOR_EACH_VEC(descriptor->listeners, i)
+	{
+		if (previousListeners.Find(descriptor->listeners[i]) != previousListeners.InvalidIndex())
+			continue;
+
+		if (addedIndex != descriptor->listeners.InvalidIndex())
+		{
+			Warning(PROJECT_NAME ": Ambiguous LuaGameEventListener probe; preserving listeners\n");
+			return;
+		}
+		addedIndex = i;
+	}
+
+	if (addedIndex == descriptor->listeners.InvalidIndex())
+	{
+		Warning(PROJECT_NAME ": LuaGameEventListener probe added no identifiable listener\n");
+		return;
+	}
+
+	CGameEventCallback* added = descriptor->listeners[addedIndex];
+	if (added->m_nListenerType != CGameEventManager::SERVERSIDE || !added->m_pCallback)
+	{
+		Warning(PROJECT_NAME ": Unsupported LuaGameEventListener probe; preserving listeners\n");
+		return;
+	}
+
+	pData->m_pLuaGameEventListener = (IGameEventListener2*)added->m_pCallback;
+	// Only undo this probe's new registration. The engine owns the callback.
+	descriptor->listeners.Remove(addedIndex);
+}
+
 LUA_FUNCTION_STATIC(gameevent_RemoveListener)
 {
 	const char* strEvent = LUA->CheckString(1);
+	auto pData = GetGameEventLuaData(LUA);
+	IGameEventListener2* pLuaGameEventListener = pData ? pData->m_pLuaGameEventListener : nullptr;
 
 	bool bSuccess = false;
 	if (pLuaGameEventListener)
@@ -328,8 +396,9 @@ Default__index(IGameEvent);
 Default__newindex(IGameEvent);
 Default__GetTable(IGameEvent);
 Default__IsValid(IGameEvent);
-Default__gc(IGameEvent, 
-	pGameEventManager->FreeEvent((IGameEvent*)pStoredData);
+Default__gc(IGameEvent,
+	if (pStoredData)
+		pGameEventManager->FreeEvent((IGameEvent*)pStoredData);
 )
 
 LUA_FUNCTION_STATIC(IGameEvent_IsEmpty)
@@ -468,9 +537,12 @@ LUA_FUNCTION_STATIC(gameevent_DuplicateEvent)
 
 LUA_FUNCTION_STATIC(gameevent_FireEvent)
 {
-	IGameEvent* pEvent = Get_IGameEvent(LUA, 1, true);
+	LuaUserData* pUserData = Get_IGameEvent_Data(LUA, 1, true);
+	IGameEvent* pEvent = (IGameEvent*)pUserData->GetData();
 	bool bDontBroadcast = LUA->GetBool(2);
 
+	// FireEvent takes ownership. Invalidate aliases before it invokes listeners.
+	pUserData->Release(LUA);
 	LUA->PushBool(pGameEventManager->FireEvent(pEvent, bDontBroadcast));
 	return 1;
 }
@@ -563,28 +635,15 @@ void CGameeventLibModule::LuaInit(GarrysMod::Lua::ILuaInterface* pLua, bool bSer
 		Util::AddFunc(pLua, gameevent_DuplicateEvent, "DuplicateEvent");
 		Util::AddFunc(pLua, gameevent_BlockCreation, "BlockCreation");
 
-		pLua->GetField(-1, "Listen");
-		if (pLua->IsType(-1, GarrysMod::Lua::Type::Function))
+		if (pLua == g_Lua)
 		{
-			pLua->PushString("vote_cast"); // Yes this is a valid gameevent.
-			pLua->CallFunctionProtected(1, 0, true);
-			CGameEventDescriptor* descriptor = pGameEventManager->GetEventDescriptor("vote_cast");
-			if (descriptor)
+			auto pData = GetGameEventLuaData(pLua);
+			if (!pData)
 			{
-				FOR_EACH_VEC(descriptor->listeners, i)
-				{
-					pLuaGameEventListener = (IGameEventListener2*)descriptor->listeners[i]->m_pCallback;
-					descriptor->listeners.Remove(i); // We also remove the listener again
-					break;
-				}
+				pData = new GameEventModuleData;
+				Lua::GetLuaData(pLua)->SetModuleData(m_pID, pData);
 			}
-
-			if (!pLuaGameEventListener)
-				Warning(PROJECT_NAME ": Failed to find pLuaGameEventListener!\n");
-		} else {
-			pLua->Pop(1);
-
-			// No listener function? We should probably add one
+			FindMainLuaGameEventListener(pLua, pData);
 		}
 
 		Util::PopTable(pLua);

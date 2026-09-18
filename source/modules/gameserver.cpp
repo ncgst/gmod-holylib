@@ -9,10 +9,15 @@
 #include "tier0/etwprof.h"
 #include "sourcesdk/baseserver.h"
 #include "sourcesdk/net_chan.h"
+#include "netchannel_bindings.h"
+#include "custom_netchannel_owner.h"
 #include <framesnapshot.h>
 #include <netadr_new.h> // Better than the normal sdk one as this one actually sets stuff properly.
 #include <shareddefs.h>
 #include <unordered_set>
+#include <vector>
+#include <utility>
+#include <string>
 
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
@@ -22,6 +27,7 @@ class CGameServerModule : public IModule
 public:
 	void LuaInit(GarrysMod::Lua::ILuaInterface* pLua, bool bServerInit) override;
 	void LuaShutdown(GarrysMod::Lua::ILuaInterface* pLua) override;
+	void Shutdown() override;
 	void InitDetour(bool bPreServer) override;
 	void OnClientDisconnect(CBaseClient* pClient) override;
 	void Think(bool bSimulating) override;
@@ -83,6 +89,11 @@ static Symbols::CNetChan_SendNetMsg g_pEngineCNetChanSendNetMsg = nullptr;
 CBaseClient* Gameserver_GetClientBySlot(int slot)
 {
 	return Util::FindClientBySlot<CBaseClient>(slot, Util::server, g_pQueueClients);
+}
+
+bool Gameserver_IsParkedQueueSlot(int slot)
+{
+	return gpGlobals && slot >= gpGlobals->maxClients;
 }
 
 /*
@@ -1013,7 +1024,7 @@ LUA_FUNCTION_STATIC(CBaseClient_GetTimeout)
 {
 	CNetChan* pNetChannel = (CNetChan*)Util::Get_NetChannel(LUA, 1, true);
 
-	LUA->PushNumber(pNetChannel->m_Timeout);
+	LUA->PushNumber(pNetChannel->GetTimeoutSeconds());
 	return 1;
 }
 
@@ -1600,7 +1611,7 @@ LUA_FUNCTION_STATIC(CNetChan_GetTimeout)
 {
 	CNetChan* pNetChannel = Get_CNetChan(LUA, 1, true);
 
-	LUA->PushNumber(pNetChannel->m_Timeout);
+	LUA->PushNumber(pNetChannel->GetTimeoutSeconds());
 	return 1;
 }
 
@@ -1688,12 +1699,17 @@ LUA_FUNCTION_STATIC(CNetChan_GetMaxRoutablePayloadSize)
 	return 1;
 }
 
+static bool RequestOwnedNetChannelClose(CNetChan* channel, const char* reason);
+
 LUA_FUNCTION_STATIC(CNetChan_Shutdown)
 {
 	CNetChan* pNetChannel = Get_CNetChan(LUA, 1, true);
 	const char* reason = LUA->CheckStringOpt(2, nullptr);
 
-	pNetChannel->Shutdown(reason);
+	if (RequestOwnedNetChannelClose(pNetChannel, reason))
+		GameServer_DrainNetChannelRetirements();
+	else
+		pNetChannel->Shutdown(reason);
 	return 0;
 }
 
@@ -1755,11 +1771,22 @@ static void hook_CNetChan_D2(CNetChan* pNetChan)
 }
 
 class NET_LuaNetChanMessage;
-class ILuaNetMessageHandler : INetChannelHandler
+class ILuaNetMessageHandler : public INetChannelHandler
 {
 public:
 	ILuaNetMessageHandler(GarrysMod::Lua::ILuaInterface* pLua);
 	~ILuaNetMessageHandler();
+	void ReleaseLuaReferences();
+	bool CanCallLua(bool closingCallback = false) const;
+
+	unsigned long long m_nOwnerID = 0;
+	unsigned int m_nCallbackDepth = 0;
+	bool m_bCloseRequested = false;
+	bool m_bDestructing = false;
+	bool m_bChannelDestroyed = false;
+	bool m_bClosingNotified = false;
+	bool m_bHasCloseReason = false;
+	std::string m_CloseReason;
 
 	void ConnectionStart(INetChannel *chan);	// called first time network channel is established
 	void ConnectionClosing(const char *reason); // network channel is being closed by remote site
@@ -1795,6 +1822,15 @@ public:
 class NET_LuaNetChanMessage : public CNetMessage
 {
 public:
+	~NET_LuaNetChanMessage() override
+	{
+		// Registered messages are deleted by CNetChan::Shutdown. The handler
+		// also owns unregistered messages, so clear its pointer when the channel
+		// destroys this one before the handler itself is released.
+		if (m_pMessageHandler && m_pMessageHandler->m_pLuaNetChanMessage == this)
+			m_pMessageHandler->m_pLuaNetChanMessage = nullptr;
+	}
+
 	bool ReadFromBuffer( bf_read &buffer )
 	{
 		//Msg("NET_LuaNetChanMessage::ReadFromBuffer\n");
@@ -1832,12 +1868,65 @@ public:
 };
 
 static unordered_set<ILuaNetMessageHandler*> g_pNetMessageHandlers;
+static unordered_set<GarrysMod::Lua::ILuaInterface*> g_pNetChannelLuaOwners;
+static unsigned long long g_nNextNetChannelOwnerID = 1;
+static unsigned int g_nNetChannelCallbackDepth = 0;
+static bool g_bDrainingNetChannelRetirements = false;
+
+static ILuaNetMessageHandler* FindOwnedNetChannel(CNetChan* channel)
+{
+	if (!channel)
+		return nullptr;
+	for (ILuaNetMessageHandler* handler : g_pNetMessageHandlers)
+	{
+		if (handler->m_pChan == channel && !handler->m_bChannelDestroyed)
+			return handler;
+	}
+	return nullptr;
+}
+
+// The generation also rejects an address reused by a callback which creates a
+// new owner while a snapshot of the old registry is being drained.
+using NetChannelOwnerSnapshot = std::vector<std::pair<ILuaNetMessageHandler*, unsigned long long>>;
+static NetChannelOwnerSnapshot SnapshotNetChannelOwners()
+{
+	NetChannelOwnerSnapshot snapshot;
+	snapshot.reserve(g_pNetMessageHandlers.size());
+	for (ILuaNetMessageHandler* handler : g_pNetMessageHandlers)
+		snapshot.emplace_back(handler, handler->m_nOwnerID);
+	return snapshot;
+}
+
+static bool IsCurrentNetChannelOwner(const NetChannelOwnerSnapshot::value_type& entry)
+{
+	return g_pNetMessageHandlers.find(entry.first) != g_pNetMessageHandlers.end() &&
+		entry.first->m_nOwnerID == entry.second;
+}
+
+class ScopedNetChannelCallback
+{
+public:
+	explicit ScopedNetChannelCallback(ILuaNetMessageHandler* handler) : m_pHandler(handler)
+	{
+		++m_pHandler->m_nCallbackDepth;
+		++g_nNetChannelCallbackDepth;
+	}
+	~ScopedNetChannelCallback()
+	{
+		--m_pHandler->m_nCallbackDepth;
+		--g_nNetChannelCallbackDepth;
+		// Never drain here: the native packet/message caller still owns a frame.
+	}
+private:
+	ILuaNetMessageHandler* m_pHandler;
+};
 ILuaNetMessageHandler::ILuaNetMessageHandler(GarrysMod::Lua::ILuaInterface* pLua)
 {
 	m_pLuaNetChanMessage = new NET_LuaNetChanMessage;
 	m_pLuaNetChanMessage->m_pMessageHandler = this;
 	g_pNetMessageHandlers.insert(this);
 	m_pLua = pLua;
+	m_nOwnerID = g_nNextNetChannelOwnerID++;
 }
 
 #define HANDLER_FREE_LUA_REFERENCE(name) \
@@ -1856,12 +1945,13 @@ ILuaNetMessageHandler::~ILuaNetMessageHandler()
 	}
 
 	g_pNetMessageHandlers.erase(this);
+	ReleaseLuaReferences();
+}
 
-	if (!ThreadInMainThread())
-	{
-		Warning(PROJECT_NAME ": Tried to delete a ILuaNetMessageHandler from another thread! How could you! Now were leaking a reference...\n");
+void ILuaNetMessageHandler::ReleaseLuaReferences()
+{
+	if (!m_pLua)
 		return;
-	}
 
 	HANDLER_FREE_LUA_REFERENCE(m_iMessageCallbackFunction);
 	HANDLER_FREE_LUA_REFERENCE(m_iConnectionStartFunction);
@@ -1874,110 +1964,228 @@ ILuaNetMessageHandler::~ILuaNetMessageHandler()
 	HANDLER_FREE_LUA_REFERENCE(m_iFileDeniedFunction);
 	HANDLER_FREE_LUA_REFERENCE(m_iFileSentFunction);
 	HANDLER_FREE_LUA_REFERENCE(m_iShouldAcceptFileFunction);
+	m_pLua = nullptr;
 }
 
-#define HANDLER_CALL_LUA_CALLBACK(name, returnVal) \
+
+bool ILuaNetMessageHandler::CanCallLua(bool closingCallback) const
+{
+	return m_pLua && g_pNetChannelLuaOwners.find(m_pLua) != g_pNetChannelLuaOwners.end() &&
+		(!m_bCloseRequested || closingCallback);
+}
+
+static bool RequestOwnedNetChannelClose(CNetChan* channel, const char* reason)
+{
+	ILuaNetMessageHandler* handler = FindOwnedNetChannel(channel);
+	if (!handler)
+		return false;
+
+	if (!handler->m_bCloseRequested && !handler->m_bDestructing)
+	{
+		handler->m_bCloseRequested = true;
+		handler->m_bHasCloseReason = reason != nullptr;
+		handler->m_CloseReason = reason ? reason : "";
+	}
+	return true;
+}
+
+bool GameServer_InterceptOwnedNetChannelShutdown(CNetChan* channel, const char* reason)
+{
+	ILuaNetMessageHandler* handler = FindOwnedNetChannel(channel);
+	if (!handler || handler->m_bDestructing)
+		return false;
+	return RequestOwnedNetChannelClose(channel, reason);
+}
+
+const char* GameServer_BeginOwnedNetChannelDestruction(CNetChan* channel)
+{
+	ILuaNetMessageHandler* handler = FindOwnedNetChannel(channel);
+	if (!handler)
+		return "NetChannel removed.";
+
+	if (!handler->m_bCloseRequested)
+		RequestOwnedNetChannelClose(channel, "NetChannel removed.");
+	handler->m_bDestructing = true;
+	return handler->m_bHasCloseReason ? handler->m_CloseReason.c_str() : nullptr;
+}
+
+bool GameServer_IsOwnedNetChannelDestructing(CNetChan* channel)
+{
+	ILuaNetMessageHandler* handler = FindOwnedNetChannel(channel);
+	return handler && handler->m_bDestructing;
+}
+
+void GameServer_EndOwnedNetChannelDestruction(CNetChan* channel)
+{
+	ILuaNetMessageHandler* handler = FindOwnedNetChannel(channel);
+	if (!handler)
+		return;
+
+	// Called by the local destructor after registered messages have been freed.
+	// Only pointer identity is used here; do not inspect the dying channel.
+	handler->m_pChan = nullptr;
+	handler->m_bChannelDestroyed = true;
+	{
+		Lua::CriticalThreadAccess stateLifetime;
+		for (Lua::StateData* state : Lua::GetAllLuaData())
+			Delete_CNetChan(state->pLua, channel);
+	}
+
+	if (handler->m_nCallbackDepth == 0)
+		delete handler;
+}
+
+void GameServer_DrainNetChannelRetirements()
+{
+	if (!ThreadInMainThread() || g_nNetChannelCallbackDepth != 0 || g_bDrainingNetChannelRetirements)
+		return;
+
+	g_bDrainingNetChannelRetirements = true;
+	for (const auto& entry : SnapshotNetChannelOwners())
+	{
+		if (!IsCurrentNetChannelOwner(entry))
+			continue;
+		ILuaNetMessageHandler* handler = entry.first;
+		if (handler->m_bChannelDestroyed)
+		{
+			delete handler;
+			continue;
+		}
+		if (!handler->m_bCloseRequested || handler->m_bDestructing || !handler->m_pChan)
+			continue;
+
+		// Remove from the engine registry once, then let the local destructor do
+		// Shutdown and notify owner finalization. Do not touch handler afterwards.
+		NET_RemoveNetChannel(handler->m_pChan, true);
+	}
+	g_bDrainingNetChannelRetirements = false;
+}
+
+static void DetachOwnedNetChannelsFromLua(GarrysMod::Lua::ILuaInterface* lua)
+{
+	// No new owner or callback may enter this state after teardown starts.
+	g_pNetChannelLuaOwners.erase(lua);
+	for (const auto& entry : SnapshotNetChannelOwners())
+	{
+		if (!IsCurrentNetChannelOwner(entry) || entry.first->m_pLua != lua)
+			continue;
+		ILuaNetMessageHandler* handler = entry.first;
+		if (handler->m_pChan)
+			RequestOwnedNetChannelClose(handler->m_pChan, nullptr);
+		// Release while lua is valid. An active callback keeps its local lua
+		// pointer for its epilogue; the handler itself is retained until the frame.
+		handler->ReleaseLuaReferences();
+	}
+	GameServer_DrainNetChannelRetirements();
+}
+
+#define HANDLER_CALL_LUA_CALLBACK(name, returnVal, closingCallback) \
 if (!ThreadInMainThread()) \
 { \
 	Warning(PROJECT_NAME ": Trying to call " #name " outside the main thread!\n"); \
 	return returnVal; \
 } \
-if (m_i##name##Function == -1) /*We have no callback function set. */ \
+if (!CanCallLua(closingCallback) || m_i##name##Function == -1) \
 	return returnVal; \
-m_pLua->ReferencePush(m_i##name##Function);
+ScopedNetChannelCallback callbackScope(this); \
+GarrysMod::Lua::ILuaInterface* callbackLua = m_pLua; \
+callbackLua->ReferencePush(m_i##name##Function);
 
 void ILuaNetMessageHandler::ConnectionStart(INetChannel* pChan)
 {
-	HANDLER_CALL_LUA_CALLBACK(ConnectionStart, )
-	Push_CNetChan(m_pLua, (CNetChan*)pChan);
-	m_pLua->CallFunctionProtected(1, 0, true);
+	HANDLER_CALL_LUA_CALLBACK(ConnectionStart, , false)
+	Push_CNetChan(callbackLua, (CNetChan*)pChan);
+	callbackLua->CallFunctionProtected(1, 0, true);
 }
 
 void ILuaNetMessageHandler::ConnectionClosing(const char* reason)
 {
-	HANDLER_CALL_LUA_CALLBACK(ConnectionClosing, )
-	Push_CNetChan(m_pLua, m_pChan);
-	m_pLua->PushString(reason);
-	m_pLua->CallFunctionProtected(2, 0, true);
+	if (m_bClosingNotified)
+		return;
+	m_bClosingNotified = true;
+	HANDLER_CALL_LUA_CALLBACK(ConnectionClosing, , true)
+	Push_CNetChan(callbackLua, m_pChan);
+	callbackLua->PushString(reason);
+	callbackLua->CallFunctionProtected(2, 0, true);
 }
 
 void ILuaNetMessageHandler::ConnectionCrashed(const char* reason)
 {
-	HANDLER_CALL_LUA_CALLBACK(ConnectionCrashed, )
-	Push_CNetChan(m_pLua, m_pChan);
-	m_pLua->PushString(reason);
-	m_pLua->CallFunctionProtected(2, 0, true);
+	HANDLER_CALL_LUA_CALLBACK(ConnectionCrashed, , false)
+	Push_CNetChan(callbackLua, m_pChan);
+	callbackLua->PushString(reason);
+	callbackLua->CallFunctionProtected(2, 0, true);
 }
 
 void ILuaNetMessageHandler::PacketStart(int incoming_sequence, int outgoing_acknowledged)
 {
 	//Msg("ILuaNetMessageHandler::PacketStart - %i | %i\n", incoming_sequence, outgoing_acknowledged);
-	HANDLER_CALL_LUA_CALLBACK(PacketStart, )
-	Push_CNetChan(m_pLua, m_pChan);
-	m_pLua->PushNumber(incoming_sequence);
-	m_pLua->PushNumber(outgoing_acknowledged);
-	m_pLua->CallFunctionProtected(3, 0, true);
+	HANDLER_CALL_LUA_CALLBACK(PacketStart, , false)
+	Push_CNetChan(callbackLua, m_pChan);
+	callbackLua->PushNumber(incoming_sequence);
+	callbackLua->PushNumber(outgoing_acknowledged);
+	callbackLua->CallFunctionProtected(3, 0, true);
 }
 
 void ILuaNetMessageHandler::PacketEnd()
 {
 	//Msg("ILuaNetMessageHandler::PacketEnd\n");
-	HANDLER_CALL_LUA_CALLBACK(PacketEnd, )
-	Push_CNetChan(m_pLua, m_pChan);
-	m_pLua->CallFunctionProtected(1, 0, true);
+	HANDLER_CALL_LUA_CALLBACK(PacketEnd, , false)
+	Push_CNetChan(callbackLua, m_pChan);
+	callbackLua->CallFunctionProtected(1, 0, true);
 }
 
 void ILuaNetMessageHandler::FileRequested(const char *fileName, unsigned int transferID)
 {
 	//Msg("ILuaNetMessageHandler::FileRequested - %s | %d\n", fileName, transferID);
-	HANDLER_CALL_LUA_CALLBACK(FileRequested, )
-	Push_CNetChan(m_pLua, m_pChan);
-	m_pLua->PushString(fileName);
-	m_pLua->PushNumber(transferID);
-	m_pLua->CallFunctionProtected(3, 0, true);
+	HANDLER_CALL_LUA_CALLBACK(FileRequested, , false)
+	Push_CNetChan(callbackLua, m_pChan);
+	callbackLua->PushString(fileName);
+	callbackLua->PushNumber(transferID);
+	callbackLua->CallFunctionProtected(3, 0, true);
 }
 
 void ILuaNetMessageHandler::FileReceived(const char *fileName, unsigned int transferID)
 {
 	//Msg("ILuaNetMessageHandler::FileReceived - %s | %d\n", fileName, transferID);
-	HANDLER_CALL_LUA_CALLBACK(FileReceived, )
-	Push_CNetChan(m_pLua, m_pChan);
-	m_pLua->PushString(fileName);
-	m_pLua->PushNumber(transferID);
-	m_pLua->CallFunctionProtected(3, 0, true);
+	HANDLER_CALL_LUA_CALLBACK(FileReceived, , false)
+	Push_CNetChan(callbackLua, m_pChan);
+	callbackLua->PushString(fileName);
+	callbackLua->PushNumber(transferID);
+	callbackLua->CallFunctionProtected(3, 0, true);
 }
 
 void ILuaNetMessageHandler::FileDenied(const char *fileName, unsigned int transferID)
 {
 	//Msg("ILuaNetMessageHandler::FileDenied - %s | %d\n", fileName, transferID);
-	HANDLER_CALL_LUA_CALLBACK(FileDenied, )
-	Push_CNetChan(m_pLua, m_pChan);
-	m_pLua->PushString(fileName);
-	m_pLua->PushNumber(transferID);
-	m_pLua->CallFunctionProtected(3, 0, true);
+	HANDLER_CALL_LUA_CALLBACK(FileDenied, , false)
+	Push_CNetChan(callbackLua, m_pChan);
+	callbackLua->PushString(fileName);
+	callbackLua->PushNumber(transferID);
+	callbackLua->CallFunctionProtected(3, 0, true);
 }
 
 void ILuaNetMessageHandler::FileSent(const char *fileName, unsigned int transferID)
 {
 	//Msg("ILuaNetMessageHandler::FileSent - %s | %d\n", fileName, transferID);
-	HANDLER_CALL_LUA_CALLBACK(FileSent, )
-	Push_CNetChan(m_pLua, m_pChan);
-	m_pLua->PushString(fileName);
-	m_pLua->PushNumber(transferID);
-	m_pLua->CallFunctionProtected(3, 0, true);
+	HANDLER_CALL_LUA_CALLBACK(FileSent, , false)
+	Push_CNetChan(callbackLua, m_pChan);
+	callbackLua->PushString(fileName);
+	callbackLua->PushNumber(transferID);
+	callbackLua->CallFunctionProtected(3, 0, true);
 }
 
 bool ILuaNetMessageHandler::ShouldAcceptFile(const char *fileName, unsigned int transferID)
 {
 	//Msg("ILuaNetMessageHandler::ShouldAcceptFile - %s | %d\n", fileName, transferID);
-	HANDLER_CALL_LUA_CALLBACK(ShouldAcceptFile, false)
-	Push_CNetChan(m_pLua, m_pChan);
-	m_pLua->PushString(fileName);
-	m_pLua->PushNumber(transferID);
-	if (m_pLua->CallFunctionProtected(3, 1, true))
+	HANDLER_CALL_LUA_CALLBACK(ShouldAcceptFile, false, false)
+	Push_CNetChan(callbackLua, m_pChan);
+	callbackLua->PushString(fileName);
+	callbackLua->PushNumber(transferID);
+	if (callbackLua->CallFunctionProtected(3, 1, true))
 	{
-		bool bAccept = m_pLua->GetBool(-1);
-		m_pLua->Pop(1);
+		bool bAccept = callbackLua->GetBool(-1);
+		callbackLua->Pop(1);
 		return bAccept;
 	}
 
@@ -1992,23 +2200,25 @@ bool ILuaNetMessageHandler::ProcessLuaNetChanMessage(NET_LuaNetChanMessage *msg)
 		return false;
 	}
 
-	if (m_iMessageCallbackFunction == -1) // We have no callback function set.
+	if (!CanCallLua() || m_iMessageCallbackFunction == -1)
 		return true;
 
-	m_pLua->ReferencePush(m_iMessageCallbackFunction);
+	ScopedNetChannelCallback callbackScope(this);
+	GarrysMod::Lua::ILuaInterface* callbackLua = m_pLua;
+	callbackLua->ReferencePush(m_iMessageCallbackFunction);
 
-	Push_CNetChan(m_pLua, m_pChan);
+	Push_CNetChan(callbackLua, m_pChan);
 #if MODULE_EXISTS_BITBUF
-	LuaUserData* pLuaData = Push_bf_read(m_pLua, &msg->m_DataIn, false);
+	LuaUserData* pLuaData = Push_bf_read(callbackLua, &msg->m_DataIn, false);
 #else
-	m_pLua->PushString((const char*)msg->m_DataIn.GetBasePointer(), msg->m_DataIn.GetNumBytesLeft());
+	callbackLua->PushString((const char*)msg->m_DataIn.GetBasePointer(), msg->m_DataIn.GetNumBytesLeft());
 #endif
-	m_pLua->PushNumber(msg->m_iLength);
-	m_pLua->CallFunctionProtected(3, 0, true);
+	callbackLua->PushNumber(msg->m_iLength);
+	callbackLua->CallFunctionProtected(3, 0, true);
 
 #if MODULE_EXISTS_BITBUF
 	if (pLuaData)
-		pLuaData->Release(m_pLua);
+		pLuaData->Release(callbackLua);
 #endif
 
 	return true;
@@ -2063,11 +2273,11 @@ LUA_FUNCTION_STATIC(CNetChan_RequestFile)
 LUA_FUNCTION_STATIC(CNetChan_Set##name) \
 { \
 	CNetChan* pNetChannel = Get_CNetChan(LUA, 1, true); \
-	ILuaNetMessageHandler* pHandler = (ILuaNetMessageHandler*)pNetChannel->m_MessageHandler; \
+	ILuaNetMessageHandler* pHandler = FindOwnedNetChannel(pNetChannel); \
 	LUA->CheckType(2, GarrysMod::Lua::Type::Function); \
 \
-	if (!pHandler) \
-		return 0; \
+	if (!pHandler || pHandler->m_pLua != LUA || !pHandler->CanCallLua()) \
+		LUA->ThrowError("Callbacks require a live custom channel owned by this Lua state"); \
 \
 	if (pHandler->m_i##name##Function != -1) \
 	{ \
@@ -2081,9 +2291,9 @@ LUA_FUNCTION_STATIC(CNetChan_Set##name) \
 LUA_FUNCTION_STATIC(CNetChan_Get##name) \
 { \
 	CNetChan* pNetChannel = Get_CNetChan(LUA, 1, true); \
-	ILuaNetMessageHandler* pHandler = (ILuaNetMessageHandler*)pNetChannel->m_MessageHandler; \
+	ILuaNetMessageHandler* pHandler = FindOwnedNetChannel(pNetChannel); \
 \
-	if (pHandler && pHandler->m_i##name##Function != -1) \
+	if (pHandler && pHandler->m_pLua == LUA && pHandler->CanCallLua() && pHandler->m_i##name##Function != -1) \
 	{ \
 		Util::ReferencePush(LUA, pHandler->m_i##name##Function); \
 	} else { \
@@ -2531,6 +2741,14 @@ CNetChan* NET_CreateHolyLibNetChannel(int socket, netadrnew_t* adr, const char* 
 		return nullptr;
 
 	CNetChan* pChan = new CNetChan;
+	for (ILuaNetMessageHandler* owner : g_pNetMessageHandlers)
+	{
+		if (static_cast<INetChannelHandler*>(owner) == handler)
+		{
+			owner->m_pChan = pChan;
+			break;
+		}
+	}
 
 	(*s_NetChannels).Lock();
 	(*s_NetChannels).AddToTail(pChan);
@@ -2544,6 +2762,10 @@ CNetChan* NET_CreateHolyLibNetChannel(int socket, netadrnew_t* adr, const char* 
 static Symbols::NET_CreateNetChannel func_NET_CreateNetChannel;
 LUA_FUNCTION_STATIC(gameserver_CreateNetChannel)
 {
+	if (!ThreadInMainThread())
+		LUA->ThrowError("Custom netchannels must be created on the main thread");
+	if (g_pNetChannelLuaOwners.find(LUA) == g_pNetChannelLuaOwners.end())
+		LUA->ThrowError("This Lua state's gameserver module is shutting down");
 	if (!s_NetChannels)
 		LUA->ThrowError("Failed to load s_NetChannels!");
 
@@ -2562,8 +2784,19 @@ LUA_FUNCTION_STATIC(gameserver_CreateNetChannel)
 
 	ILuaNetMessageHandler* pHandler = new ILuaNetMessageHandler(LUA);
 	CNetChan* pNetChannel = NET_CreateHolyLibNetChannel(nSocket, &adr, adr.ToString(), (INetChannelHandler*)pHandler, true, nProtocolVersion);
-	pNetChannel->RegisterMessage(pHandler->m_pLuaNetChanMessage);
-	pHandler->m_pChan = pNetChannel;
+	if (!pNetChannel)
+	{
+		delete pHandler;
+		Push_CNetChan(LUA, nullptr);
+		return 1;
+	}
+	if (!pNetChannel->RegisterMessage(pHandler->m_pLuaNetChanMessage))
+	{
+		RequestOwnedNetChannelClose(pNetChannel, nullptr);
+		GameServer_DrainNetChannelRetirements();
+		Push_CNetChan(LUA, nullptr);
+		return 1;
+	}
 
 	Push_CNetChan(LUA, pNetChannel);
 	return 1;
@@ -2575,17 +2808,17 @@ LUA_FUNCTION_STATIC(gameserver_RemoveNetChannel)
 	if (!func_NET_RemoveNetChannel)
 		LUA->ThrowError("Failed to load NET_RemoveNetChannel!");
 
-	LuaUserData* pLuaData = Get_CNetChan_Data(LUA, 1, true);
-	CNetChan* pNetChannel = (CNetChan*)pLuaData->GetData();
+	CNetChan* pNetChannel = Get_CNetChan(LUA, 1, true);
 
-	ILuaNetMessageHandler* pHandler = (ILuaNetMessageHandler*)pNetChannel->m_MessageHandler;
-	func_NET_RemoveNetChannel(pNetChannel, true);
-	pLuaData->Release(LUA);
-
-	if (pHandler)
+	if (RequestOwnedNetChannelClose(pNetChannel, "NetChannel removed."))
 	{
-		delete pHandler;
+		GameServer_DrainNetChannelRetirements();
+		return 0;
 	}
+
+	// Engine-owned handlers are not ILuaNetMessageHandler allocations.
+	func_NET_RemoveNetChannel(pNetChannel, true);
+	Delete_CNetChan(LUA, pNetChannel);
 
 	return 0;
 }
@@ -2596,6 +2829,8 @@ LUA_FUNCTION_STATIC(gameserver_GetCreatedNetChannels)
 		int idx = 0;
 		for (auto& handler : g_pNetMessageHandlers)
 		{
+			if (handler->m_bCloseRequested || handler->m_bChannelDestroyed || !handler->m_pChan)
+				continue;
 			Push_CNetChan(LUA, handler->m_pChan);
 			Util::RawSetI(LUA, -2, ++idx);
 		}
@@ -2766,6 +3001,7 @@ void CGameServerModule::LuaInit(GarrysMod::Lua::ILuaInterface* pLua, bool bServe
 	if (bServerInit)
 		return;
 
+	g_pNetChannelLuaOwners.insert(pLua);
 	sv_stressbots = g_pCVar->FindVar("sv_stressbots");
 	if (!sv_stressbots)
 		Warning(PROJECT_NAME ": Failed to find sv_stressbots convar!\n");
@@ -2917,10 +3153,28 @@ void CGameServerModule::LuaInit(GarrysMod::Lua::ILuaInterface* pLua, bool bServe
 
 void CGameServerModule::LuaShutdown(GarrysMod::Lua::ILuaInterface* pLua)
 {
+	DetachOwnedNetChannelsFromLua(pLua);
 	Util::NukeTable(pLua, "gameserver");
 
 	DeleteAll_CBaseClient(pLua);
 	DeleteAll_CNetChan(pLua);
+}
+
+void CGameServerModule::Shutdown()
+{
+	// Normally LuaShutdown already detached each owner. Also cover module
+	// teardown without a current Lua interface, before its detours are removed.
+	for (const auto& entry : SnapshotNetChannelOwners())
+	{
+		if (!IsCurrentNetChannelOwner(entry))
+			continue;
+		ILuaNetMessageHandler* handler = entry.first;
+		if (handler->m_pChan)
+			RequestOwnedNetChannelClose(handler->m_pChan, nullptr);
+		handler->ReleaseLuaReferences();
+	}
+	g_pNetChannelLuaOwners.clear();
+	GameServer_DrainNetChannelRetirements();
 }
 
 // This is a total CGameClient-object limit, not a real-player limit. The engine's
@@ -3311,6 +3565,16 @@ static void SendPendingServerInfos(CBaseServer* pServer)
 	std::vector<CGameClient*> pQueueSnapshot(g_pQueueClients);
 	for (CBaseClient* pClient : pQueueSnapshot)
 	{
+		// Parked slots are outside the engine client array. Native GModDataPack
+		// still sizes per-client request state for physical players, so a queued
+		// SendServerInfo corrupts its file tree. Promotion Reconnect() sends the
+		// baseline from the real slot.
+		if (IsParkedQueueClient(pClient))
+		{
+			pClient->m_bSendServerInfo = false;
+			continue;
+		}
+
 		if (pClient->m_bSendServerInfo)
 		{
 			INetChannel* pChan = pClient->m_NetChannel;
@@ -3494,6 +3758,17 @@ static bool hook_CBaseClient_SetSignonState(CBaseClient* cl, int state, int spaw
 		return false;
 #endif
 
+	// Connect() already stores SIGNONSTATE_CONNECTED. The engine function then
+	// only sets m_bSendServerInfo, which queues native GModDataPack SendServerInfo
+	// against a parked slot. That path smashes GModDataPack's file tree; promotion
+	// already restarts the handshake on a real slot via Reconnect().
+	if (IsParkedQueueClient(cl) && state == SIGNONSTATE_CONNECTED)
+	{
+		cl->m_nSignonState = SIGNONSTATE_CONNECTED;
+		cl->m_bSendServerInfo = false;
+		return true;
+	}
+
 	return detour_CBaseClient_SetSignonState.GetTrampoline<Symbols::CBaseClient_SetSignonState>()(cl, state, spawncount);
 }
 
@@ -3512,8 +3787,8 @@ static bool hook_CGameClient_SetSignonState(CGameClient* client, int state, int 
 		);
 	}
 
-	// The parked CONNECTED path needs the real base implementation after the
-	// HolyLib/datapack hooks, but must bypass CGameClient::CheckConnect entirely.
+	// The parked CONNECTED path still runs HolyLib/Lua hooks, but must bypass
+	// CGameClient::CheckConnect and must not arm native SendServerInfo.
 	if (!detour_CBaseClient_SetSignonState.IsEnabled())
 		return false;
 
@@ -4230,6 +4505,16 @@ static QueuePromotionResult CommitQueuePromotion(CGameClient* origin, CGameClien
 		return result;
 	}
 
+	NetChannelBindings bindings;
+	if (!TryGetNetChannelBindings(state.channel, bindings) ||
+		*bindings.handler != static_cast<INetChannelHandler*>(origin) || bindings.messages->Count() == 0)
+	{
+		Warning(PROJECT_NAME " - gameserver: unrecognized CNetChan bindings; queue promotion refused before transfer\n");
+		const QueuePromotionResult result = QueuePromotionFailure("layout_mismatch");
+		DebugQueuePromotion(result, origin, target, &state);
+		return result;
+	}
+
 	// Phase B starts here. target is a verified empty real slot; invoking the
 	// game-DLL-facing Inactivate path on it is unnecessary and unsafe.
 	target->Clear();
@@ -4257,25 +4542,22 @@ static QueuePromotionResult CommitQueuePromotion(CGameClient* origin, CGameClien
 	// immediately, before any later post-commit validation can return: once the
 	// target owns the channel, no live message may continue dispatching through
 	// the queue source that will be cleared below.
-	CNetChan* chan = (CNetChan*)target->m_NetChannel;
-	chan->m_MessageHandler = (INetChannelHandler*)target;
-	FOR_EACH_VEC(chan->m_NetMessages, i)
+	*bindings.handler = static_cast<INetChannelHandler*>(target);
+	FOR_EACH_VEC(*bindings.messages, i)
 	{
-		CExtendedNetMessage* msg = (CExtendedNetMessage*)chan->m_NetMessages[i];
+		CExtendedNetMessage* msg = (CExtendedNetMessage*)(*bindings.messages)[i];
 		if (!msg)
 			continue;
 
-		msg->m_pMessageHandler = target;
 		if (msg->GetType() == clc_CmdKeyValues)
 		{
-			Base_CmdKeyValues* keyVal = (Base_CmdKeyValues*)msg;
-			if (keyVal->m_pKeyValues)
-			{
-				// Ownership cannot be proven after the handler move; retaining the
-				// existing defensive null avoids a double free at the cost of the
-				// same small leak as the legacy path.
-				keyVal->m_pKeyValues = nullptr;
-			}
+			// Base_CmdKeyValues stores its owned payload before the handler.
+			// Treating it as CExtendedNetMessage overwrites that payload and leaves
+			// dispatch pointing at the retired queue source. The same channel still
+			// owns the message and payload after promotion; only rebind the handler.
+			static_cast<CLC_CmdKeyValues*>(static_cast<INetMessage*>(msg))->m_pMessageHandler = target;
+		} else {
+			msg->m_pMessageHandler = target;
 		}
 	}
 
@@ -4676,6 +4958,16 @@ void CGameServerModule::InitDetour(bool bPreServer)
 
 	DETOUR_PREPARE_THISCALL();
 	SourceSDK::FactoryLoader engine_loader("engine");
+	// These are raw engine entry addresses, not hook trampolines. Other modules
+	// may still detour them while gameserver is disabled, obscuring their entry
+	// signatures on re-enable. Retain successful lookups for this loaded engine.
+	static void* netChannelFunctionModule = nullptr;
+	if (netChannelFunctionModule != engine_loader.GetModule())
+	{
+		netChannelFunctionModule = engine_loader.GetModule();
+		func_NET_RemoveNetChannel = nullptr;
+		func_NET_SendPacket = nullptr;
+	}
 	g_pEngineCNetChanSendNetMsg = reinterpret_cast<Symbols::CNetChan_SendNetMsg>(
 		Detour::GetFunction(engine_loader.GetModule(), Symbols::CNetChan_SendNetMsgSym));
 #if defined(SYSTEM_LINUX)
@@ -4940,7 +5232,8 @@ void CGameServerModule::InitDetour(bool bPreServer)
 	func_NET_CreateNetChannel = (Symbols::NET_CreateNetChannel)Detour::GetFunction(engine_loader.GetModule(), Symbols::NET_CreateNetChannelSym);
 	Detour::CheckFunction((void*)func_NET_CreateNetChannel, "NET_CreateNetChannel");
 
-	func_NET_RemoveNetChannel = (Symbols::NET_RemoveNetChannel)Detour::GetFunction(engine_loader.GetModule(), Symbols::NET_RemoveNetChannelSym);
+	if (!func_NET_RemoveNetChannel)
+		func_NET_RemoveNetChannel = (Symbols::NET_RemoveNetChannel)Detour::GetFunction(engine_loader.GetModule(), Symbols::NET_RemoveNetChannelSym);
 	Detour::CheckFunction((void*)func_NET_RemoveNetChannel, "NET_RemoveNetChannel");
 
 	/*
@@ -4959,7 +5252,8 @@ void CGameServerModule::InitDetour(bool bPreServer)
 		(void*)hook_Filter_SendBan, m_pID
 	);
 
-	func_NET_SendPacket = (Symbols::NET_SendPacket)Detour::GetFunction(engine_loader.GetModule(), Symbols::NET_SendPacketSym);
+	if (!func_NET_SendPacket)
+		func_NET_SendPacket = (Symbols::NET_SendPacket)Detour::GetFunction(engine_loader.GetModule(), Symbols::NET_SendPacketSym);
 	Detour::CheckFunction((void*)func_NET_SendPacket, "NET_SendPacket");
 
 	func_NET_SendStream = (Symbols::NET_SendStream)Detour::GetFunction(engine_loader.GetModule(), Symbols::NET_SendStreamSym);

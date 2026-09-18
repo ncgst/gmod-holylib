@@ -43,6 +43,9 @@ struct NetHistory
 
 	void AddEntry(const void* pData, size_t nLength)
 	{
+		// The shared map lock protects lifetime, not concurrent writes to this
+		// channel's deque and unsynchronized pool. Keep map -> history lock order.
+		std::lock_guard<std::mutex> lock(pSendMutex);
 		auto& entry = pHistory.emplace_front(&pool);
 
 		entry.pData.resize(nLength);
@@ -88,20 +91,25 @@ static thread_local std::string g_strNextSteamID = "";
 static Detouring::Hook detour_NET_RemoveNetChannel;
 static void hook_NET_RemoveNetChannel(INetChannel* pChannel, bool bShouldRemove)
 {
-	std::unique_lock<std::shared_mutex> lock(g_pNetHistoryMutex);
-	auto it = g_pNetHistory.find(pChannel);
-	if (it != g_pNetHistory.end())
 	{
-		if (g_bDumpNextDisconnect)
+		std::unique_lock<std::shared_mutex> lock(g_pNetHistoryMutex);
+		auto it = g_pNetHistory.find(pChannel);
+		if (it != g_pNetHistory.end())
 		{
-			it->second->DumpToDisk(g_strNextSteamID.c_str());
-			g_bDumpNextDisconnect = false;
-		}
+			if (g_bDumpNextDisconnect)
+			{
+				it->second->DumpToDisk(g_strNextSteamID.c_str());
+				g_bDumpNextDisconnect = false;
+			}
 
-		delete it->second;
-		g_pNetHistory.erase(it);
+			delete it->second;
+			g_pNetHistory.erase(it);
+		}
 	}
 
+	// Channel destruction can send its final disconnect datagram. NET_SendPacket
+	// re-enters this module and takes a shared history lock, so engine teardown
+	// must run after releasing our exclusive lock.
 	detour_NET_RemoveNetChannel.GetTrampoline<Symbols::NET_RemoveNetChannel>()(pChannel, bShouldRemove);
 }
 

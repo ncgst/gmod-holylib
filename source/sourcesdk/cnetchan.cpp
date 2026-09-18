@@ -16,6 +16,7 @@
 #include "tier0/vprof.h"
 #include "filesystem_init.h"
 #include "net_chan.h"
+#include "custom_netchannel_owner.h"
 #include <lz4/lz4_compression.h>
 #include <memory>
 #include <string>
@@ -398,6 +399,9 @@ bool CNetChan::SendFile(const char *filename, unsigned int transferID)
 
 void CNetChan::Shutdown(const char *pReason)
 {
+	if (GameServer_InterceptOwnedNetChannelShutdown(this, pReason))
+		return;
+
 	// send disconnect
 
 	if ( m_Socket < 0 )
@@ -443,6 +447,11 @@ void CNetChan::Shutdown(const char *pReason)
 	m_NetMessages.Purge();
 
 	m_DemoRecorder = nullptr;
+
+	// The engine registry has already removed an owned channel before invoking
+	// its local destructor. Do not recursively remove/delete the same channel.
+	if (GameServer_IsOwnedNetChannelDestructing(this))
+		return;
 
 	if ( m_bProcessingMessages )
 	{
@@ -511,7 +520,8 @@ CNetChan::CNetChan()
 
 CNetChan::~CNetChan()
 {
-	Shutdown("NetChannel removed.");
+	Shutdown(GameServer_BeginOwnedNetChannelDestruction(this));
+	GameServer_EndOwnedNetChannelDestruction(this);
 }
 
 /*

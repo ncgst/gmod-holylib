@@ -735,16 +735,40 @@ LUA_FUNCTION_STATIC(pvs_AddEntityToTransmit)
 	return 0;
 }
 
+#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
+static Symbols::CBaseEntity_GMOD_SetShouldPreventTransmitToPlayer func_SetShouldPreventTransmit = nullptr;
+#if MODULE_EXISTS_NETWORKING
+extern Symbols::CBaseEntity_GMOD_SetShouldPreventTransmitToPlayer Networking_GetSetShouldPreventTransmit();
+#endif
+#endif
+
+static void SetShouldPreventTransmit(CBaseEntity* ent, CBasePlayer* ply, bool prevent)
+{
+#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
+	// The SDK's virtual slot is stale on current Linux64 builds. Resolve the
+	// same entry used by Entity:SetPreventTransmit, including any installed hook.
+	func_SetShouldPreventTransmit(ent, ply, prevent);
+#else
+	ent->GMOD_SetShouldPreventTransmitToPlayer(ply, prevent);
+#endif
+}
+
 LUA_FUNCTION_STATIC(pvs_SetPreventTransmitBulk)
 {
-	CBasePlayer* ply = nullptr;
+#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
+	if (!func_SetShouldPreventTransmit)
+		LUA->ThrowError("Failed to resolve CBaseEntity::GMOD_SetShouldPreventTransmitToPlayer");
+#endif
 	std::vector<CBasePlayer*> filterplys;
 	if (LUA->IsType(2, GarrysMod::Lua::Type::RecipientFilter))
 	{
 		CRecipientFilter* filter = (CRecipientFilter*)Get_IRecipientFilter(LUA, 2, true);
-		for (int i=0; i<gpGlobals->maxClients; ++i)
-			if (filter->GetRecipientIndex(i) != -1)
-				filterplys.push_back(UTIL_PlayerByIndex(i));
+		for (int i=0; i<filter->GetRecipientCount(); ++i)
+		{
+			CBasePlayer* ply = UTIL_PlayerByIndex(filter->GetRecipientIndex(i));
+			if (ply)
+				filterplys.push_back(ply);
+		}
 	}
 	else if (LUA->IsType(2, GarrysMod::Lua::Type::Table))
 	{
@@ -760,7 +784,11 @@ LUA_FUNCTION_STATIC(pvs_SetPreventTransmitBulk)
 		LUA->Pop(1);
 	}
 	else
-		ply = Util::Get_Player(LUA, 2, true);
+		filterplys.push_back(Util::Get_Player(LUA, 2, true));
+
+	// Empty recipient collections are a no-op, never a null player argument.
+	if (filterplys.empty())
+		return 0;
 
 	bool notransmit = LUA->GetBool(3);
 	if (LUA->IsType(1, GarrysMod::Lua::Type::Table))
@@ -770,15 +798,8 @@ LUA_FUNCTION_STATIC(pvs_SetPreventTransmitBulk)
 		while (LUA->Next(-2))
 		{
 			CBaseEntity* ent = Util::Get_Entity(LUA, -1, true);
-			if (filterplys.size() > 0)
-			{
-				for (CBasePlayer* pply : filterplys)
-				{
-					ent->GMOD_SetShouldPreventTransmitToPlayer(pply, notransmit);
-				}
-			} else {
-				ent->GMOD_SetShouldPreventTransmitToPlayer(ply, notransmit);
-			}
+			for (CBasePlayer* pply : filterplys)
+				SetShouldPreventTransmit(ent, pply, notransmit);
 
 			LUA->Pop(1);
 		}
@@ -788,16 +809,14 @@ LUA_FUNCTION_STATIC(pvs_SetPreventTransmitBulk)
 		EntityList* entList = Get_EntityList(LUA, 1, true);
 		for (CBaseEntity* ent : entList->GetEntities())
 		{
-			if (filterplys.size() > 0)
-				for (CBasePlayer* pply : filterplys)
-					ent->GMOD_SetShouldPreventTransmitToPlayer(pply, notransmit);
-			else
-				ent->GMOD_SetShouldPreventTransmitToPlayer(ply, notransmit);
+			for (CBasePlayer* pply : filterplys)
+				SetShouldPreventTransmit(ent, pply, notransmit);
 		}
 #endif
 	} else {
 		CBaseEntity* ent = Util::Get_Entity(LUA, 1, true);
-		ent->GMOD_SetShouldPreventTransmitToPlayer(ply, notransmit);
+		for (CBasePlayer* pply : filterplys)
+			SetShouldPreventTransmit(ent, pply, notransmit);
 	}
 	
 	return 0;
@@ -1099,10 +1118,19 @@ void CPVSModule::InitDetour(bool bPreServer)
 {
 	if (bPreServer)
 		return;
+	SourceSDK::ModuleLoader server_loader("server");
+#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
+#if MODULE_EXISTS_NETWORKING
+	func_SetShouldPreventTransmit = Networking_GetSetShouldPreventTransmit();
+#endif
+	if (!func_SetShouldPreventTransmit)
+		func_SetShouldPreventTransmit = (Symbols::CBaseEntity_GMOD_SetShouldPreventTransmitToPlayer)Detour::GetFunction(
+			server_loader.GetModule(), Symbols::CBaseEntity_GMOD_SetShouldPreventTransmitToPlayerSym);
+	Detour::CheckFunction((void*)func_SetShouldPreventTransmit, "CBaseEntity::GMOD_SetShouldPreventTransmitToPlayer(PVS)");
+#endif
 
 #ifndef HOLYLIB_MANUALNETWORKING
 	DETOUR_PREPARE_THISCALL();
-	SourceSDK::ModuleLoader server_loader("server");
 	Detour::Create(
 		&detour_CGMOD_Player_SetupVisibility, "CGMOD_Player::SetupVisibility",
 		server_loader.GetModule(), Symbols::CGMOD_Player_SetupVisibilitySym,
@@ -1125,6 +1153,9 @@ void CPVSModule::InitDetour(bool bPreServer)
 
 void CPVSModule::Shutdown()
 {
+#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
+	func_SetShouldPreventTransmit = nullptr;
+#endif
 #if MODULE_EXISTS_NETWORKING
 	Networking_SwitchToOURTransmit();
 #endif

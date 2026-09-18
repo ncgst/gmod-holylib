@@ -82,6 +82,7 @@ IModule* pGModDataPackModule = &g_pGModDataPackModule;
 
 #if MODULE_EXISTS_GAMESERVER
 extern bool Gameserver_HasExactGModSender();
+extern bool Gameserver_IsParkedQueueSlot(int slot);
 #endif
 
 // Linux connections begin from globally canonical hashes. Remember the exact
@@ -2277,6 +2278,17 @@ static bool SendLuaPackServerInfoNow(CBaseClient* client,
 static bool hook_CBaseClient_SendServerInfo(CBaseClient* client)
 {
 	VPROF_BUDGET("HolyLib - LuaPack queue SendServerInfo", VPROF_BUDGETGROUP_HOLYLIB);
+#if MODULE_EXISTS_GAMESERVER
+	if (client && Gameserver_IsParkedQueueSlot(client->GetPlayerSlot()))
+	{
+		// Parked queue clients keep CONNECTED for admission accounting. The
+		// engine GModDataPack tree is physical-slot-sized; sending a baseline
+		// from slot 128+ corrupts it. PromoteFromQueue restarts sign-on on the
+		// real slot, which is the supported Lua delivery boundary.
+		client->m_bSendServerInfo = false;
+		return true;
+	}
+#endif
 	if (QueueLuaPackServerInfo(client))
 	{
 		// The engine clears m_bSendServerInfo only inside the real call, and all known

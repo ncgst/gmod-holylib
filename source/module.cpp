@@ -1,6 +1,9 @@
 #include "detours.h"
 #include <tier2/tier2.h>
 #include "modules/_modules.h"
+#if MODULE_EXISTS_GAMESERVER
+#include "custom_netchannel_owner.h"
+#endif
 #include "convar.h"
 #include "tier0/icommandline.h"
 
@@ -427,8 +430,8 @@ void CModuleManager::LuaInit(GarrysMod::Lua::ILuaInterface* pLua, bool bServerIn
 				if (LUA == pLua)
 					continue;
 
-				VCALL_LUA_ENABLED_MODULES(LuaInit(pLua, bServerInit));
-				VCALL_LUA_ENABLED_MODULES(PostLuaInit(pLua, bServerInit));
+				// Bind dispatch and its multi-state filter to this child interface.
+				LuaInit(LUA, true);
 			}
 		}
 	}
@@ -473,6 +476,9 @@ void CModuleManager::InitDetour(bool bPreServer)
 
 void CModuleManager::Think(bool bSimulating)
 {
+#if MODULE_EXISTS_GAMESERVER
+	GameServer_DrainNetChannelRetirements();
+#endif
 	VCALL_ENABLED_MODULES(Think(bSimulating));
 }
 

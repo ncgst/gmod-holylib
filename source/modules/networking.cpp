@@ -207,6 +207,13 @@ static void CleanupSetPreventTransmit(const CBaseEntity* ent)
 }
 
 static Detouring::Hook detour_CBaseEntity_GMOD_SetShouldPreventTransmitToPlayer;
+static Symbols::CBaseEntity_GMOD_SetShouldPreventTransmitToPlayer func_GMODSetShouldPrevent = nullptr;
+
+Symbols::CBaseEntity_GMOD_SetShouldPreventTransmitToPlayer Networking_GetSetShouldPreventTransmit()
+{
+	return func_GMODSetShouldPrevent;
+}
+
 static void hook_CBaseEntity_GMOD_SetShouldPreventTransmitToPlayer(CBaseEntity* pEnt, CBasePlayer* pPly, bool bPreventTransmit)
 {
 	const edict_t* pEdict = pEnt->edict();
@@ -2056,6 +2063,9 @@ void CNetworkingModule::InitDetour(bool bPreServer)
 		void* pGMODSetShouldPrevent = Detour::GetFunction(server_loader.GetModule(), Symbols::CBaseEntity_GMOD_SetShouldPreventTransmitToPlayerSym);
 		if (pGMODShouldPrevent && pGMODSetShouldPrevent)
 		{
+			// Preserve the original entry address before detouring changes its prologue.
+			// Other modules must reuse this address rather than scan patched code.
+			func_GMODSetShouldPrevent = (Symbols::CBaseEntity_GMOD_SetShouldPreventTransmitToPlayer)pGMODSetShouldPrevent;
 			Detour::Create(
 				&detour_CBaseEntity_GMOD_SetShouldPreventTransmitToPlayer, "CBaseEntity::GMOD_SetShouldPreventTransmitToPlayer",
 				server_loader.GetModule(), Symbols::CBaseEntity_GMOD_SetShouldPreventTransmitToPlayerSym,
@@ -2310,12 +2320,8 @@ void CNetworkingModule::Shutdown()
 {
 	g_pReplaceCServerGameEnts_CheckTransmit = false;
 
-	if (!framesnapshotmanager) // If we failed, we failed
-	{
-		Msg(PROJECT_NAME ": Failed to find framesnapshotmanager. Unable to fully unload!\n");
-		return;
-	}
-
+	// The default 64-bit transmit path does not resolve the snapshot manager.
+	// Listener teardown is independent of the disabled snapshot restoration below.
 	if (Util::gameeventmanager)
 		Util::gameeventmanager->RemoveListener(&g_pNetworkGameEventListener);
 

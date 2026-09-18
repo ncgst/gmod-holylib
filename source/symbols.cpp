@@ -52,7 +52,7 @@ namespace Symbols
 
 	const std::vector<Symbol> CBaseAnimating_InvalidateBoneCacheSym = {
 		Symbol::FromName("_ZN14CBaseAnimating19InvalidateBoneCacheEv"),
-		Symbol::FromSignature("\x55\x48\x89\xE5\x48\x8B\xBF\x58\x16\x00\x00"), // 55 48 89 E5 48 8B BF 58 16 00 00
+		Symbol::FromSignature("\x55\x48\x89\xE5\x48\x8B\xBF*\x16\x00\x00\x5D\xE9"), // Linux64 260804/260915: bone-cache handle moved 0x1658 -> 0x1650; preserve the tail-call wrapper signature.
 		// How to hopefully find it(Still a pain): Search for "%5.2f : %s : %s : %5.3f\n" -> CBaseAnimating::StudioFrameAdvance() -> StudioFrameAdvanceInternal() -> Studio_InvalidateBoneCacheIfNotMatching() -> Find CBaseAnimating::InvalidateBoneCache by checking which function calls it with -1.0f
 		// Else: Search for 'aim_yaw' -> CNPC_SecurityCamera__UpdateFacing -> CBaseAnimating::InvalidateBoneCache
 	};
@@ -640,7 +640,7 @@ namespace Symbols
 
 	const std::vector<Symbol> CBaseEntity_GMOD_SetShouldPreventTransmitToPlayerSym = { //Find CBaseEntity::GetLuaEntity with "m_LuaEntity != ENTITY!"
 		Symbol::FromName("_ZN11CBaseEntity37GMOD_SetShouldPreventTransmitToPlayerEP11CBasePlayerb"),
-		Symbol::FromSignature("\x55\x48\x89\xE5\x41\x57\x41\x89\xD7\x41\x56\x41\x55\x41\x54\x49\x89\xFC\x53"), // 55 48 89 E5 41 57 41 89 D7 41 56 41 55 41 54 49 89 FC 53
+		Symbol::FromSignature("\x55\x48\x89\xE5\x41\x57\x41\x89\xD7\x41\x56\x41\x55\x41\x54\x49\x89\xFC\x53\x48\x89\xF3\x48\x83\xEC\x28\x48\x85\xF6"), // Unique in Linux64 260804/260915; the shorter prologue also matched an unrelated function.
 		Symbol::FromSignature("\x55\x8B\xEC\x53\x56\x8B\x75\x08\x57\x8B\xF9\x85\xF6\x74\x2A\x8B\x06\x8B\xCE\xFF\x50\x08\x8B\x00"),
 		Symbol::FromSignature("\x40\x53\x56\x57\x41\x55\x41\x56\x48\x83\xEC\x20"),
 	};

@@ -947,15 +947,10 @@ void CLuaInterface::RunThreadedCalls()
 	std::list<GarrysMod::Lua::ILuaThreadedCall*> pThreadedCalls = m_pThreadedCalls;
 	m_pThreadedCallsMutex.Unlock();
 
-	for (auto it = pThreadedCalls.begin(); it != pThreadedCalls.end(); )
+	for (GarrysMod::Lua::ILuaThreadedCall* call : pThreadedCalls)
 	{
-		if ((*it)->IsDone())
-		{
-			pFinishedCalls.insert(*it);
-			continue;
-		}
-
-		it++;
+		if (call->IsDone())
+			pFinishedCalls.insert(call);
 	}
 
 	// Second pass though without calling any callback ensuring that AddThreadedCall is not possibly invoked
