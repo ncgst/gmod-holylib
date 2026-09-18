@@ -11,7 +11,7 @@ require("http")
 function FetchHolyLogsResults(github_repository, runNumber, callback, host, apikey)
 	HTTP({
 		failed = function(reason)
-			print("Failed to get performance results from HolyLogs for " .. runNumber .. "!", reason)
+			error("Failed to get performance results for run " .. runNumber .. ": " .. reason)
 		end,
 		success = function(responseBody)
 			print("Successfully got performance results from HolyLogs for " .. runNumber .. " :3")
@@ -20,33 +20,22 @@ function FetchHolyLogsResults(github_repository, runNumber, callback, host, apik
 				return
 			end
 
-			local function SubUntilNull(str, startPos)
-				for k=startPos, string.len(str) do
-					if string.byte(responseBody, k, k) == 0 then
-						return string.sub(str, startPos, k-1), k
-					end
-				end
-
-				return string.sub(str, startPos), string.len(str)
-			end
-
 			local entries = {}
-			local pos = 0
-			while pos < string.len(responseBody) do
-				local lengthStr, newPos = SubUntilNull(responseBody, pos)
-				pos = newPos + 1
-
+			local pos = 1
+			while pos <= #responseBody do
+				local separator = responseBody:find("\0", pos, true)
+				if not separator then error("Incomplete telemetry length for run " .. runNumber) end
+				local lengthStr = responseBody:sub(pos, separator - 1)
 				local length = tonumber(lengthStr)
-				if not length then
-					print("Failed to parse number (" .. lengthStr .. ")")
-					return
+				if not lengthStr:match("^%d+$") or not length or length < 1 then
+					error("Invalid telemetry length for run " .. runNumber)
 				end
-
-				local data = string.sub(responseBody, pos, pos + length - 1)
-				pos = pos + length + 1 -- Every entry too is ended by a null byte that we can skip
-
-				-- if string.len(data) != length then print("Length for entry doesn't match!") end
-
+				pos = separator + 1
+				if pos + length > #responseBody or responseBody:sub(pos + length, pos + length) ~= "\0" then
+					error("Incomplete telemetry entry for run " .. runNumber)
+				end
+				local data = responseBody:sub(pos, pos + length - 1)
+				pos = pos + length + 1
 				table.insert(entries, data)
 			end
 
@@ -62,27 +51,27 @@ function FetchHolyLogsResults(github_repository, runNumber, callback, host, apik
 end
 
 function FetchFromHolyLogs(github_repository, runNumber, host, apikey, previous_run_number)
-	local currentHolyLogsResults = {}
+	local currentHolyLogsResults
 	FetchHolyLogsResults(github_repository, runNumber, function(jsonTable)
 		currentHolyLogsResults = jsonTable
 	end, host, apikey)
 
 	if previous_run_number > 0 then
-		local lastHolyLogsResults = {}
+		local lastHolyLogsResults
 		FetchHolyLogsResults(github_repository, previous_run_number, function(jsonTable)
 			lastHolyLogsResults = jsonTable
 		end, host, apikey)
 
 		HTTP_WaitForAll()
 
-		if not lastHolyLogsResults then
+		if not currentHolyLogsResults or not lastHolyLogsResults then
 			error("Failed to fetch results.")
 		end
 
 		return currentHolyLogsResults, lastHolyLogsResults, previous_run_number
 	end
 
-	local lastHolyLogsResults = {} -- Results of the last run.
+	local lastHolyLogsResults -- Results of the last run.
 	local lastRun = -1
 	nextSearchID = runNumber - 1
 	while (lastRun == -1) and ((runNumber - nextSearchID) < 50 and nextSearchID > 0) do -- NUKE IT >:3
@@ -258,8 +247,7 @@ end
 
 local currentHolyLogsResults, lastHolyLogsResults, lastRun = FetchFromHolyLogs(github_repo, run_number, usingPublic and holylogs_public_host or holylogs_host, holylogs_api, previous_run_number)
 if not currentHolyLogsResults or not lastHolyLogsResults then
-	print("Missing results, skipping summary.", currentHolyLogsResults, lastHolyLogsResults)
-	return
+	error("Missing performance results")
 end
 
 local currentResults = CalculateMergedResults(currentHolyLogsResults)

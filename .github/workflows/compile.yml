@@ -39,6 +39,8 @@ jobs:
         run: source/_prebuildtools/luajit_64 tests/gluatest_trace_fixture_tests.lua
       - name: Check read-only update evidence collection
         run: python3 tests/gmod_update_evidence_tests.py
+      - name: Check complete CI telemetry responses and reporting failures
+        run: python3 tests/ci_telemetry_tests.py -v
 
   teleport_guard_tests:
     name: "Teleport recursion guard tests"

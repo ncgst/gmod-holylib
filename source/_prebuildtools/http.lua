@@ -18,55 +18,46 @@
 RemoveDir("http") -- Nuke old data!
 CreateDir("http")
 
-local last_added_request = os.time()
 local requests = {}
+local requestComplete = "HOLYLIB_HTTP_COMPLETE"
+
+local function RequestFailed(tbl, reason)
+	if tbl.failed then
+		tbl.failed(reason)
+	else
+		error(reason)
+	end
+	return false
+end
+
+local function FinishRequest(tbl)
+	if not tbl.handle then
+		return RequestFailed(tbl, "Request failed: could not start curl")
+	end
+
+	-- Curl writes the response to a file and only emits this marker on success.
+	-- Waiting for pipe EOF precedes reading that file; a stable size is not EOF.
+	-- Lua 5.1's popen close can report true even for a nonzero process exit.
+	local completion = tbl.handle:read("*a")
+	local closed = tbl.handle:close()
+	tbl.handle = nil
+	if not closed or not completion or not completion:match("^" .. requestComplete .. "%s*$") then
+		return RequestFailed(tbl, "Request failed: curl did not complete successfully")
+	end
+
+	local httpcontent = ReadFile(tbl.httpfile)
+	if httpcontent == nil then
+		return RequestFailed(tbl, "Request failed: response file is missing")
+	end
+	if tbl.success then tbl.success(httpcontent) end
+	return true
+end
+
 function HTTP_WaitForAllInternal()
-	local i = 0
-	for key, tbl in pairs(requests) do
-		i = i + 1
-
-		local httpcontent = ReadFile(tbl.httpfile)
-		if httpcontent and not (httpcontent == "") then
-			local fileSize = string.len(httpcontent)
-			local fileChanged = (tbl.fileSize or 0) ~= fileSize
-			if fileChanged or (tbl.raceConditionTime and os.clock() < tbl.raceConditionTime) then
-				tbl.fileSize = fileSize
-				if fileChanged then
-					tbl.raceConditionTime = os.clock() + 0.2 -- We add some delay since it can take a few milliseconds to finish outputting.
-					print("Skipping result since it's sill being outputted (race condition)")
-				end
-				continue
-			end
-
-			table.remove(requests, key)
-			local success = tbl.handle and tbl.handle:close()
-			if success or not tbl.handle then
-				if tbl.success then
-					tbl.success(httpcontent)
-				end
-			else
-				if tbl.failed then
-					tbl.failed("Request failed: " .. success)
-				end
-			end
-			continue
-		end
-
-		if os.time() > tbl.timeouttime then
-			table.remove(requests, key)
-			if tbl.failed then
-				tbl.failed("Request failed: timeout")
-			end
-		end
-	end
-
-	if (os.time() - last_added_request) > 10 then
-		print("HTTP Took way too long. Assuming something broke!")
-		requests = {} -- Discard of this crap
-		return false
-	end
-
-	return i > 0
+	local tbl = table.remove(requests, 1)
+	if not tbl then return false end
+	FinishRequest(tbl)
+	return #requests > 0
 end
 
 function HTTP_WaitForAll()
@@ -121,36 +112,15 @@ function HTTP(inputTbl)
 		end
 	end
 	tbl.httpfile = "http/" .. i .. ".txt"
-	--tbl.httpdonefile = "http/" .. i .. "_done.txt"
-
-	local curlCommand = "curl -sb -X " .. method .. " " .. url .. params .. (not (contentType == "") and (" -H \"Content-Type:".. contentType .. "\"") or "") .. headers .. (body == "" and "" or (" --data-raw \"" .. body .. "\"")) .. " --max-time " .. timeout .. " > " .. tbl.httpfile --.. " && echo \"Done\" > " .. tbl.httpfile
+	local curlCommand = "curl -sS --fail -X " .. method .. " " .. url .. params .. (not (contentType == "") and (" -H \"Content-Type:".. contentType .. "\"") or "") .. headers .. (body == "" and "" or (" --data-raw \"" .. body .. "\"")) .. " --max-time " .. timeout .. " > " .. tbl.httpfile .. " && echo " .. requestComplete
 	local handle = io.popen(curlCommand)
 	tbl.handle = handle
-	tbl.starttime = os.time()
-	tbl.timeouttime = os.time() + timeout
 
 	if not tbl.mode or tbl.mode == "async" then
 		table.insert(requests, tbl)
 	elseif tbl.mode == "sync" then
-		handle:read('*all')
-		handle:close()
-		print("Result")
-		local httpcontent = ReadFile(tbl.httpfile)
-		if httpcontent and not (httpcontent == "") then
-			local success = tbl.handle and tbl.handle:close()
-			if success or not tbl.handle then
-				if tbl.success then
-					tbl.success(httpcontent)
-				end
-			else
-				if tbl.failed then
-					tbl.failed("Request failed: " .. success)
-				end
-			end
-		end
+		FinishRequest(tbl)
 	end
-
-	last_added_request = os.time()
 end
 
 function HTTPDownload(tbl)
@@ -177,7 +147,7 @@ function HTTPDownload(tbl)
 		end
 	end
 
-	local curlCommand = "curl -L " .. url .. params .. headers .. " --max-time " .. timeout .. " -s -o \"" .. tbl.httpfile .. "\""
+	local curlCommand = "curl -L " .. url .. params .. headers .. " --max-time " .. timeout .. " -sS --fail -o \"" .. tbl.httpfile .. "\" && echo " .. requestComplete
 	local handle = io.popen(curlCommand)
 	tbl.handle = handle
 
