@@ -1,3 +1,4 @@
+# Keep SDK pins aligned with the supported interface ABI documented in BUILD.md.
 name: Build Custom Version
 
 on: 
@@ -52,8 +53,8 @@ jobs:
       BUILD_WINDOWS: "false"
       ARTIFACT_EXPIRE: "7"
       SOURCESDK_MINIMAL: "RaphaelIT7/sourcesdk-minimal"
-      SOURCESDK_MINIMAL_BRANCH: "patch-7"
-      SOURCESDK_MINIMAL_64XBRANCH: "x86-64-patch-3"
+      SOURCESDK_MINIMAL_BRANCH: "0784d6fdfe93bdc017098f3d8422268f7bafb87e" # patch-7
+      SOURCESDK_MINIMAL_64XBRANCH: "7ad3ac0b89a951a73e2e10c70491ed643f5eb4e8" # x86-64-patch-3
       GARRYSMOD_COMMON: "RaphaelIT7/garrysmod_common"
       GARRYSMOD_COMMON_BRANCH: "holylib"
       ADDITIONAL_DATA: "1"
@@ -72,7 +73,7 @@ jobs:
       ARTIFACT_EXPIRE: "7"
       ADDITIONAL_DATA: "1"
       SOURCESDK_MINIMAL: "RaphaelIT7/sourcesdk-minimal"
-      SOURCESDK_MINIMAL_BRANCH: "patch-7"
-      SOURCESDK_MINIMAL_64XBRANCH: "x86-64-patch-3"
+      SOURCESDK_MINIMAL_BRANCH: "0784d6fdfe93bdc017098f3d8422268f7bafb87e" # patch-7
+      SOURCESDK_MINIMAL_64XBRANCH: "7ad3ac0b89a951a73e2e10c70491ed643f5eb4e8" # x86-64-patch-3
       GARRYSMOD_COMMON: "RaphaelIT7/garrysmod_common"
       GARRYSMOD_COMMON_BRANCH: "holylib"
