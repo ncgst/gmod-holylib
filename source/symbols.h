@@ -673,6 +673,21 @@ namespace Symbols
 	extern void* ResolveCCollisionEventFrameUpdate(void* pModule);
 #endif
 
+	//---------------------------------------------------------------------------------
+	// Purpose: GModDataPack Linux x64 resolver
+	//---------------------------------------------------------------------------------
+#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
+	/*
+	 * Linux x64 server.so does not export GModDataPack::IsSingleplayer and the
+	 * generic signature only matches the 32-bit CGlobalVars layout. The resolver
+	 * verifies the unique x64 function body (gpGlobals->maxClients == 1), the
+	 * 12GModDataPack RTTI type name and its vtable slot 5, returning nullptr when
+	 * any structural check fails so the engine implementation is kept.
+	 */
+	extern void* ResolveGModDataPackIsSingleplayer(void* pModule);
+#endif
+
+
 	using CCollisionProperty_MarkSurroundingBoundsDirty = void (GMCOMMON_CALLING_CONVENTION*)(void* fancy_class);
 	extern const std::vector<Symbol> CCollisionProperty_MarkSurroundingBoundsDirtySym;
 

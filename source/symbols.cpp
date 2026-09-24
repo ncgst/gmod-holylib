@@ -2030,5 +2030,87 @@ namespace Symbols
 		return true;
 	}
 
+	void* ResolveGModDataPackIsSingleplayer(void* pModule)
+	{
+		EngineModule module = {};
+		if (!GetEngineModule(pModule, module))
+			return nullptr;
+
+		const Elf64_Phdr* pExecutable = nullptr;
+		for (uint16_t i = 0; i < module.phnum; ++i)
+		{
+			if (module.phdrs[i].p_type == PT_LOAD && (module.phdrs[i].p_flags & (PF_X | PF_R)) == (PF_X | PF_R))
+			{
+				if (pExecutable)
+					return nullptr; // Only the verified single executable-segment layout is supported.
+				pExecutable = &module.phdrs[i];
+			}
+		}
+
+		if (!pExecutable || pExecutable->p_vaddr > UINTPTR_MAX - module.base)
+			return nullptr;
+
+		const unsigned char* pBegin = (const unsigned char*)(module.base + pExecutable->p_vaddr);
+		size_t nRange = pExecutable->p_filesz;
+		if (!IsRangeAccessible(module, pBegin, nRange, true))
+			return nullptr;
+
+		/*
+		 * GModDataPack::IsSingleplayer is not exported and only exists as a
+		 * stripped private function. Its x64 body is return gpGlobals->maxClients == 1;
+		 * the pinned SDK's 64-bit CGlobalVarsBase places maxClients at 0x1C (the
+		 * generic signature offset 0x14 is the 32-bit layout and never matches).
+		 * The whole instruction sequence except the gpGlobals GOT displacement is
+		 * fixed, and it must be unique in the executable segment.
+		 */
+		static const unsigned char pSignature[] = {
+			0x48, 0x8B, 0x05, 0x2A, 0x2A, 0x2A, 0x2A, 0x55, 0x48, 0x89, 0xE5, 0x5D,
+			0x48, 0x8B, 0x00, 0x83, 0x78, 0x1C, 0x01, 0x0F, 0x94, 0xC0, 0xC3
+		};
+		BytePattern signature = { pSignature, sizeof(pSignature) };
+		const unsigned char* pFunction = nullptr;
+		if (!FindUniquePatternInRange(module, pBegin, nRange, signature, pFunction))
+			return nullptr;
+
+		// Independent identity: the function must be slot 5 of the unique 12GModDataPack
+		// vtable (IGModDataPack declaration order: GetFromDatatable, GetHashFromDatatable,
+		// GetHashFromString, FindInDatatable, FindFileInDatatable, IsSingleplayer, ...).
+		static const char pTypeName[] = "12GModDataPack";
+		BytePattern typeNamePattern = { (const unsigned char*)pTypeName, sizeof(pTypeName) };
+		const unsigned char* pTypeNameString = nullptr;
+		if (!FindUniquePatternInRange(module, pBegin, nRange, typeNamePattern, pTypeNameString))
+			return nullptr;
+
+		// typeinfo = [typeinfo vtable][name]; the scan finds the name field address.
+		uintptr_t nNameRef = 0;
+		if (!FindUniquePointerInData(module, (uintptr_t)pTypeNameString, nNameRef) || nNameRef < sizeof(uintptr_t))
+			return nullptr;
+
+		uintptr_t nTypeInfo = nNameRef - sizeof(uintptr_t);
+		if (!IsRangeAccessible(module, (const void*)nTypeInfo, 2 * sizeof(uintptr_t), false))
+			return nullptr;
+
+		uintptr_t nTypeInfoName = 0;
+		memcpy(&nTypeInfoName, (const void*)(nTypeInfo + sizeof(uintptr_t)), sizeof(nTypeInfoName));
+		if (nTypeInfoName != (uintptr_t)pTypeNameString)
+			return nullptr;
+
+		uintptr_t nVTableHeader = 0;
+		if (!FindUniquePointerInData(module, nTypeInfo, nVTableHeader) || nVTableHeader > UINTPTR_MAX - sizeof(uintptr_t))
+			return nullptr;
+
+		uintptr_t nVTable = nVTableHeader + sizeof(uintptr_t);
+		if (!IsRangeAccessible(module, (const void*)nVTable, 6 * sizeof(uintptr_t), false) ||
+			!HasVTableType(module, nVTable, pTypeName, sizeof(pTypeName)))
+			return nullptr;
+
+		uintptr_t nSlotValue = 0;
+		memcpy(&nSlotValue, (const void*)(nVTable + 5 * sizeof(uintptr_t)), sizeof(nSlotValue));
+		if (nSlotValue != (uintptr_t)pFunction)
+			return nullptr;
+
+		return (void*)pFunction;
+	}
+
 #endif
 }

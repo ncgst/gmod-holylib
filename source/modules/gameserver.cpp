@@ -5202,11 +5202,24 @@ void CGameServerModule::InitDetour(bool bPreServer)
 			(void*)DETOUR_THISCALL(hook_CBaseServer_IsMultiplayer, IsMultiplayer), m_pID
 		);
 
+#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
+		// server.so is stripped and does not export this method; the generic x64
+		// signature only matches the 32-bit CGlobalVars layout. The resolver proves
+		// the unique x64 body (gpGlobals->maxClients == 1) and the 12GModDataPack
+		// RTTI/vtable slot 5 relationship, or returns nullptr so the engine
+		// implementation is left in place instead of hooking a lookalike.
+		void* pIsSingleplayer = Symbols::ResolveGModDataPackIsSingleplayer(server_loader.GetModule());
+		Detour::CreateAtAddress(
+			&detour_GModDataPack_IsSingleplayer, "GModDataPack::IsSingleplayer",
+			pIsSingleplayer, (void*)DETOUR_THISCALL(hook_GModDataPack_IsSingleplayer, IsSingleplayer), m_pID
+		);
+#else
 		Detour::Create(
 			&detour_GModDataPack_IsSingleplayer, "GModDataPack::IsSingleplayer",
 			server_loader.GetModule(), Symbols::GModDataPack_IsSingleplayerSym,
 			(void*)DETOUR_THISCALL(hook_GModDataPack_IsSingleplayer, IsSingleplayer), m_pID
 		);
+#endif
 	}
 
 	Detour::Create(
