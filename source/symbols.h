@@ -350,6 +350,29 @@ namespace Symbols
 	using CNetworkStringTable_Deconstructor = void (GMCOMMON_CALLING_CONVENTION*)(void* table);
 	extern const std::vector<Symbol> CNetworkStringTable_DeconstructorSym;
 
+#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
+	/*
+	 * The Linux x64 deleting destructor (_ZN19CNetworkStringTableD0Ev) cannot be
+	 * identified by name or by a class unique byte signature: its instruction shape
+	 * (push rbp; mov rbx,rdi; call sibling; tail jmp operator delete) is shared with
+	 * many other classes in engine.so. This resolver instead locates the
+	 * CNetworkStringTable vtable structurally and returns the verified complete object
+	 * destructor (the function the deleting destructor calls), or nullptr when the
+	 * engine build does not match. Returning nullptr leaves the hook disabled instead
+	 * of hooking an unrelated function.
+	 */
+	extern void* ResolveCNetworkStringTableDeconstructor(void* pModule);
+
+	/*
+	 * Fallback for engine driven map teardown when the destructor above cannot be
+	 * verified: resolves CNetworkStringTableContainer::RemoveAllTables through the
+	 * container interface vtable and validates its type and prologue. This protects
+	 * the verified container teardown path, not arbitrary future deletion paths.
+	 */
+	using CNetworkStringTableContainer_RemoveAllTables = void (GMCOMMON_CALLING_CONVENTION*)(void* container);
+	extern void* ResolveCNetworkStringTableContainerRemoveAllTables(void* pModule, void* pContainer);
+#endif
+
 	//---------------------------------------------------------------------------------
 	// Purpose: surffix Symbols
 	//---------------------------------------------------------------------------------

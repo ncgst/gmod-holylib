@@ -369,6 +369,25 @@ static void hook_CNetworkStringTable_Deconstructor(INetworkStringTable* tbl)
 	// Loves to crash on Windows. Why? Idk.
 }
 
+#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
+/*
+ * Fallback for engine driven map teardown when the CNetworkStringTable destructor
+ * cannot be installed. The verified container teardown path frees its tables, so
+ * invalidate their wrappers before forwarding to the engine.
+ */
+static Detouring::Hook detour_CNetworkStringTableContainer_RemoveAllTables;
+static void hook_CNetworkStringTableContainer_RemoveAllTables(CNetworkStringTableContainer* pContainer)
+{
+	if (pContainer)
+	{
+		for (int i = 0; i < pContainer->m_Tables.Count(); ++i)
+			DeleteGlobal_INetworkStringTable(pContainer->m_Tables[i]);
+	}
+
+	detour_CNetworkStringTableContainer_RemoveAllTables.GetTrampoline<Symbols::CNetworkStringTableContainer_RemoveAllTables>()(pContainer);
+}
+#endif
+
 LUA_FUNCTION_STATIC(INetworkStringTable__tostring)
 {
 	INetworkStringTable* table = Get_INetworkStringTable(LUA, 1, false);
@@ -1060,8 +1079,9 @@ LUA_FUNCTION_STATIC(stringtable_RemoveTable)
 	Util::DoUnsafeCodeCheck(LUA);
 
 	networkStringTableContainerServer->m_Tables.FastRemove(pTable->GetTableId());
-	//DeleteGlobal_INetworkStringTable(pTable); // We don't need this since we hooked into the deconstructor.
-	Delete_INetworkStringTable(LUA, pTable); // Delete our Lua pointer.
+	// The destructor detour is optional; invalidate wrappers in every Lua state
+	// before freeing the table even when its engine symbol is unavailable.
+	DeleteGlobal_INetworkStringTable(pTable);
 
 	CGameServer* pServer = (CGameServer*)Util::server;
 	if (pServer)
@@ -1198,11 +1218,35 @@ void CStringTableModule::InitDetour(bool bPreServer)
 #if SYSTEM_LINUX
 	// Note: This hook exists for safety and if everything goes well we shouldn't even require it.
 	SourceSDK::ModuleLoader engine_loader("engine");
+#if defined(ARCHITECTURE_X86_64)
+	// engine.so is stripped and the deleting destructor is an allocator thunk whose
+	// instruction shape is shared with other classes, so resolve the destructor
+	// structurally and only hook it when the vtable relationship is verified.
+	void* pDeconstructor = Symbols::ResolveCNetworkStringTableDeconstructor(engine_loader.GetModule());
+	Detour::CreateAtAddress(
+		&detour_CNetworkStringTable_Deconstructor, "CNetworkStringTable::~CNetworkStringTable",
+		pDeconstructor, (void*)hook_CNetworkStringTable_Deconstructor, m_pID
+	);
+
+	if (!DETOUR_ISVALID(detour_CNetworkStringTable_Deconstructor) ||
+		!DETOUR_ISENABLED(detour_CNetworkStringTable_Deconstructor))
+	{
+		// No verified destructor hook: keep engine driven map teardown safe by
+		// invalidating the wrappers before the container frees its tables.
+		void* pRemoveAllTables = Symbols::ResolveCNetworkStringTableContainerRemoveAllTables(
+			engine_loader.GetModule(), networkStringTableContainerServer);
+		Detour::CreateAtAddress(
+			&detour_CNetworkStringTableContainer_RemoveAllTables, "CNetworkStringTableContainer::RemoveAllTables",
+			pRemoveAllTables, (void*)hook_CNetworkStringTableContainer_RemoveAllTables, m_pID
+		);
+	}
+#else
 	Detour::Create(
 		&detour_CNetworkStringTable_Deconstructor, "CNetworkStringTable::~CNetworkStringTable",
 		engine_loader.GetModule(), Symbols::CNetworkStringTable_DeconstructorSym,
 		(void*)hook_CNetworkStringTable_Deconstructor, m_pID
 	);
+#endif
 
 	func_CNetworkStringTable_DeleteAllStrings = (Symbols::CNetworkStringTable_DeleteAllStrings)Detour::GetFunction(engine_loader.GetModule(), Symbols::CNetworkStringTable_DeleteAllStringsSym);
 	Detour::CheckFunction((void*)func_CNetworkStringTable_DeleteAllStrings, "CNetworkStringTable::DeleteAllStrings");

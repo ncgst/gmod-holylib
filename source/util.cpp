@@ -50,50 +50,27 @@ ConVar Util::holylib_debug_mainutil("holylib_debug_mainutil", "1");
 // We require this here since we depend on the Lua namespace
 void ReferencedLuaUserData::ForceGlobalRelease(void* pData)
 {
-	bool bFound = false;
 	const auto& pStateData = Lua::GetAllLuaData();
+	// Invalidate this pointer in every state before releasing any Lua references.
 	for (Lua::StateData* pState : pStateData)
 	{
-		const auto& owningData = pState->GetPushedUserData(); // Copy it over in case it->second gets deleted while iterating
+		const auto& owningData = pState->GetPushedUserData();
 		auto it2 = owningData.find(pData);
-		if (it2 == owningData.end())
-			continue;
-		
-		bFound = true;
-		for (auto& [_, userData] : owningData)
-		{
-			if (userData->GetData())
-			{
-				userData->SetData(nullptr); // Remove any references any LuaUserData holds to us.
-			}
-		}
+		if (it2 != owningData.end())
+			it2->second->SetData(nullptr);
 	}
 
-	if (!bFound)
-		return;
-
-	/*
-		We need to pull it again since the it->second might have now been deleted.
-		This is because SetData internally releases the UserData it holds and the UserData will delete itself if all references were freed
-	*/
 	for (Lua::StateData* pState : pStateData)
 	{
-		auto& owningData = pState->GetPushedUserData(); // Copy it over in case it->second gets deleted while iterating
+		auto& owningData = pState->GetPushedUserData();
 		auto it2 = owningData.find(pData);
 		if (it2 == owningData.end())
 			continue;
 
-		// Reference leak case. This should normally never happen.
-#if HOLYLIB_UTIL_BASEUSERDATA 
-//#if HOLYLIB_UTIL_DEBUG_BASEUSERDATA
-		Warning(PROJECT_NAME " - BaseUserData: Found a reference leak while deleting it! (%p, %p, %i)\n", pData, it2->second, it2->second->GetReferenceCount());
-//#endif
-
-		it2->second-> = 1; // Set it to 1 because Release will only fully execute if there aren't any other references left.
-		it2->second->Release(nullptr);
-#else
-		it2->second->Release(pState->pLua);
-#endif
+		// The cache must not retain userdata after its strong Lua reference is freed.
+		ReferencedLuaUserData* userData = it2->second;
+		owningData.erase(it2);
+		userData->Release(pState->pLua);
 	}
 }
 

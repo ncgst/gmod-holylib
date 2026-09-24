@@ -1,5 +1,13 @@
 #include "symbols.h"
 
+#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
+#include <cstdint>
+#include <cstring>
+#include <dlfcn.h>
+#include <elf.h>
+#include <link.h>
+#endif
+
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
 
@@ -306,7 +314,10 @@ namespace Symbols
 
 	const std::vector<Symbol> CNetworkStringTable_DeconstructorSym = { // "Table %s\n" - Brings you to CNetworkStringTable::Dump
 		Symbol::FromName("_ZN19CNetworkStringTableD0Ev"),
-		Symbol::FromSignature("\x55\x48\x89\xE5\x53\x48\x89\xFB\x48\x83\xEC\x08\xE8\x8F\xFF\xFF\xFF\x48\x83\xC4\x08\x48\x89\xDF\x5B\x5D\xE9**\xEE\xFF"), // 55 48 89 E5 53 48 89 FB 48 83 EC 08 E8 8F FF FF FF 48 83 C4 08 48 89 DF 5B 5D E9 ?? ?? EE FF
+		// Linux x64: no stable name and no class unique signature (the deleting
+		// destructor shape matches ~30 other classes in engine.so). Resolved
+		// structurally through Symbols::ResolveCNetworkStringTableDeconstructor.
+		NULL_SIGNATURE,
 		Symbol::FromSignature("\x55\x8B\xEC\x56\x8B\xF1\xFF\x76\x08"),
 		Symbol::FromSignature("\x48\x89\x5C\x24\x08\x57\x48\x83\xEC\x20\x48\x8D\x05\x2A\x2A\x2A\x2A\x48\x8B\xD9\x48\x89\x01\x8B\xFA\x48\x8B\x49\x10"),
 		// Optional though not really required, tho it still would be good to have tbh as it acts as safety against invalid pointers for lua userdata
@@ -1350,4 +1361,292 @@ namespace Symbols
 	const std::vector<Symbol> Lua_KillSym = {
 		Symbol::FromName("_ZN3Lua4KillEv"),
 	};
+
+#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
+	namespace
+	{
+		struct EngineModule
+		{
+			uintptr_t base;
+			const Elf64_Phdr* phdrs;
+			uint16_t phnum;
+		};
+
+		bool GetEngineModule(void* pModule, EngineModule& module)
+		{
+			if (!pModule)
+				return false;
+
+			link_map* pMap = nullptr;
+			if (dlinfo(pModule, RTLD_DI_LINKMAP, &pMap) != 0 || !pMap)
+				return false;
+			module.base = (uintptr_t)pMap->l_addr;
+			// Read loader-owned headers instead of assuming an opaque dlopen handle
+			// is a link_map or that the ELF header is mapped at the load bias.
+			dl_iterate_phdr([](dl_phdr_info* pInfo, size_t, void* pContext) -> int {
+				EngineModule& found = *(EngineModule*)pContext;
+				if ((uintptr_t)pInfo->dlpi_addr != found.base)
+					return 0;
+				found.phdrs = pInfo->dlpi_phdr;
+				found.phnum = pInfo->dlpi_phnum;
+				return 1;
+			}, &module);
+			return module.phdrs && module.phnum != 0;
+		}
+
+		bool IsRangeAccessible(const EngineModule& module, const void* pData, size_t nSize, bool bExecutable)
+		{
+			uintptr_t nAddress = (uintptr_t)pData;
+			for (uint16_t i = 0; i < module.phnum; ++i)
+			{
+				const Elf64_Phdr& segment = module.phdrs[i];
+				const unsigned int nRequiredFlags = PF_R | (bExecutable ? PF_X : 0);
+				if (segment.p_type != PT_LOAD || (segment.p_flags & nRequiredFlags) != nRequiredFlags ||
+					segment.p_vaddr > UINTPTR_MAX - module.base)
+					continue;
+
+				uintptr_t nStart = module.base + segment.p_vaddr;
+				if (segment.p_memsz > UINTPTR_MAX - nStart)
+					continue;
+				uintptr_t nEnd = nStart + segment.p_memsz;
+				if (nAddress >= nStart && nAddress <= nEnd && nSize <= nEnd - nAddress)
+					return true;
+			}
+
+			return false;
+		}
+
+		bool MatchesBytes(const EngineModule& module, const void* pData, const unsigned char* pExpected, size_t nSize, bool bWildcards = false)
+		{
+			unsigned char pBuffer[32];
+			if (nSize > sizeof(pBuffer) || !IsRangeAccessible(module, pData, nSize, true))
+				return false;
+
+			memcpy(pBuffer, pData, nSize);
+			for (size_t i = 0; i < nSize; ++i)
+			{
+				if (bWildcards && pExpected[i] == 0x2A) // Same wildcard the symbol finder uses.
+					continue;
+
+				if (pBuffer[i] != pExpected[i])
+					return false;
+			}
+
+			return true;
+		}
+
+		bool ContainsBytes(const EngineModule& module, const void* pData, size_t nRange, const unsigned char* pExpected, size_t nSize)
+		{
+			if (nRange < nSize || !IsRangeAccessible(module, pData, nRange, true))
+				return false;
+
+			const unsigned char* pBytes = (const unsigned char*)pData;
+			for (size_t i = 0; i <= nRange - nSize; ++i)
+			{
+				if (memcmp(pBytes + i, pExpected, nSize) == 0)
+					return true;
+			}
+
+			return false;
+		}
+
+		bool HasVTableType(const EngineModule& module, uintptr_t nVTable, const char* pName, size_t nNameSize)
+		{
+			if (nVTable < 2 * sizeof(uintptr_t) || (nVTable % alignof(uintptr_t)) ||
+				!IsRangeAccessible(module, (const void*)(nVTable - 2 * sizeof(uintptr_t)), 2 * sizeof(uintptr_t), false))
+				return false;
+			uintptr_t header[2];
+			memcpy(header, (const void*)(nVTable - 2 * sizeof(uintptr_t)), sizeof(header));
+			if (header[0] != 0 || !IsRangeAccessible(module, (const void*)header[1], 2 * sizeof(uintptr_t), false))
+				return false;
+			uintptr_t nName;
+			memcpy(&nName, (const void*)(header[1] + sizeof(uintptr_t)), sizeof(nName));
+			return IsRangeAccessible(module, (const void*)nName, nNameSize, false) &&
+				memcmp((const void*)nName, pName, nNameSize) == 0;
+		}
+
+		bool AddRelativeDisplacement(uintptr_t nAddress, int32_t nDisplacement, uintptr_t& nResult)
+		{
+			if (nDisplacement < 0)
+			{
+				uintptr_t nMagnitude = (uintptr_t)(-(int64_t)nDisplacement);
+				if (nMagnitude > nAddress) return false;
+				nResult = nAddress - nMagnitude;
+			} else {
+				if ((uintptr_t)nDisplacement > UINTPTR_MAX - nAddress) return false;
+				nResult = nAddress + (uintptr_t)nDisplacement;
+			}
+			return true;
+		}
+	}
+
+	void* ResolveCNetworkStringTableDeconstructor(void* pModule)
+	{
+		EngineModule module = {};
+		if (!GetEngineModule(pModule, module))
+			return nullptr;
+
+		const Elf64_Phdr* pExecutable = nullptr;
+		for (uint16_t i = 0; i < module.phnum; ++i)
+		{
+			if (module.phdrs[i].p_type == PT_LOAD && (module.phdrs[i].p_flags & (PF_X | PF_R)) == (PF_X | PF_R))
+			{
+				if (pExecutable)
+					return nullptr; // Only the verified single executable-segment layout is supported.
+				pExecutable = &module.phdrs[i];
+			}
+		}
+
+		if (!pExecutable)
+			return nullptr;
+
+		/*
+		 * CNetworkStringTable's complete object destructor (which also performs the
+		 * base object destruction, there is no separate reachable D2 entry point in
+		 * these builds) starts by storing the class vtable into the instance. The RIP
+		 * displacement to that vtable is wildcarded because it changes with every
+		 * engine build.
+		 *
+		 * The deleting destructor (D0) itself must NOT be used as the anchor: its
+		 * instruction shape (push rbp; mov rbx,rdi; call sibling; tail jmp operator
+		 * delete) is shared with ~30 other classes in engine.so. It is instead
+		 * validated by proving that it calls the function found here.
+		 */
+		static const unsigned char pCompletePrologue[] = {
+			0x55, 0x48, 0x8D, 0x05, 0x2A, 0x2A, 0x2A, 0x2A, 0x31, 0xD2, 0x48, 0x89,
+			0xE5, 0x53, 0x48, 0x89, 0xFB, 0x48, 0x83, 0xEC, 0x08, 0x48, 0x89, 0x07
+		};
+		static const unsigned char pDeletingPrologue[] = {
+			0x55, 0x48, 0x89, 0xE5, 0x53, 0x48, 0x89, 0xFB, 0x48, 0x83, 0xEC, 0x08, 0xE8
+		};
+		static const unsigned char pDeletingTail[] = {
+			0x48, 0x83, 0xC4, 0x08, 0x48, 0x89, 0xDF, 0x5B, 0x5D, 0xE9
+		};
+		static const unsigned char pGetTableName[] = {
+			0x55, 0x48, 0x89, 0xE5, 0x48, 0x8B, 0x47, 0x10, 0x5D, 0xC3
+		};
+		static const unsigned char pGetTableId[] = {
+			0x55, 0x48, 0x89, 0xE5, 0x8B, 0x47, 0x08, 0x5D, 0xC3
+		};
+		static const unsigned char pDumpGMod[] = { // Dump reads the vptr and calls GetTableName.
+			0x48, 0x8B, 0x07, 0xFF, 0x50, 0x10
+		};
+
+		if (pExecutable->p_filesz < sizeof(pCompletePrologue) ||
+			pExecutable->p_vaddr > UINTPTR_MAX - module.base ||
+			!IsRangeAccessible(module, (const void*)(module.base + pExecutable->p_vaddr), pExecutable->p_filesz, true))
+			return nullptr;
+
+		const unsigned char* pBegin = (const unsigned char*)(module.base + pExecutable->p_vaddr);
+		const unsigned char* pEnd = pBegin + pExecutable->p_filesz - sizeof(pCompletePrologue);
+
+		void* pMatch = nullptr;
+		for (const unsigned char* pCandidate = pBegin; pCandidate <= pEnd; ++pCandidate)
+		{
+			if (!MatchesBytes(module, pCandidate, pCompletePrologue, sizeof(pCompletePrologue), true))
+				continue;
+
+			int32_t nVTableDisplacement;
+			memcpy(&nVTableDisplacement, pCandidate + 4, sizeof(nVTableDisplacement));
+
+			// push rbp is 1 byte, so the RIP relative LE is 8 bytes in.
+			uintptr_t nVTable;
+			if (!AddRelativeDisplacement((uintptr_t)pCandidate + 8, nVTableDisplacement, nVTable))
+				continue;
+
+			static const char pTypeName[] = "19CNetworkStringTable";
+			if (!IsRangeAccessible(module, (const void*)nVTable, 16 * sizeof(void*), false) ||
+				!HasVTableType(module, nVTable, pTypeName, sizeof(pTypeName)))
+				continue;
+
+			void* pCompleteDestructor = nullptr;
+			void* pDeletingDestructor = nullptr;
+			memcpy(&pCompleteDestructor, (const void*)nVTable, sizeof(pCompleteDestructor));
+			memcpy(&pDeletingDestructor, (const void*)(nVTable + 8), sizeof(pDeletingDestructor));
+
+			// vtable[0] must point back at the function that writes it.
+			if (pCompleteDestructor != pCandidate)
+				continue;
+
+			// vtable[1] must be a deleting destructor that calls the complete object
+			// destructor and then tail jumps into the allocator's free path.
+			if (!IsRangeAccessible(module, pDeletingDestructor, 31, true) ||
+				memcmp(pDeletingDestructor, pDeletingPrologue, sizeof(pDeletingPrologue)) != 0 ||
+				memcmp((const unsigned char*)pDeletingDestructor + 17, pDeletingTail, sizeof(pDeletingTail)) != 0)
+				continue;
+
+			int32_t nCallDisplacement;
+			memcpy(&nCallDisplacement, (const unsigned char*)pDeletingDestructor + 13, sizeof(nCallDisplacement));
+			uintptr_t nCallTarget;
+			if (!AddRelativeDisplacement((uintptr_t)pDeletingDestructor + 17, nCallDisplacement, nCallTarget) ||
+				nCallTarget != (uintptr_t)pCandidate)
+				continue;
+
+			int32_t nFreeDisplacement;
+			memcpy(&nFreeDisplacement, (const unsigned char*)pDeletingDestructor + 27, sizeof(nFreeDisplacement));
+			uintptr_t nFreeTarget;
+			if (!AddRelativeDisplacement((uintptr_t)pDeletingDestructor + 31, nFreeDisplacement, nFreeTarget) ||
+				!IsRangeAccessible(module, (const void*)nFreeTarget, 1, true))
+				continue;
+
+			// Sanity check the vtable against the INetworkStringTable interface:
+			// slots 2/3 are the trivial table name/id getters and slot 15 (Dump)
+			// reads the vptr and calls GetTableName.
+			void* pGetTableNameFn = nullptr;
+			void* pGetTableIdFn = nullptr;
+			void* pDumpFn = nullptr;
+			if (!IsRangeAccessible(module, (const void*)(nVTable + 16), 8, false) ||
+				!IsRangeAccessible(module, (const void*)(nVTable + 24), 8, false) ||
+				!IsRangeAccessible(module, (const void*)(nVTable + 120), 8, false))
+				continue;
+
+			memcpy(&pGetTableNameFn, (const void*)(nVTable + 16), sizeof(pGetTableNameFn));
+			memcpy(&pGetTableIdFn, (const void*)(nVTable + 24), sizeof(pGetTableIdFn));
+			memcpy(&pDumpFn, (const void*)(nVTable + 120), sizeof(pDumpFn));
+
+			if (!MatchesBytes(module, pGetTableNameFn, pGetTableName, sizeof(pGetTableName)) ||
+				!MatchesBytes(module, pGetTableIdFn, pGetTableId, sizeof(pGetTableId)) ||
+				!ContainsBytes(module, pDumpFn, 32, pDumpGMod, sizeof(pDumpGMod)))
+				continue;
+
+			if (pMatch)
+				return nullptr; // Multiple structurally valid candidates are ambiguous.
+			pMatch = (void*)pCandidate;
+		}
+
+		return pMatch;
+	}
+
+	void* ResolveCNetworkStringTableContainerRemoveAllTables(void* pModule, void* pContainer)
+	{
+		if (!pContainer)
+			return nullptr;
+		EngineModule module = {};
+		if (!GetEngineModule(pModule, module))
+			return nullptr;
+
+		// INetworkStringTableContainer vtable: slots 0/1 are the destructor pair,
+		// slot 2 is CreateStringTable and slot 3 is RemoveAllTables.
+		void* pVTable = nullptr;
+		memcpy(&pVTable, pContainer, sizeof(pVTable));
+		static const char pContainerType[] = "28CNetworkStringTableContainer";
+		if (!IsRangeAccessible(module, pVTable, 4 * sizeof(void*), false) ||
+			!HasVTableType(module, (uintptr_t)pVTable, pContainerType, sizeof(pContainerType)))
+			return nullptr;
+
+		void* pRemoveAllTables = nullptr;
+		memcpy(&pRemoveAllTables, (const unsigned char*)pVTable + 3 * sizeof(void*), sizeof(pRemoveAllTables));
+		if (!pRemoveAllTables)
+			return nullptr;
+
+		static const unsigned char pPrologue[] = {
+			0x55, 0x48, 0x89, 0xE5, 0x41, 0x54, 0x53, 0x48, 0x89, 0xFB, 0x8B, 0x53, 0x28
+		};
+
+		if (!MatchesBytes(module, pRemoveAllTables, pPrologue, sizeof(pPrologue)))
+			return nullptr;
+
+		return pRemoveAllTables;
+	}
+#endif
 }
