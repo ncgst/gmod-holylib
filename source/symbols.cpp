@@ -857,10 +857,16 @@ namespace Symbols
 
 	const std::vector<Symbol> CPhysicsHook_FrameUpdatePostEntityThinkSym = { // "CPhysicsHook::FrameUpdatePostEntityThink" - VPROF Call
 		Symbol::FromName("_ZN12CPhysicsHook26FrameUpdatePostEntityThinkEv"),
+		// Linux x64: server.so is stripped and the prologue is shared with other
+		// functions. Resolved through the VPROF string and the CPhysicsHook vtable
+		// by Symbols::ResolveCPhysicsHookFrameUpdatePostEntityThink.
+		NULL_SIGNATURE,
 	};
 
 	const std::vector<Symbol> CCollisionEvent_FrameUpdateSym = {
 		Symbol::FromName("_ZN15CCollisionEvent11FrameUpdateEv"),
+		// Linux x64: resolved through the VPROF string and direct callers by
+		// Symbols::ResolveCCollisionEventFrameUpdate.
 		NULL_SIGNATURE,
 	};
 
@@ -1478,6 +1484,161 @@ namespace Symbols
 			}
 			return true;
 		}
+
+		// Byte pattern where 0x2A is a wildcard, matching the SymbolFinder convention.
+		struct BytePattern
+		{
+			const unsigned char* pBytes;
+			size_t nSize;
+		};
+
+		bool MatchesPatternAt(const unsigned char* pData, const BytePattern& pattern)
+		{
+			for (size_t i = 0; i < pattern.nSize; ++i)
+			{
+				if (pattern.pBytes[i] != 0x2A && pData[i] != pattern.pBytes[i])
+					return false;
+			}
+			return true;
+		}
+
+		// Finds the unique match of a pattern inside a readable range. Multiple
+		// matches are ambiguous and rejected instead of taking the first one.
+		bool FindUniquePatternInRange(const EngineModule& module, const unsigned char* pBegin, size_t nRange, const BytePattern& pattern, const unsigned char*& pFound)
+		{
+			if (pattern.nSize == 0 || pattern.nSize > nRange || !IsRangeAccessible(module, pBegin, nRange, true))
+				return false;
+
+			bool bFound = false;
+			for (size_t i = 0; i + pattern.nSize <= nRange; ++i)
+			{
+				if (!MatchesPatternAt(pBegin + i, pattern))
+					continue;
+
+				if (bFound)
+					return false;
+				bFound = true;
+				pFound = pBegin + i;
+			}
+
+			return bFound;
+		}
+
+		// Finds the unique RIP-relative LEA (48/4C 8D /r, mod=00 rm=101) whose target
+		// equals nTarget.
+		bool FindUniqueRipLea(const EngineModule& module, const unsigned char* pBegin, size_t nRange, uintptr_t nTarget, uintptr_t& nFound)
+		{
+			if (!IsRangeAccessible(module, pBegin, nRange, true))
+				return false;
+
+			bool bFound = false;
+			for (size_t i = 0; i + 7 <= nRange; ++i)
+			{
+				if ((pBegin[i] != 0x48 && pBegin[i] != 0x4C) || pBegin[i + 1] != 0x8D || (pBegin[i + 2] & 0xC7) != 0x05)
+					continue;
+
+				int32_t nDisplacement;
+				memcpy(&nDisplacement, pBegin + i + 3, sizeof(nDisplacement));
+				uintptr_t nCandidate;
+				if (!AddRelativeDisplacement((uintptr_t)(pBegin + i + 7), nDisplacement, nCandidate) || nCandidate != nTarget)
+					continue;
+
+				if (bFound)
+					return false;
+				bFound = true;
+				nFound = (uintptr_t)(pBegin + i);
+			}
+
+			return bFound;
+		}
+
+		// Finds the unique occurrence of a pointer value in readable, non-executable
+		// data segments (RTTI and vtable structures live there).
+		bool FindUniquePointerInData(const EngineModule& module, uintptr_t nValue, uintptr_t& nFound)
+		{
+			bool bFound = false;
+			for (uint16_t i = 0; i < module.phnum; ++i)
+			{
+				const Elf64_Phdr& segment = module.phdrs[i];
+				if (segment.p_type != PT_LOAD || (segment.p_flags & PF_R) != PF_R || (segment.p_flags & PF_X))
+					continue;
+
+				if (segment.p_vaddr > UINTPTR_MAX - module.base ||
+					segment.p_filesz > UINTPTR_MAX - (module.base + segment.p_vaddr))
+					continue;
+
+				const unsigned char* pBegin = (const unsigned char*)(module.base + segment.p_vaddr);
+				if (segment.p_filesz > segment.p_memsz ||
+					!IsRangeAccessible(module, pBegin, segment.p_filesz, false))
+					return false;
+				for (size_t n = 0; n + sizeof(uintptr_t) <= segment.p_filesz; n += alignof(uintptr_t))
+				{
+					uintptr_t nCandidate;
+					memcpy(&nCandidate, pBegin + n, sizeof(nCandidate));
+					if (nCandidate != nValue)
+						continue;
+
+					if (bFound)
+						return false;
+					bFound = true;
+					nFound = (uintptr_t)(pBegin + n);
+				}
+			}
+
+			return bFound;
+		}
+
+		bool ContainsDirectCallTo(const EngineModule& module, const unsigned char* pBegin, size_t nRange, uintptr_t nTarget)
+		{
+			if (!IsRangeAccessible(module, pBegin, nRange, true))
+				return false;
+
+			for (size_t i = 0; i + 5 <= nRange; ++i)
+			{
+				if (pBegin[i] != 0xE8)
+					continue;
+
+				int32_t nDisplacement;
+				memcpy(&nDisplacement, pBegin + i + 1, sizeof(nDisplacement));
+				uintptr_t nCandidate;
+				if (AddRelativeDisplacement((uintptr_t)(pBegin + i + 5), nDisplacement, nCandidate) && nCandidate == nTarget)
+					return true;
+			}
+
+			return false;
+		}
+
+		// Locates a function through the unique VPROF budget string it contains: the
+		// string, its unique RIP-relative reference and the unique entry signature in
+		// the window directly before that reference. Used for server.so functions
+		// whose prologue is shared with other translation units.
+		bool FindVProfFunction(const EngineModule& module, const unsigned char* pBegin, size_t nRange,
+			const char* pName, const unsigned char* pPrologue, size_t nPrologueSize,
+			uintptr_t& nFunction, uintptr_t& nXref)
+		{
+			BytePattern namePattern = { (const unsigned char*)pName, strlen(pName) + 1 };
+			const unsigned char* pString = nullptr;
+			if (!FindUniquePatternInRange(module, pBegin, nRange, namePattern, pString))
+				return false;
+
+			if (!FindUniqueRipLea(module, pBegin, nRange, (uintptr_t)pString, nXref))
+				return false;
+
+			const size_t nWindow = 0x1000;
+			size_t nOffset = (size_t)(nXref - (uintptr_t)pBegin);
+			if (nOffset > nRange)
+				return false;
+
+			const unsigned char* pWindowBegin = (const unsigned char*)nXref - (nOffset < nWindow ? nOffset : nWindow);
+			size_t nWindowSize = (size_t)((const unsigned char*)nXref - pWindowBegin);
+			BytePattern prologue = { pPrologue, nPrologueSize };
+			const unsigned char* pEntry = nullptr;
+			if (!FindUniquePatternInRange(module, pWindowBegin, nWindowSize, prologue, pEntry))
+				return false;
+
+			nFunction = (uintptr_t)pEntry;
+			return true;
+		}
 	}
 
 	void* ResolveCNetworkStringTableDeconstructor(void* pModule)
@@ -1648,5 +1809,226 @@ namespace Symbols
 
 		return pRemoveAllTables;
 	}
+
+	void* ResolveCPhysicsHookFrameUpdatePostEntityThink(void* pModule)
+	{
+		EngineModule module = {};
+		if (!GetEngineModule(pModule, module))
+			return nullptr;
+
+		const Elf64_Phdr* pExecutable = nullptr;
+		for (uint16_t i = 0; i < module.phnum; ++i)
+		{
+			if (module.phdrs[i].p_type == PT_LOAD && (module.phdrs[i].p_flags & (PF_X | PF_R)) == (PF_X | PF_R))
+			{
+				if (pExecutable)
+					return nullptr; // Only the verified single executable-segment layout is supported.
+				pExecutable = &module.phdrs[i];
+			}
+		}
+
+		if (!pExecutable || pExecutable->p_vaddr > UINTPTR_MAX - module.base)
+			return nullptr;
+
+		const unsigned char* pBegin = (const unsigned char*)(module.base + pExecutable->p_vaddr);
+		size_t nRange = pExecutable->p_filesz;
+		if (!IsRangeAccessible(module, pBegin, nRange, true))
+			return nullptr;
+
+		/*
+		 * The entry prologue is NOT unique in server.so (four other functions share
+		 * it), so it is only accepted when it is the unique match in the window
+		 * directly before the function's own VPROF budget string reference.
+		 */
+		static const unsigned char pPrologue[] = {
+			0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x4C, 0x8B,
+			0x25, 0x2A, 0x2A, 0x2A, 0x2A, 0x53, 0x48, 0x89, 0xFB, 0x41, 0x8B, 0x94,
+			0x24, 0x0C, 0x10, 0x00, 0x00
+		};
+		uintptr_t nFunction = 0;
+		uintptr_t nXref = 0;
+		if (!FindVProfFunction(module, pBegin, nRange, "CPhysicsHook::FrameUpdatePostEntityThink",
+			pPrologue, sizeof(pPrologue), nFunction, nXref))
+			return nullptr;
+
+		// Independent identity: the entry must be a slot of the CPhysicsHook vtable.
+		static const char pTypeName[] = "12CPhysicsHook";
+		BytePattern typeNamePattern = { (const unsigned char*)pTypeName, sizeof(pTypeName) };
+		const unsigned char* pTypeNameString = nullptr;
+		if (!FindUniquePatternInRange(module, pBegin, nRange, typeNamePattern, pTypeNameString))
+			return nullptr;
+
+		// typeinfo = [typeinfo vtable][name]; the scan finds the name field address.
+		uintptr_t nNameRef = 0;
+		if (!FindUniquePointerInData(module, (uintptr_t)pTypeNameString, nNameRef) || nNameRef < sizeof(uintptr_t))
+			return nullptr;
+
+		uintptr_t nTypeInfo = nNameRef - sizeof(uintptr_t);
+		if (!IsRangeAccessible(module, (const void*)nTypeInfo, 2 * sizeof(uintptr_t), false))
+			return nullptr;
+
+		uintptr_t nTypeInfoName = 0;
+		memcpy(&nTypeInfoName, (const void*)(nTypeInfo + sizeof(uintptr_t)), sizeof(nTypeInfoName));
+		if (nTypeInfoName != (uintptr_t)pTypeNameString)
+			return nullptr;
+
+		uintptr_t nVTableHeader = 0;
+		if (!FindUniquePointerInData(module, nTypeInfo, nVTableHeader) || nVTableHeader > UINTPTR_MAX - sizeof(uintptr_t))
+			return nullptr;
+
+		uintptr_t nVTable = nVTableHeader + sizeof(uintptr_t);
+		// Slot 16 is FrameUpdatePostEntityThink in both verified CPhysicsHook
+		// layouts. Do not search beyond the class into a neighboring vtable.
+		if (!IsRangeAccessible(module, (const void*)nVTable, 17 * sizeof(uintptr_t), false) ||
+			!HasVTableType(module, nVTable, pTypeName, sizeof(pTypeName)))
+			return nullptr;
+
+		uintptr_t nSlotValue = 0;
+		memcpy(&nSlotValue, (const void*)(nVTable + 16 * sizeof(uintptr_t)), sizeof(nSlotValue));
+		if (nSlotValue != nFunction || nXref < nFunction || nXref - nFunction >= 0x1A3)
+			return nullptr;
+
+		return (void*)nFunction;
+	}
+
+	void* ResolveCCollisionEventFrameUpdate(void* pModule)
+	{
+		EngineModule module = {};
+		if (!GetEngineModule(pModule, module))
+			return nullptr;
+
+		const Elf64_Phdr* pExecutable = nullptr;
+		for (uint16_t i = 0; i < module.phnum; ++i)
+		{
+			if (module.phdrs[i].p_type == PT_LOAD && (module.phdrs[i].p_flags & (PF_X | PF_R)) == (PF_X | PF_R))
+			{
+				if (pExecutable)
+					return nullptr; // Only the verified single executable-segment layout is supported.
+				pExecutable = &module.phdrs[i];
+			}
+		}
+
+		if (!pExecutable || pExecutable->p_vaddr > UINTPTR_MAX - module.base)
+			return nullptr;
+
+		const unsigned char* pBegin = (const unsigned char*)(module.base + pExecutable->p_vaddr);
+		size_t nRange = pExecutable->p_filesz;
+		if (!IsRangeAccessible(module, pBegin, nRange, true))
+			return nullptr;
+
+		// CCollisionEvent::FrameUpdate is not virtual, so unlike the physics hook it
+		// has no vtable identity. The entry signature must therefore be unique in the
+		// whole executable segment, and the function must have direct engine callers.
+		static const unsigned char pPrologue[] = {
+			0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x49, 0x89, 0xFE, 0x41,
+			0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xEC, 0x38, 0x48, 0x8B, 0x05, 0x2A,
+			0x2A, 0x2A, 0x2A, 0x8B, 0x90, 0x0C, 0x10, 0x00, 0x00
+		};
+		uintptr_t nFunction = 0;
+		uintptr_t nXref = 0;
+		if (!FindVProfFunction(module, pBegin, nRange, "CCollisionEvent::FrameUpdate",
+			pPrologue, sizeof(pPrologue), nFunction, nXref))
+			return nullptr;
+
+		BytePattern prologuePattern = { pPrologue, sizeof(pPrologue) };
+		const unsigned char* pGloballyUnique = nullptr;
+		if (!FindUniquePatternInRange(module, pBegin, nRange, prologuePattern, pGloballyUnique) ||
+			(uintptr_t)pGloballyUnique != nFunction)
+			return nullptr;
+
+		if (nXref < nFunction || nXref - nFunction >= 0x41F ||
+			!ContainsDirectCallTo(module, pBegin, nRange, nFunction))
+			return nullptr;
+
+		return (void*)nFunction;
+	}
+
+	bool ResolveCVarIteratorLayout(void* pModule, const void* pCVarVTable, void**& pIteratorVTable)
+	{
+		pIteratorVTable = nullptr;
+		EngineModule module = {};
+		if (!GetEngineModule(pModule, module))
+			return false;
+
+		// These libvstdlib builds have been checked independently for the factory
+		// and iterator ABI. A build ID alone is insufficient: validate all pointers
+		// and both RTTI types below before permitting the first virtual call.
+		struct Layout
+		{
+			unsigned char buildID[20];
+			uintptr_t cvarVTable, iteratorVTable, factory;
+			uintptr_t methods[6];
+		};
+		static const Layout layouts[] = {
+			{{0x80,0x15,0xf3,0x51,0x85,0x2d,0xdb,0x50,0x7b,0xe6,0x57,0x46,0x4b,0xa8,0xdc,0x24,0x3d,0xd6,0x69,0x1c},
+			 0x2522b0, 0x252270, 0xdcd0, {0x11300,0x114c0,0xda40,0xe010,0xda90,0xdad0}},
+			{{0x1c,0xa6,0x11,0xdf,0xab,0x55,0x71,0xca,0xfe,0x76,0x11,0x52,0x63,0x68,0x67,0xfb,0x12,0x6d,0xf4,0x52},
+			 0x2532b0, 0x253270, 0xdd20, {0x11350,0x11510,0xda90,0xe060,0xdae0,0xdb20}}
+		};
+		const Layout* pLayout = nullptr;
+		for (uint16_t i = 0; i < module.phnum; ++i)
+		{
+			const Elf64_Phdr& segment = module.phdrs[i];
+			if (segment.p_type != PT_NOTE)
+				continue;
+			if (segment.p_vaddr > UINTPTR_MAX - module.base || segment.p_filesz > segment.p_memsz)
+				return false;
+			const unsigned char* pNote = (const unsigned char*)(module.base + segment.p_vaddr);
+			size_t nRemaining = segment.p_filesz;
+			if (!IsRangeAccessible(module, pNote, nRemaining, false))
+				return false;
+			while (nRemaining >= 3 * sizeof(uint32_t))
+			{
+				uint32_t header[3]; // namesz, descsz, type (Elf64_Nhdr)
+				memcpy(header, pNote, sizeof(header));
+				pNote += sizeof(header);
+				nRemaining -= sizeof(header);
+				const uint64_t nNameSize = ((uint64_t)header[0] + 3) & ~uint64_t(3);
+				const uint64_t nDescSize = ((uint64_t)header[1] + 3) & ~uint64_t(3);
+				if (nNameSize > nRemaining || nDescSize > nRemaining - nNameSize)
+					return false;
+				if (header[0] == 4 && header[1] == 20 && header[2] == 3 && memcmp(pNote, "GNU\0", 4) == 0)
+				{
+					if (pLayout) return false; // Ambiguous build identity.
+					for (const Layout& layout : layouts)
+						if (memcmp(pNote + nNameSize, layout.buildID, sizeof(layout.buildID)) == 0)
+							pLayout = &layout;
+					if (!pLayout) return false;
+				}
+				pNote += nNameSize + nDescSize;
+				nRemaining -= nNameSize + nDescSize;
+			}
+		}
+		if (!pLayout || pLayout->cvarVTable > UINTPTR_MAX - module.base ||
+			pLayout->iteratorVTable > UINTPTR_MAX - module.base || pLayout->factory > UINTPTR_MAX - module.base)
+			return false;
+
+		const uintptr_t nCVarVTable = module.base + pLayout->cvarVTable;
+		const uintptr_t nIteratorVTable = module.base + pLayout->iteratorVTable;
+		static const char pCVarType[] = "5CCvar";
+		static const char pIteratorType[] = "N5CCvar21CCVarIteratorInternalE";
+		if ((uintptr_t)pCVarVTable != nCVarVTable ||
+			!IsRangeAccessible(module, pCVarVTable, 43 * sizeof(uintptr_t), false) ||
+			!IsRangeAccessible(module, (const void*)nIteratorVTable, 6 * sizeof(uintptr_t), false) ||
+			!HasVTableType(module, nCVarVTable, pCVarType, sizeof(pCVarType)) ||
+			!HasVTableType(module, nIteratorVTable, pIteratorType, sizeof(pIteratorType)))
+			return false;
+
+		uintptr_t nFactory;
+		memcpy(&nFactory, (const void*)(nCVarVTable + 42 * sizeof(uintptr_t)), sizeof(nFactory));
+		if (nFactory != module.base + pLayout->factory || !IsRangeAccessible(module, (const void*)nFactory, 1, true))
+			return false;
+		for (size_t i = 0; i < 6; ++i)
+		{
+			uintptr_t nMethod;
+			memcpy(&nMethod, (const void*)(nIteratorVTable + i * sizeof(uintptr_t)), sizeof(nMethod));
+			if (pLayout->methods[i] > UINTPTR_MAX - module.base ||
+				nMethod != module.base + pLayout->methods[i] || !IsRangeAccessible(module, (const void*)nMethod, 1, true))
+				return false;
+		}
+		pIteratorVTable = (void**)nIteratorVTable;
+		return true;
+	}
+
 #endif
 }

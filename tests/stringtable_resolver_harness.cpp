@@ -11,6 +11,7 @@
 #define ELFCLASS64 2
 #define EM_X86_64 62
 #define PT_LOAD 1
+#define PT_NOTE 4
 #define PF_X 1
 #define PF_R 4
 #define SHT_RELA 4

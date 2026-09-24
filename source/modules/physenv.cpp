@@ -2940,6 +2940,21 @@ void CPhysEnvModule::InitDetour(bool bPreServer)
 		(void*)hook_PhysCreateBbox, m_pID
 	);
 
+#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
+	// server.so is stripped and neither entry signature is class unique on its own.
+	// The resolvers verify the function's VPROF string plus the RTTI/vtable
+	// relationship (CPhysicsHook) or the unique entry signature plus direct engine
+	// callers (CCollisionEvent), and return nullptr otherwise so the hook is simply
+	// not installed instead of attaching to the wrong function.
+	void* pFrameUpdatePostEntityThink = Symbols::ResolveCPhysicsHookFrameUpdatePostEntityThink(server_loader.GetModule());
+	Detour::CreateAtAddress(
+		&detour_CPhysicsHook_FrameUpdatePostEntityThink, "CPhysicsHook::FrameUpdatePostEntityThink",
+		pFrameUpdatePostEntityThink, (void*)DETOUR_THISCALL(hook_CPhysicsHook_FrameUpdatePostEntityThink, FrameUpdatePostEntityThink), m_pID
+	);
+
+	func_CCollisionEvent_FrameUpdate = (Symbols::CCollisionEvent_FrameUpdate)Symbols::ResolveCCollisionEventFrameUpdate(server_loader.GetModule());
+	Detour::CheckFunction((void*)func_CCollisionEvent_FrameUpdate, "CCollisionEvent::FrameUpdate");
+#else
 	Detour::Create(
 		&detour_CPhysicsHook_FrameUpdatePostEntityThink, "CPhysicsHook::FrameUpdatePostEntityThink",
 		server_loader.GetModule(), Symbols::CPhysicsHook_FrameUpdatePostEntityThinkSym,
@@ -2948,6 +2963,7 @@ void CPhysEnvModule::InitDetour(bool bPreServer)
 
 	func_CCollisionEvent_FrameUpdate = (Symbols::CCollisionEvent_FrameUpdate)Detour::GetFunction(server_loader.GetModule(), Symbols::CCollisionEvent_FrameUpdateSym);
 	Detour::CheckFunction((void*)func_CCollisionEvent_FrameUpdate, "CCollisionEvent::FrameUpdate");
+#endif
 
 	func_CCollisionProperty_MarkSurroundingBoundsDirty = (Symbols::CCollisionProperty_MarkSurroundingBoundsDirty)Detour::GetFunction(server_loader.GetModule(), Symbols::CCollisionProperty_MarkSurroundingBoundsDirtySym);
 	Detour::CheckFunction((void*)func_CCollisionProperty_MarkSurroundingBoundsDirty, "CCollisionProperty::MarkSurroundingBoundsDirty");

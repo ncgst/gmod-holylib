@@ -660,6 +660,19 @@ namespace Symbols
 	using CCollisionEvent_FrameUpdate = void (GMCOMMON_CALLING_CONVENTION*)(void* pCollisionEvent);
 	extern const std::vector<Symbol> CCollisionEvent_FrameUpdateSym;
 
+#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
+	/*
+	 * Linux x64 server.so is stripped and both functions share their prologue with
+	 * other translation units, so a plain byte signature is not unique. These
+	 * resolvers anchor on the function's own VPROF budget string plus the class
+	 * RTTI/vtable (CPhysicsHook) or a unique entry signature and direct callers
+	 * (CCollisionEvent). They return nullptr when any structural check fails, which
+	 * disables the hook instead of attaching it to the wrong function.
+	 */
+	extern void* ResolveCPhysicsHookFrameUpdatePostEntityThink(void* pModule);
+	extern void* ResolveCCollisionEventFrameUpdate(void* pModule);
+#endif
+
 	using CCollisionProperty_MarkSurroundingBoundsDirty = void (GMCOMMON_CALLING_CONVENTION*)(void* fancy_class);
 	extern const std::vector<Symbol> CCollisionProperty_MarkSurroundingBoundsDirtySym;
 

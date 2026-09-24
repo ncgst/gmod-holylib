@@ -18,6 +18,7 @@
 #include "GarrysMod/IGet.h"
 #include <lua.h>
 #include "versioninfo.h"
+#include "x64_cvar_iterator.h"
 
 #if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
 #include <detouring/helpers.hpp>
@@ -1869,6 +1870,8 @@ static void CreateDebugDump(const CCommand &args)
 	if (pDebugDump)
 	{
 		Bootil::Data::Tree& pData = pDebugDump->GetData();
+		// A dump is a current snapshot; EnsureChildVar preserves existing values.
+		pData.Clear();
 
 		// This will contain all kind of information that could be useful to figure out an issue
 		Bootil::Data::Tree& pInformation = pData.GetChild("information");
@@ -1897,11 +1900,29 @@ static void CreateDebugDump(const CCommand &args)
 		// Dump all holylib convars.
 		{
 			Bootil::Data::Tree& pConVars = pData.GetChild("convars");
-		#if ARCHITECTURE_IS_X86_64
+		#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
+			// ICvar::Iterator from the pinned SDK drives the wrong vtable slots on this
+			// engine (see x64_cvar_iterator.h). Use the ABI verified factory iterator
+			// and never dereference a null entry: build 260709 can report IsValid()
+			// while Get() returns nullptr.
+			SourceSDK::FactoryLoader vstdlib_loader("vstdlib");
+			CX64CVarIterator iter(g_pCVar, vstdlib_loader.GetModule());
+			if (!iter.IsAvailable())
+			{
+				Warning(PROJECT_NAME ": Failed to create the ABI verified ConVar iterator; skipping the convar dump!\n");
+			}
+			else for ( iter.SetFirst() ; iter.IsValid() ; iter.Next() )
+			{
+				ConCommandBase* pCommand = iter.Get();
+				if (!pCommand)
+					continue;
+		#elif ARCHITECTURE_IS_X86_64
 			ICvar::Iterator iter(g_pCVar);
 			for ( iter.SetFirst() ; iter.IsValid() ; iter.Next() )
 			{
 				ConCommandBase* pCommand = iter.Get();
+				if (!pCommand)
+					continue;
 		#else
 			for (const ConCommandBase* pCommand = g_pCVar->GetCommands(); pCommand; pCommand = pCommand->GetNext())
 			{
