@@ -977,9 +977,8 @@ Default__index(CVProfNode);
 Default__newindex(CVProfNode);
 Default__GetTable(CVProfNode);
 Default__gc(CVProfNode,
-	CVProfNode* pNode = (CVProfNode*)pStoredData;
-	if (pNode)
-		delete pNode;
+	// GetRoot/GetCurrentNode and node navigation return engine-owned nodes.
+	// Release only the Lua wrapper; deleting the node corrupts the profile tree.
 )
 
 LUA_FUNCTION_STATIC(VProfNode_GetName)
@@ -1524,6 +1523,9 @@ void CVProfModule::LuaInit(GarrysMod::Lua::ILuaInterface* pLua, bool bServerInit
 	pLua->Pop(1);
 
 	Util::StartTable(pLua);
+		// Callers can avoid traversing borrowed nodes on older unsafe builds.
+		pLua->PushBool(true);
+		pLua->SetField(-2, "NODE_GC_SAFE");
 		Util::AddFunc(pLua, vprof_Start, "Start");
 		Util::AddFunc(pLua, vprof_Stop, "Stop");
 		Util::AddFunc(pLua, vprof_AtRoot, "AtRoot");

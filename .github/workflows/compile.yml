@@ -42,6 +42,8 @@ jobs:
         run: python3 tests/gmod_update_evidence_tests.py
       - name: Check complete CI telemetry responses and reporting failures
         run: python3 tests/ci_telemetry_tests.py -v
+      - name: Check borrowed VProf node ownership under sanitizers
+        run: python3 tests/vprof_node_ownership_tests.py
 
   teleport_guard_tests:
     name: "Teleport recursion guard tests"
