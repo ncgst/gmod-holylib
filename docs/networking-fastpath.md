@@ -53,9 +53,19 @@ the rest of the networking module thread-safe or support native extensions
 rewriting that PVS buffer from inside an entity transmit callback.
 
 HLTV/replay retain their separate path. The existing full-update player additions
-and the final `g_bWasSeenByPlayer` union still run. This patch preserves the
-`fastpath 0` implementation's semantics; it does not establish that every other
-networking optimization is equivalent to the stock engine.
+and the final `g_bWasSeenByPlayer` union still run. This does not establish that
+every other networking optimization is equivalent to the stock engine.
+
+In-eye observer handling is shared by both cache settings. The common recipient
+path explicitly transmits a valid observed player and its viewmodels and hands,
+even if the target was already marked for transmission. Attachment binding
+otherwise excludes these entities from ordinary checks, and the character hook
+only adds them for their owner. This retains the observer additions previously
+performed by the old fastpath cache-hit helper and also repairs their omission
+with `fastpath 0`. The real recipient stays unchanged, so an observer does not
+qualify for owner-only inventory transmission. A prevented target is not forced;
+individual additions respect prevent-transmit bits, and a final mask removes
+prevented entities added recursively before the packing union is updated.
 
 `holylib_networking_fastpath_usecluster` remains registered for configuration
 compatibility but no longer changes matching. Both values require exact PVS
@@ -114,6 +124,13 @@ against a deterministic engine fixture. It compares complete transmit/always
 bitsets, recipient callback counts and the packing union with caching on/off for
 120 recipients, including different PVS data, live portal changes, full updates,
 recipient attachments, range limits, HLTV, parent visibility and area splitting.
+The fixture also compiles the production character transmit hook and attachment
+exclusion block. Its in-eye cases use a distinct target and a spectator with no
+own attachments, and check both recipient orders, already-marked targets,
+multiple viewmodels, owner-only weapon exclusion, recursive prevent-transmit
+filtering, the packing union, and target changes. The observer case fails against
+the initial cache-only revision with the target transmitted but its viewmodels
+and hands absent; comparing cache settings alone does not detect that omission.
 It does not load GMod or verify engine ABI, real weapon behavior or network I/O.
 The CI regression job runs both tests under ASan and UBSan.
 

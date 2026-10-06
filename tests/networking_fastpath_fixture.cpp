@@ -9,6 +9,8 @@
 #include <vector>
 
 constexpr int MAX_PLAYERS = 128, MAX_EDICTS = 1024, MAX_MAP_AREAS = 4;
+constexpr int MAX_VIEWMODELS = 3, MAX_WEAPONS = 4;
+constexpr int OBS_MODE_NONE = 0, OBS_MODE_IN_EYE = 4, OBS_MODE_CHASE = 5;
 constexpr int FL_EDICT_FULLCHECK = 0, FL_EDICT_ALWAYS = 8, FL_EDICT_DONTSEND = 16, FL_EDICT_PVSCHECK = 32;
 #define PROJECT_NAME "fixture"
 #define Warning(...) ((void)0)
@@ -20,9 +22,14 @@ template <std::size_t N> struct CBitVec
 	void ClearAll() { bits.reset(); }
 	void Set(int index) { bits.set(index); }
 	bool Get(int index) const { return bits.test(index); }
+	bool IsBitSet(int index) const { return Get(index); }
 	void CopyTo(CBitVec* out) const { *out = *this; }
 	void Or(const CBitVec& other, CBitVec* out) const { out->bits = bits | other.bits; }
 };
+[[maybe_unused]] static void CBitVec_AndNot(CBitVec<MAX_EDICTS>* a, const CBitVec<MAX_EDICTS>* b)
+{
+	a->bits &= ~b->bits;
+}
 using vec_t = float;
 struct Vector
 {
@@ -81,35 +88,63 @@ struct CBaseEntity
 	CCServerNetworkProperty property;
 	CCollisionProperty collision;
 	CBaseEntity* view = nullptr;
+	CBaseEntity* observerTarget = nullptr;
+	CBaseEntity* hands = nullptr;
+	CBaseEntity* viewmodels[MAX_VIEWMODELS]{};
+	CBaseEntity* weapons[MAX_WEAPONS]{};
+	CBaseEntity* activeWeapon = nullptr;
+	CBaseEntity* transmitDependency = nullptr;
 	bool player = false, evenOnly = false;
+	bool hasEdict = true;
+	int observerMode = OBS_MODE_NONE;
 	int skybox = 3;
 	CBaseEntity() { entry.entity = this; entry.property = &property; property.owner = &entry; }
-	edict_t* edict() { return &entry; }
+	edict_t* edict() { return hasEdict ? &entry : nullptr; }
+	bool IsPlayer() const { return player; }
+	int GetObserverMode() const { return observerMode; }
+	CBaseEntity* GetObserverTarget() const { return observerTarget; }
 	const Vector& EyePosition() const { return collision.position; }
 	int ShouldTransmit(CCheckTransmitInfo* info)
 	{
 		++shouldTransmitCalls;
 		const int recipient = info->m_pClientEnt->m_EdictIndex;
 		if (player)
-			return recipient == entry.m_EdictIndex ? FL_EDICT_ALWAYS : FL_EDICT_DONTSEND;
+			return recipient == entry.m_EdictIndex || info->m_pClientEnt->entity->observerTarget == this
+				? FL_EDICT_ALWAYS : FL_EDICT_DONTSEND;
 		if (evenOnly && recipient % 2 != 0)
 			return FL_EDICT_DONTSEND;
 		return FL_EDICT_PVSCHECK;
 	}
-	void SetTransmit(CCheckTransmitInfo* info, bool always)
+	void SetTransmit(CCheckTransmitInfo* info, bool always);
+	void BaseSetTransmit(CCheckTransmitInfo* info, bool always)
 	{
 		info->m_pTransmitEdict->Set(entry.m_EdictIndex);
 		if (always && info->m_pTransmitAlways)
 			info->m_pTransmitAlways->Set(entry.m_EdictIndex);
-		if (player && info->m_pClientEnt == &entry)
-		{
-			// Recipient-only attachments model viewmodels, hands and inventory.
-			info->m_pTransmitEdict->Set(500 + entry.m_EdictIndex);
-			info->m_pTransmitEdict->Set(700 + entry.m_EdictIndex);
-		}
+		if (transmitDependency)
+			transmitDependency->SetTransmit(info, always);
 	}
 };
 using CBasePlayer = CBaseEntity;
+using CBaseCombatCharacter = CBaseEntity;
+using CBaseViewModel = CBaseEntity;
+static CBaseEntity* GetGMODPlayerHands(const CBaseEntity* player) { return player->hands; }
+static CBaseViewModel* GetViewModel(const CBaseEntity* player, int slot) { return player->viewmodels[slot]; }
+static CBaseEntity* GetMyWeapon(const CBaseEntity* player, int slot) { return player->weapons[slot]; }
+static CBaseEntity* GetActiveWeapon(const CBaseEntity* player) { return player->activeWeapon; }
+static void BaseCharacterTransmit(CBaseCombatCharacter* character, CCheckTransmitInfo* info, bool always)
+{
+	character->BaseSetTransmit(info, always);
+}
+namespace Symbols
+{
+using CBaseCombatCharacter_SetTransmit = void (*)(CBaseCombatCharacter*, CCheckTransmitInfo*, bool);
+}
+struct CharacterDetour
+{
+	template <typename Fn> Fn GetTrampoline() { return &BaseCharacterTransmit; }
+};
+static CharacterDetour detour_CBaseCombatCharacter_SetTransmit;
 struct IServerGameEnts
 {
 	CBaseEntity* EdictToBaseEntity(edict_t* edict) { return edict->entity; }
@@ -139,26 +174,42 @@ static Globals globals;
 static Globals* gpGlobals = &globals;
 static edict_t world;
 static edict_t* world_edict = &world;
-static bool func_CBaseAnimating_SetTransmit = true;
+static Symbols::CBaseCombatCharacter_SetTransmit func_CBaseAnimating_SetTransmit = &BaseCharacterTransmit;
 static CBaseEntity* g_pEntityCache[MAX_EDICTS]{};
 static CBitVec<MAX_EDICTS> g_pShouldPrevent[MAX_PLAYERS], g_pDontTransmitCache;
 struct ConVar
 {
-	bool value = false;
-	bool GetBool() const { return value; }
+	int value = 0;
+	bool GetBool() const { return value != 0; }
+	int GetInt() const { return value; }
 };
 static ConVar networking_fastpath, networking_fasttransmit{true}, networking_areasplit;
 static ConVar networking_transmit_onfullupdate{true}, networking_transmit_onfullupdate_networktoothers{true};
+static ConVar networking_fastcharactertransmit{true};
+static ConVar networking_bind_gmodhands_to_player{true}, networking_bind_viewmodels_to_player{true};
+static ConVar networking_transmit_all_weapons{true}, networking_transmit_all_weapons_to_owner{true};
+static ConVar networking_transmit_one_per_tick, networking_transmit_newweapons{true};
 static ConVar forceTransmit;
 static ConVar* sv_force_transmit_ents = &forceTransmit;
-struct PlayerCache
+struct PlayerTransmitCache
 {
+	struct WeaponSlot { bool bIsNew = false, bAlwaysNetwork = false; };
+	WeaponSlot pWeapons[MAX_WEAPONS];
+	int nNextWeaponSlot = 0;
 	bool full = false;
 	int nLastAcknowledgedTick = 0;
 	void NextTick(CBaseEntity*, int) {}
 	bool InFullUpdate(int = 0) const { return full; }
 };
-static PlayerCache g_pPlayerTransmitCache[MAX_PLAYERS];
+static PlayerTransmitCache g_pPlayerTransmitCache[MAX_PLAYERS];
+// PRODUCTION_CHARACTER_TRANSMIT
+void CBaseEntity::SetTransmit(CCheckTransmitInfo* info, bool always)
+{
+	if (player)
+		hook_CBaseCombatCharacter_SetTransmit(this, info, always);
+	else
+		BaseSetTransmit(info, always);
+}
 struct EntityTransmitCache
 {
 	struct AreaCache { int nCount = 0; CBaseEntity* pEntities[64]{}; };
@@ -167,7 +218,11 @@ struct EntityTransmitCache
 	CBaseEntity* pFullEntityList[256]{};
 	CBaseEntity* pPVSEntityList[64]{};
 	AreaCache nAreaEntities[MAX_MAP_AREAS - 1];
-	void UpdateEntities(const unsigned short*, int) {}
+	void UpdateEntities(const unsigned short*, int)
+	{
+		pNeverTransmitBits.ClearAll();
+		// PRODUCTION_ATTACHMENT_EXCLUSION
+	}
 };
 static EntityTransmitCache g_nEntityTransmitCache;
 // PRODUCTION_GLOBAL_CACHE
@@ -247,6 +302,168 @@ static Result Run(bool fast, int tick, bool areaSplit)
 	return result;
 }
 
+static void ResetObserverWorld(bool fast)
+{
+	for (int i = 0; i < MAX_EDICTS; ++i)
+	{
+		entities[i] = CBaseEntity{};
+		entities[i].entry.m_EdictIndex = i;
+		entities[i].entry.entity = &entities[i];
+		entities[i].entry.property = &entities[i].property;
+		entities[i].property.owner = &entities[i].entry;
+		g_pEntityCache[i] = nullptr;
+	}
+	for (int i = 0; i < MAX_PLAYERS; ++i)
+	{
+		g_pPlayerTransmitCache[i] = {};
+		g_pShouldPrevent[i].ClearAll();
+	}
+	g_nEntityTransmitCache = {};
+	g_pTransmitPVSCache.Reset();
+	g_pGlobalTransmitTickCache.g_iLastCheckTransmit = -1;
+	globals.maxClients = 3;
+	++globals.tickcount;
+	portalOpen = true;
+	forceTransmit.value = false;
+	networking_fastpath.value = fast;
+	networking_areasplit.value = false;
+	networking_fastcharactertransmit.value = true;
+	networking_bind_gmodhands_to_player.value = true;
+	networking_bind_viewmodels_to_player.value = true;
+	networking_transmit_all_weapons.value = false;
+	networking_transmit_all_weapons_to_owner.value = true;
+	networking_transmit_one_per_tick.value = 2; // Owner-only rotation must stay owner-only.
+	networking_transmit_newweapons.value = true;
+	networking_transmit_onfullupdate.value = true;
+	networking_transmit_onfullupdate_networktoothers.value = false;
+	for (int i = 1; i <= 3; ++i)
+	{
+		entities[i].player = true;
+		g_pEntityCache[i] = &entities[i];
+		g_nEntityTransmitCache.pFullEntityList[++g_nEntityTransmitCache.nFullEdictCount] = &entities[i];
+	}
+	for (int owner : {1, 3})
+	{
+		for (int slot = 0; slot < MAX_VIEWMODELS; ++slot)
+			entities[owner].viewmodels[slot] = &entities[500 + owner * 10 + slot];
+		entities[owner].hands = &entities[600 + owner];
+		entities[owner].weapons[0] = &entities[700 + owner * 10];
+		entities[owner].weapons[1] = &entities[701 + owner * 10];
+		entities[owner].activeWeapon = entities[owner].weapons[0];
+		g_pPlayerTransmitCache[owner - 1].full = true;
+		g_pPlayerTransmitCache[owner - 1].pWeapons[1].bIsNew = true;
+		g_pPlayerTransmitCache[owner - 1].nNextWeaponSlot = 1;
+	}
+	entities[2].observerMode = OBS_MODE_IN_EYE;
+	entities[2].observerTarget = &entities[1];
+	// The spectator deliberately has no hands, viewmodels or weapons. None of
+	// its own attachments can indirectly transmit the observed attachments.
+	// The production exclusion block must keep these otherwise-visible entities
+	// out of the ordinary PVS loop.
+	for (int i : {510, 511, 512, 601, 710, 711, 530, 531, 532, 603, 730, 731, 300})
+		g_nEntityTransmitCache.pPVSEntityList[++g_nEntityTransmitCache.nPVSEdictCount] = &entities[i];
+}
+
+static CBitVec<MAX_EDICTS> ObserverTransmit(int recipient, bool preMarked = false, bool hltv = false)
+{
+	CBitVec<MAX_EDICTS> transmit, always;
+	if (preMarked)
+		transmit.Set(1);
+	CCheckTransmitInfo info;
+	info.m_pClientEnt = &entities[recipient].entry;
+	info.m_pTransmitEdict = &transmit;
+	info.m_pTransmitAlways = hltv ? &always : nullptr;
+	for (auto& byte : info.m_PVS)
+		byte = 0xFF;
+	g_nTransmitRange = -1.0f;
+	assert(New_CServerGameEnts_CheckTransmit(Util::servergameents, &info, nullptr, 0));
+	assert((transmit.bits & ~g_pGlobalTransmitTickCache.g_bWasSeenByPlayer.bits).none());
+	return transmit;
+}
+
+static bool CheckObserverAttachments()
+{
+	for (bool fast : {true, false})
+	{
+		for (bool sourceFirst : {true, false})
+		{
+			for (bool preMarked : {false, true})
+			{
+				ResetObserverWorld(fast);
+				if (sourceFirst)
+				{
+					const auto owner = ObserverTransmit(1);
+					assert(owner.Get(510) && owner.Get(601) && owner.Get(711));
+				}
+				const auto spectator = ObserverTransmit(2, preMarked);
+				assert(g_nEntityTransmitCache.pNeverTransmitBits.Get(510));
+				assert(g_nEntityTransmitCache.pNeverTransmitBits.Get(601));
+				assert(g_nEntityTransmitCache.pNeverTransmitBits.Get(711));
+				if (!spectator.Get(1) || !spectator.Get(510) || !spectator.Get(511) ||
+					!spectator.Get(512) || !spectator.Get(601))
+				{
+					std::cerr << "In-eye regression: target=" << spectator.Get(1)
+						<< " viewmodel=" << spectator.Get(510) << " hands=" << spectator.Get(601)
+						<< " fastpath=" << fast << " sourceFirst=" << sourceFirst << '\n';
+					return false;
+				}
+				assert(!spectator.Get(711)); // No owner-only inactive/new/full-update weapon.
+				assert(!spectator.Get(530) && !spectator.Get(603)); // No other player's attachments.
+			}
+		}
+
+		// Explicitly prevented attachments must stay absent, even when another
+		// attachment's SetTransmit recursively adds their bits.
+		for (int blocked : {510, 601, 1})
+		{
+			ResetObserverWorld(fast);
+			g_pShouldPrevent[1].Set(blocked);
+			if (blocked == 510)
+				entities[601].transmitDependency = &entities[510];
+			if (blocked == 601)
+				entities[510].transmitDependency = &entities[601];
+			if (blocked == 1)
+				g_pPlayerTransmitCache[1].full = true; // Full-update bits also obey the final mask.
+			const auto spectator = ObserverTransmit(2);
+			assert(!spectator.Get(blocked));
+			assert(!g_pGlobalTransmitTickCache.g_bWasSeenByPlayer.Get(blocked));
+			assert(!spectator.Get(711));
+			if (blocked == 1)
+				assert(!spectator.Get(510) && !spectator.Get(601));
+			else
+				assert(spectator.Get(blocked == 510 ? 601 : 510));
+		}
+
+		// Chase/free observers, absent or non-player targets, and HLTV do not
+		// receive the in-eye-only additions.
+		for (int scenario = 0; scenario < 6; ++scenario)
+		{
+			ResetObserverWorld(fast);
+			if (scenario == 0) entities[2].observerMode = OBS_MODE_CHASE;
+			if (scenario == 1) entities[2].observerMode = OBS_MODE_NONE;
+			if (scenario == 2) entities[2].observerTarget = nullptr;
+			if (scenario == 3) entities[2].observerTarget = &entities[400];
+			if (scenario == 4) entities[1].hasEdict = false;
+			const auto spectator = ObserverTransmit(2, false, scenario == 5);
+			assert(!spectator.Get(510) && !spectator.Get(601) && !spectator.Get(711));
+		}
+
+		ResetObserverWorld(fast);
+		const auto first = ObserverTransmit(2);
+		assert(first.Get(510) && first.Get(601));
+		entities[2].observerTarget = &entities[3];
+		const auto switched = ObserverTransmit(2);
+		assert(switched.Get(3) && switched.Get(530) && switched.Get(603));
+		assert(!switched.Get(510) && !switched.Get(601) && !switched.Get(731));
+		entities[2].observerTarget = nullptr;
+		const auto cleared = ObserverTransmit(2);
+		assert(!cleared.Get(510) && !cleared.Get(530) && !cleared.Get(601) && !cleared.Get(603));
+	}
+	std::cout << "In-eye observer: production character hook and attachment exclusion, both cache settings, "
+		"source orders, premarked targets, inventory privacy, prevent masks and target changes passed\n";
+	return true;
+}
+
 int main()
 {
 	for (int i = 0; i < MAX_EDICTS; ++i)
@@ -254,6 +471,9 @@ int main()
 	for (int i = 1; i <= 120; ++i)
 	{
 		entities[i].player = true;
+		entities[i].viewmodels[0] = &entities[500 + i];
+		entities[i].weapons[0] = &entities[700 + i];
+		entities[i].activeWeapon = entities[i].weapons[0];
 		g_pEntityCache[i] = &entities[i];
 		g_nEntityTransmitCache.pFullEntityList[++g_nEntityTransmitCache.nFullEdictCount] = &entities[i];
 	}
@@ -312,4 +532,6 @@ int main()
 
 	globals.maxClients = MAX_PLAYERS + 1;
 	assert(!New_CServerGameEnts_CheckTransmit(Util::servergameents, &info, nullptr, 0));
+	if (!CheckObserverAttachments())
+		return 1;
 }

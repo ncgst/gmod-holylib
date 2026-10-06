@@ -15,9 +15,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--msvc", action="store_true")
     parser.add_argument("--sanitize", action="store_true")
+    parser.add_argument("--source", type=Path, help="Networking source override for regression controls")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
-    net = (root / "source/modules/networking.cpp").read_text(encoding="utf-8")
+    net = (args.source or root / "source/modules/networking.cpp").read_text(encoding="utf-8")
     prop = (root / "source/sourcesdk/ccservernetworkproperty.h").read_text(encoding="utf-8")
     fixture = (root / "tests/networking_fastpath_fixture.cpp").read_text(encoding="utf-8")
     bodies = {
@@ -25,6 +26,8 @@ def main():
         "IS_IN_PVS": between(net, "static inline bool IsInPVS(", "\nstatic vec_t g_nTransmitRange"),
         "DO_TRANSMIT": between(net, "static inline void DoTransmitPVSCheck(", "\nstatic ConVar networking_fastpath("),
         "CHECK_TRANSMIT": between(net, "bool New_CServerGameEnts_CheckTransmit(", "\nvoid SV_FillHLTVData("),
+        "CHARACTER_TRANSMIT": between(net, "static void hook_CBaseCombatCharacter_SetTransmit(", "\nstatic inline bool IsInPVS("),
+        "ATTACHMENT_EXCLUSION": between(net, "\t\t// First we build data based off all players", "\n\t\tfor (int i=0; i < nEdicts; ++i)"),
         "PVS": prop[prop.index("template <typename HeadnodeQuery>\ninline bool CCServerNetworkProperty::IsInPVS("):],
     }
     for name, body in bodies.items():

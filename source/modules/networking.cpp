@@ -1488,6 +1488,42 @@ static inline void DoTransmitPVSCheck(
 	}
 }
 
+static void TransmitInEyeObserver(CBasePlayer* pRecipientPlayer, CCheckTransmitInfo* pInfo, int clientIndex)
+{
+	if (pInfo->m_pTransmitAlways || pRecipientPlayer->GetObserverMode() != OBS_MODE_IN_EYE)
+		return;
+
+	CBaseEntity* pObserverTarget = pRecipientPlayer->GetObserverTarget();
+	if (!pObserverTarget || pObserverTarget == pRecipientPlayer || !pObserverTarget->IsPlayer())
+		return;
+
+	const CBitVec<MAX_EDICTS>& preventTransmit = g_pShouldPrevent[clientIndex];
+	const auto TransmitIfAllowed = [pInfo, &preventTransmit](CBaseEntity* pEntity) {
+		edict_t* pEdict = pEntity ? pEntity->edict() : nullptr;
+		if (!pEdict || pEdict->m_EdictIndex <= 0 || pEdict->m_EdictIndex >= MAX_EDICTS ||
+			preventTransmit.Get(pEdict->m_EdictIndex))
+			return false;
+
+		pEntity->SetTransmit(pInfo, true);
+		return true;
+	};
+
+	if (TransmitIfAllowed(pObserverTarget))
+	{
+		// Bound attachments are excluded from ordinary entity checks. The target
+		// may already be marked, so its SetTransmit hook alone cannot add them.
+		// Keep the real recipient: spectators must not gain owner-only inventory.
+		CBasePlayer* pObserverPlayer = static_cast<CBasePlayer*>(pObserverTarget);
+		for (int i = 0; i < MAX_VIEWMODELS; ++i)
+			TransmitIfAllowed(GetViewModel(pObserverPlayer, i));
+		TransmitIfAllowed(GetGMODPlayerHands(pObserverPlayer));
+	}
+
+	// SetTransmit can recursively add a prevented attachment or parent. Filter
+	// after all recipient additions and full updates, before the packing union.
+	CBitVec_AndNot(pInfo->m_pTransmitEdict, &preventTransmit);
+}
+
 static ConVar networking_fastpath("holylib_networking_fastpath", "0", 0, "Experimental - Reuse BSP headnode visibility queries for identical PVS data within a tick; all recipient transmit decisions still run");
 static ConVar networking_fastpath_usecluster("holylib_networking_fastpath_usecluster", "1", 0, "Deprecated compatibility setting; fastpath always matches exact PVS data, never just an area or cluster");
 static void NetworkingFastPathStats(const CCommand&)
@@ -1681,6 +1717,7 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 		}
 	}
 
+	TransmitInEyeObserver(pRecipientPlayer, pInfo, clientIndex);
 	pInfo->m_pTransmitEdict->Or(g_pGlobalTransmitTickCache.g_bWasSeenByPlayer, &g_pGlobalTransmitTickCache.g_bWasSeenByPlayer);
 
 	return true;
