@@ -23,6 +23,7 @@
 #include "sourcesdk/GameEventManager.h"
 #include "sourcesdk/ccservernetworkproperty.h"
 #include "sourcesdk/datatablestack.h"
+#include "networking_pvs_cache.h"
 
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
@@ -425,18 +426,6 @@ static inline int GetSkybox3DArea(const void* pPlayer) // Fully safe access :3
 	return *(int*)pSkybox3DArea;
 }
 
-static inline CBaseEntity* IndexToEntity(const int nEntIndex)
-{
-	// Should never happen anyways (This is very very expensive apparently?)
-	if (nEntIndex < 0 || nEntIndex >= MAX_EDICTS)
-		return nullptr;
-
-	if (!g_pEntityList)
-		return Util::GetCBaseEntityFromIndex(nEntIndex); // The cache can outlive the entity, see EHandleToEntity.
-
-	return g_pEntityCache[nEntIndex];
-}
-
 static inline CBaseEntity* EHandleToEntity(const CBaseHandle* pHandle)
 {
 	if (!g_pEntityList)
@@ -544,6 +533,20 @@ static inline CBaseViewModel* GetViewModel(const void* pPlayer, const int nViewM
 	return (CBaseViewModel*)EHandleToEntity((CBasePlayer::CBaseViewModelHandle*)m_hViewModel_Offset.GetPointerArray(pPlayer, nViewModelSlot));
 }
 
+// Don't use CBasePlayer::GetObserverMode()/GetObserverTarget(), they are virtual and GMod's vtable differs from the SDK.
+// On current x86-64 branch builds the SDK's slots hold SetObserverMode(int) and ObserverUse(bool) instead.
+static DTVarByOffset m_iObserverMode_Offset("DT_BasePlayer", "m_iObserverMode");
+static inline int GetObserverMode(const void* pPlayer)
+{
+	return *(const int*)m_iObserverMode_Offset.GetPointer(pPlayer);
+}
+
+static DTVarByOffset m_hObserverTarget_Offset("DT_BasePlayer", "m_hObserverTarget");
+static inline CBaseEntity* GetObserverTarget(const void* pPlayer)
+{
+	return EHandleToEntity((CBaseHandle*)m_hObserverTarget_Offset.GetPointer(pPlayer));
+}
+
 // DT_LocalPlayerExclusive is based off CBasePlayer! So we don't need to get it first as offsets are all for CBasePlayer
 static DTVarByOffset m_hViewEntity_Offset("DT_LocalPlayerExclusive", "m_hViewEntity");
 static inline CBaseEntity* GetViewEntity(void* pPlayer)
@@ -588,6 +591,7 @@ struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, t
 		memset(pEntityTransmitStates, 0, sizeof(pEntityTransmitStates));
 #endif
 		Plat_FastMemset(&pAlwaysTransmitBits, 0, sizeof(pAlwaysTransmitBits) * 4); // Again, very "safe"
+		nAlwaysTransmitPlayerCount = 0;
 		//pAlwaysTransmitBits.ClearAll();
 		//pNeverTransmitBits.ClearAll();
 		//pPVSTransmitBits.ClearAll();
@@ -670,22 +674,7 @@ struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, t
 
 			if (nFlags & FL_EDICT_ALWAYS)
 			{
-				while (pEdict) // Stop if we got no edict / for example have no further parent
-				{
-					pAlwaysTransmitBits.Set(iEdict);
-
-					CCServerNetworkProperty *pEnt = static_cast<CCServerNetworkProperty*>(pEdict->GetNetworkable());
-					if (!pEnt)
-						break;
-
-					CCServerNetworkProperty *pParent = GetNetworkParentSafe(pEnt);
-					if (!pParent)
-						break;
-
-					pEdict = pParent->edict();
-					if (pEdict)
-						iEdict = pEdict->m_EdictIndex; // Source engine normally uses pParent->entindex() which needs no null check due to it using ENTINDEX internally
-				}
+				MarkAlwaysTransmit(pEdict, iEdict);
 				continue;
 			}
 
@@ -741,6 +730,10 @@ struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, t
 				if (pAlwaysTransmitBits.IsBitSet(i))
 					Msg("    %i\n", i);
 			}
+
+			Msg("Always (players, transmitted through SetTransmit):\n");
+			for (int i=0; i<nAlwaysTransmitPlayerCount; ++i)
+				Msg("    %i\n", pAlwaysTransmitPlayers[i]);
 
 			if (networking_areasplit.GetBool())
 			{
@@ -803,6 +796,48 @@ struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, t
 		}
 	}
 
+	// Marks an FL_EDICT_ALWAYS entity and the move parents that SetTransmit would force along with it.
+	// Players are not marked: a set bit makes CheckTransmit skip their SetTransmit hook, which is the only place
+	// that sends their bound attachments and weapons, so the owner would lose its viewmodels.
+	// CheckTransmit calls SetTransmit on them for every recipient instead, which also forces the rest of the chain.
+	inline void MarkAlwaysTransmit(edict_t* pEdict, int iEdict)
+	{
+		while (pEdict) // Stop if we got no edict / for example have no further parent
+		{
+			if (iEdict >= 1 && iEdict <= gpGlobals->maxClients)
+			{
+				AddAlwaysTransmitPlayer(iEdict);
+				return;
+			}
+
+			pAlwaysTransmitBits.Set(iEdict);
+
+			CCServerNetworkProperty *pEnt = static_cast<CCServerNetworkProperty*>(pEdict->GetNetworkable());
+			if (!pEnt)
+				break;
+
+			CCServerNetworkProperty *pParent = GetNetworkParentSafe(pEnt);
+			if (!pParent)
+				break;
+
+			pEdict = pParent->edict();
+			if (pEdict)
+				iEdict = pEdict->m_EdictIndex; // Source engine normally uses pParent->entindex() which needs no null check due to it using ENTINDEX internally
+		}
+	}
+
+	inline void AddAlwaysTransmitPlayer(int iEdict)
+	{
+		for (int i=0; i<nAlwaysTransmitPlayerCount; ++i)
+		{
+			if (pAlwaysTransmitPlayers[i] == iEdict)
+				return;
+		}
+
+		if (nAlwaysTransmitPlayerCount < MAX_PLAYERS)
+			pAlwaysTransmitPlayers[nAlwaysTransmitPlayerCount++] = iEdict;
+	}
+
 	void EntityRemoved(CBaseEntity* pEntity, edict_t* pEdict)
 	{
 		// Not networking? Then we can easily skip all this since everything is cleared on the next transmit anyways
@@ -860,7 +895,7 @@ struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, t
 				if (i < (pArea.nCount - 1))
 					memmove(&pArea.pEntities[i], &pArea.pEntities[i + 1], (pArea.nCount - i - 1) * sizeof(CBaseEntity*));
 
-				pArea.pEntities[pArea.nCount--] = nullptr;
+				pArea.pEntities[--pArea.nCount] = nullptr; // nCount is a count here, unlike the preincremented lists above
 				break;
 			}
 		}
@@ -970,6 +1005,10 @@ struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, t
 	CBitVec<MAX_EDICTS> pNeverTransmitBits;
 	CBitVec<MAX_EDICTS> pPVSTransmitBits;
 	CBitVec<MAX_EDICTS> pFullTransmitBits;
+
+	// Edict indices of players that are the move parent of an always transmitted entity, see MarkAlwaysTransmit.
+	int nAlwaysTransmitPlayerCount = 0;
+	int pAlwaysTransmitPlayers[MAX_PLAYERS] = {0};
 
 	// int nEntityCluster[MAX_EDICTS] = {0};
 	// CBitVec<MAX_EDICTS> bDirtyEntities = {false}; // Their Cluster changed compared to last tick.
@@ -1144,21 +1183,35 @@ public:
 };
 static NetworkingGameEventListener g_pNetworkGameEventListener;
 
-// Per tick cache
-// Reset every tick using memset to 0!
-struct PlayerTransmitTickCache
-{
-	int nAreaNum = 0;
+// Bounded storage shared only by recipients with byte-identical PVS data. Reset on map activation.
+using TransmitPVSCache = Networking::PVSCache<sizeof(CCheckTransmitInfo::m_PVS), MAX_PLAYERS>;
+static TransmitPVSCache g_pTransmitPVSCache;
 
-	// All Entities sent to this player from the transmit check
-	// 
-	// NOTE:
-	// We remove all Entities networked inside the client's transmit check (see pClientCache usage)
-	// so the client and anything networked inside CGMOD_Player::SetTransmit is removed from this cache
-	// this is to prevent issues like this:
-	// All weapons of all players being networked instead of just the active weapon
-	// as it would include per-client specific transmits
-	CBitVec<MAX_EDICTS> pClientBitVec;
+struct TransmitPVSQuery
+{
+	explicit TransmitPVSQuery(bool bEnabled) : bPending(bEnabled) {}
+
+	bool CheckHeadnode(const CCheckTransmitInfo* pInfo, int headnode)
+	{
+		// Most small entities use direct cluster bit tests. Do not hash/copy a
+		// recipient's PVS unless an expensive headnode query actually needs it.
+		if (bPending)
+		{
+			pContext = g_pTransmitPVSCache.FindContext(pInfo->m_PVS, pInfo->m_nPVSSize);
+			bPending = false;
+		}
+
+		// Answer misses from the context's own copy, so a stored answer always belongs to the PVS it is stored under,
+		// even if something changes the recipient's PVS buffer during the transmit.
+		const unsigned char* pPVS = pContext ? pContext->pvs.data() : pInfo->m_PVS;
+		const int nPVSSize = pContext ? pContext->size : pInfo->m_nPVSSize;
+		return g_pTransmitPVSCache.CheckHeadnode(pContext, headnode, [pPVS, nPVSSize, headnode]() {
+			return engine->CheckHeadnodeVisible(headnode, pPVS, nPVSSize) != 0;
+		});
+	}
+
+	bool bPending; // The context is still to be looked up.
+	TransmitPVSCache::Context* pContext = nullptr;
 };
 
 struct GlobalTransmitTickCache
@@ -1183,7 +1236,6 @@ struct GlobalTransmitTickCache
 	// bool g_bFilledDontTransmitWeaponCache[MAX_PLAYERS] = {0};
 };
 static GlobalTransmitTickCache g_pGlobalTransmitTickCache;
-static PlayerTransmitTickCache g_pPlayerTransmitTickCache[MAX_PLAYERS] = {};
 
 #if 0 // Would be needed for pvs.AddEntitiesToTransmit / this would need to be called after the HolyLib:PostCheckTransmit hook if we'd were to allow entity additions in there
 void Networking_DoPostTransmitCheck(CCheckTransmitInfo* pInfo)
@@ -1335,67 +1387,12 @@ static void hook_CBaseCombatCharacter_SetTransmit(CBaseCombatCharacter* pCharact
 	}
 }
 
-// Fast path method of networking a player by using the cached results of another one
-static void TransmitFastPathPlayer(CBasePlayer* pRecipientPlayer, int clientIndex, CCheckTransmitInfo *pInfo, int iOtherClient, const PlayerTransmitTickCache& nOtherCache)
+static inline bool IsInPVS(CCServerNetworkProperty* netProp, const CCheckTransmitInfo* pInfo,
+	TransmitPVSQuery& pPVSQuery)
 {
-	nOtherCache.pClientBitVec.CopyTo(pInfo->m_pTransmitEdict);
-	if (pInfo->m_pTransmitAlways)
-		nOtherCache.pClientBitVec.CopyTo(pInfo->m_pTransmitAlways);
-
-	// g_pPlayerTransmitCacheBitVec won't contain any information about the client the cache was build upon, so we need to call SetTransmit ourselves.
-	// RaphaelIT7 called this safe "even if it doesn't look safe"; it isn't - the slot is empty whenever that
-	// client has no entity this tick, which is every tick on 64x before the cache rebuild landed.
-	CBaseEntity* pOtherPlayer = IndexToEntity(iOtherClient + 1);
-	if (pOtherPlayer)
-		pOtherPlayer->SetTransmit(pInfo, true);
-	pRecipientPlayer->SetTransmit(pInfo, true);
-	// ENGINE BUG: CBaseCombatCharacter::SetTransmit doesn't network the player's viewmodel! So we need to do it ourself.
-	// This was probably done since CBaseViewModel::ShouldTransmit determines if it would be sent or not.
-	// We can remove this once we have: https://github.com/Facepunch/garrysmod-requests/issues/2839
-	for (int iViewModel=0; iViewModel<MAX_VIEWMODELS; ++iViewModel)
-	{
-		CBaseViewModel* pViewModel = GetViewModel(pRecipientPlayer, iViewModel);
-		if (pViewModel)
-			pViewModel->SetTransmit(pInfo, true);
-	}
-
-	CBaseEntity* pHandsEntity = GetGMODPlayerHands(pRecipientPlayer);
-	if (pHandsEntity)
-		pHandsEntity->SetTransmit(pInfo, true);
-
-	// Extra stuff to hopefully not break the observer mode
-	if (pRecipientPlayer->GetObserverMode() == OBS_MODE_IN_EYE)
-	{
-		CBaseEntity* pObserverEntity = pRecipientPlayer->GetObserverTarget();
-		if (pObserverEntity)
-		{
-			pObserverEntity->SetTransmit(pInfo, true);
-			if (pObserverEntity->IsPlayer())
-			{
-				// Time to network these shit again
-				CBasePlayer* pObserverPlayer = (CBasePlayer*)pObserverEntity;
-				for (int iViewModel=0; iViewModel<MAX_VIEWMODELS; ++iViewModel)
-				{
-					CBaseViewModel* pViewModel = GetViewModel(pObserverPlayer, iViewModel);
-					if (pViewModel)
-						pViewModel->SetTransmit(pInfo, true);
-				}
-
-				pHandsEntity = GetGMODPlayerHands(pObserverPlayer);
-				if (pHandsEntity)
-					pHandsEntity->SetTransmit(pInfo, true);
-			}
-		}
-	}
-
-	// Fast way to set all prevent transmit things.
-	CBitVec_AndNot(pInfo->m_pTransmitEdict, &g_pShouldPrevent[clientIndex]);
-	if (pInfo->m_pTransmitAlways)
-		CBitVec_AndNot(pInfo->m_pTransmitAlways, &g_pShouldPrevent[clientIndex]);
-
-	// Since we optimized PackEntities_Normal using g_bWasSeenByPlayer, we need to now also perform this Or here.
-	// If we don't do this, Entities like the CBaseViewModel won't be packed by PackEntities_Normal causing a crash later deep inside SV_WriteEnterPVS
-	pInfo->m_pTransmitEdict->Or(g_pGlobalTransmitTickCache.g_bWasSeenByPlayer, &g_pGlobalTransmitTickCache.g_bWasSeenByPlayer);
+	return netProp->IsInPVS(pInfo, [pInfo, &pPVSQuery](int headnode) {
+		return pPVSQuery.CheckHeadnode(pInfo, headnode);
+	});
 }
 
 static vec_t g_nTransmitRange = -1.0f;
@@ -1408,7 +1405,8 @@ void Networking_SetNextTransmitRange(vec_t nRange)
 // Very expensive!
 static inline void DoTransmitPVSCheck(
 	edict_t* pEdict, CBaseEntity* pEnt, const bool bIsHLTV, CCheckTransmitInfo *pInfo,
-	const bool bForceTransmit, const int skyBoxArea, const Vector& clientPosition, const vec_t maxTransmitRange
+	const bool bForceTransmit, const int skyBoxArea, const Vector& clientPosition, const vec_t maxTransmitRange,
+	TransmitPVSQuery& pPVSQuery
 )
 {
 	CCServerNetworkProperty *netProp = static_cast<CCServerNetworkProperty*>( pEdict->GetNetworkable() );
@@ -1447,7 +1445,7 @@ static inline void DoTransmitPVSCheck(
 		}
 	}
 
-	const bool bInPVS = netProp->IsInPVS( pInfo );
+	const bool bInPVS = IsInPVS(netProp, pInfo, pPVSQuery);
 	if ( bInPVS || bForceTransmit )
 	{
 		// only send if entity is in PVS
@@ -1519,7 +1517,7 @@ static inline void DoTransmitPVSCheck(
 		{
 			// Check pvs
 			check->RecomputePVSInformation();
-			const bool bMoveParentInPVS = check->IsInPVS( pInfo );
+			const bool bMoveParentInPVS = IsInPVS(check, pInfo, pPVSQuery);
 			if ( bMoveParentInPVS )
 			{
 				pEnt->SetTransmit( pInfo, true );
@@ -1532,14 +1530,80 @@ static inline void DoTransmitPVSCheck(
 	}
 }
 
-static ConVar networking_fastpath("holylib_networking_fastpath", "0", 0, "Experimental - If two players are in the same area, then it will reuse the transmit state of the first calculated player saving a lot of time");
-static ConVar networking_fastpath_usecluster("holylib_networking_fastpath_usecluster", "1", 0, "Experimental - When using the fastpatth, it will compate against clients in the same cluster instead of area");
+// The engine's CBaseViewModel::ShouldTransmit sends a player's viewmodels to the owner, to spectators watching
+// that player in first person and to HLTV. Binding moves viewmodels and hands out of the ordinary entity checks
+// and hook_CBaseCombatCharacter_SetTransmit only adds them for their owner, so this adds the other two viewers.
+static void TransmitBoundAttachmentsToViewers(CBasePlayer* pRecipientPlayer, CCheckTransmitInfo* pInfo, int clientIndex)
+{
+	const bool bBindViewModels = networking_bind_viewmodels_to_player.GetBool();
+	const bool bBindHands = networking_bind_gmodhands_to_player.GetBool();
+	if (!networking_fastcharactertransmit.GetBool() || (!bBindViewModels && !bBindHands))
+		return; // Nothing is bound, everything went through the ordinary checks.
+
+	const CBitVec<MAX_EDICTS>& preventTransmit = g_pShouldPrevent[clientIndex];
+	const auto TransmitAttachment = [pInfo, &preventTransmit](CBaseEntity* pEntity) {
+		edict_t* pEdict = pEntity ? pEntity->edict() : nullptr;
+		if (!pEdict || pEdict->m_EdictIndex <= 0 || pEdict->m_EdictIndex >= MAX_EDICTS ||
+			(pEdict->m_fStateFlags & FL_EDICT_DONTSEND) || preventTransmit.Get(pEdict->m_EdictIndex))
+			return;
+
+		// Like in the engine, this also sends the move parent, so the owner comes along with its viewmodel.
+		pEntity->SetTransmit(pInfo, true);
+	};
+	const auto TransmitAttachmentsOf = [&](CBaseEntity* pOwner) {
+		if (bBindViewModels)
+		{
+			for (int i = 0; i < MAX_VIEWMODELS; ++i)
+				TransmitAttachment(GetViewModel(pOwner, i));
+		}
+
+		if (bBindHands)
+			TransmitAttachment(GetGMODPlayerHands(pOwner));
+	};
+
+	if (pInfo->m_pTransmitAlways) // HLTV gets them like everything else, it doesn't cull by PVS.
+	{
+		for (int iPlayerIndex = 1; iPlayerIndex <= gpGlobals->maxClients; ++iPlayerIndex)
+		{
+			if (g_pEntityCache[iPlayerIndex])
+				TransmitAttachmentsOf(g_pEntityCache[iPlayerIndex]);
+		}
+		return;
+	}
+
+	if (GetObserverMode(pRecipientPlayer) != OBS_MODE_IN_EYE)
+		return;
+
+	CBaseEntity* pTarget = GetObserverTarget(pRecipientPlayer);
+	edict_t* pTargetEdict = pTarget ? pTarget->edict() : nullptr;
+	if (!pTargetEdict || pTarget == pRecipientPlayer || !pTarget->IsPlayer())
+		return;
+
+	// A target hidden from this spectator must not come back as the move parent of its attachments.
+	if (preventTransmit.Get(pTargetEdict->m_EdictIndex))
+		return;
+
+	TransmitAttachmentsOf(pTarget);
+}
+
+static ConVar networking_fastpath("holylib_networking_fastpath", "0", 0, "Experimental - Cache BSP headnode visibility results per exact PVS until the map changes; all recipient transmit decisions still run");
+static ConVar networking_fastpath_usecluster("holylib_networking_fastpath_usecluster", "1", 0, "Deprecated compatibility setting; fastpath always matches exact PVS data, never just an area or cluster");
+static void NetworkingFastPathStats(const CCommand&)
+{
+	const auto& stats = g_pTransmitPVSCache.GetStats();
+	Msg("HolyLib networking fastpath: contexts hit=%llu miss=%llu evicted=%llu bypass=%llu; headnodes hit=%llu miss=%llu\n",
+		static_cast<unsigned long long>(stats.contextHits), static_cast<unsigned long long>(stats.contextMisses),
+		static_cast<unsigned long long>(stats.contextEvictions), static_cast<unsigned long long>(stats.contextBypasses),
+		static_cast<unsigned long long>(stats.nodeHits), static_cast<unsigned long long>(stats.nodeMisses));
+}
+static ConCommand networking_fastpath_stats("holylib_networking_fastpath_stats", NetworkingFastPathStats,
+	"Show fastpath cache counters since module initialization or map activation", 0);
 bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmitInfo *pInfo, const unsigned short *pEdictIndices, int nEdicts)
 {
 	vec_t maxTransmitRange = g_nTransmitRange;
 	g_nTransmitRange = -1.0f;
 
-	if (!networking_fasttransmit.GetBool() || !gpGlobals || !engine || !func_CBaseAnimating_SetTransmit || !world_edict)
+	if (!networking_fasttransmit.GetBool() || !gpGlobals || !engine || !func_CBaseAnimating_SetTransmit || !world_edict || gpGlobals->maxClients > MAX_PLAYERS)
 		return false; // Fail-safe: the engine's own CheckTransmit runs instead. (mdlcache is deliberately not
 		              //            required anymore, see the MDLCACHE_CRITICAL_SECTION note further down.)
 
@@ -1559,11 +1623,6 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 
 	CBaseEntity* pViewEntity = GetViewEntity(pRecipientPlayer);
 	const Vector& clientPosition = pViewEntity ? pViewEntity->EyePosition() : pRecipientPlayer->EyePosition();
-	const int clientArea = networking_fastpath_usecluster.GetBool() ? Util::engineserver->GetClusterForOrigin(clientPosition) : Util::engineserver->GetArea(clientPosition);
-
-	// NOTE: We intentionally use GetArea and not GetCluster, since a Area is far bigger than a cluster & it should work good enough.
-	// Possible BUG: The PVS might hate us for doing such a cruel thing to it. Anyways >:3
-
 	// ToDo: Bring over's CS:GO code for InitialSpawnTime
 	//const bool bIsFreshlySpawned = pRecipientPlayer->GetInitialSpawnTime()+3.0f > gpGlobals->curtime;
 
@@ -1579,7 +1638,6 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 	// pRecipientPlayer->IsHLTV(); Why do we not use IsHLTV()? Because its NOT a virtual function & the variables are fked
 	const int nCurrentTick = gpGlobals->tickcount;
 	const bool bIsHLTV = pInfo->m_pTransmitAlways != nullptr;
-	const bool bFastPath = networking_fastpath.GetBool();
 	const bool bFirstTransmit = g_pGlobalTransmitTickCache.IsNewTick(nCurrentTick);
 	if (bFirstTransmit)
 	{
@@ -1587,9 +1645,6 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 		// only ever as fresh as the last rebuild. Doing this inside UpdateEntities (below) left the player
 		// loop reading entries a tick out of date and could hand a removed player to NextTick() freed.
 		RebuildEntityCacheForTick();
-
-		if (bFastPath)
-			Plat_FastMemset(g_pPlayerTransmitTickCache, 0, sizeof(g_pPlayerTransmitTickCache));
 
 		for (int iPlayerIndex = 1; iPlayerIndex <= gpGlobals->maxClients; ++iPlayerIndex)
 		{
@@ -1602,39 +1657,29 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 
 		g_nEntityTransmitCache.UpdateEntities(pEdictIndices, nEdicts);
 		g_pGlobalTransmitTickCache.NewTick(nCurrentTick);
-
-	} else {
-		// We got g_nEntityTransmitCache for this already
-		// g_pGlobalTransmitTickCache.g_pAlwaysTransmitCacheBitVec.CopyTo(pInfo->m_pTransmitEdict);
-		// if (bIsHLTV)
-		//	g_pGlobalTransmitTickCache.g_pAlwaysTransmitCacheBitVec.CopyTo(pInfo->m_pTransmitAlways);
-
-		if (bFastPath)
-		{
-			for (int iOtherClient = 0; iOtherClient<gpGlobals->maxClients; ++iOtherClient)
-			{
-				const PlayerTransmitTickCache& nOtherCache = g_pPlayerTransmitTickCache[iOtherClient];
-				if (nOtherCache.nAreaNum != clientArea)
-					continue;
-
-				TransmitFastPathPlayer(pRecipientPlayer, clientIndex, pInfo, iOtherClient, nOtherCache);
-				return true; // fast route when players are in the same area, we can save a tone of calculation hopefully without breaking anything.
-			}
-		}
 	}
+
+	// Sharing a final transmit bitset skips ShouldTransmit, SetTransmit and
+	// full-update handling. Share only pure BSP queries; HLTV never queries the PVS.
+	TransmitPVSQuery pPVSQuery(networking_fastpath.GetBool());
 
 	g_pShouldPrevent[clientIndex].CopyTo(&g_pDontTransmitCache); // We combine Gmod's prevent transmit with also our things to remove unessesary checks.
 	g_nEntityTransmitCache.pNeverTransmitBits.Or(g_pDontTransmitCache, &g_pDontTransmitCache);
 
-	const int clientEntIndex = pInfo->m_pClientEnt->m_EdictIndex;
-	static CBitVec<MAX_EDICTS> pClientCache; // Temporary cache used when we are calculating the transmit to the current pRecipientPlayer
-	pClientCache.ClearAll(); // It is static, so without this it carries the previous recipient's bits into the Xor below.
 	const bool bForceTransmit = sv_force_transmit_ents && sv_force_transmit_ents->GetBool(); // Only set when g_pCVar existed at ServerActivate
-	bool bWasTransmitToPlayer = false;
 	// pInfo->m_pTransmitEdict->Or(g_pGlobalTransmitTickCache.g_pAlwaysTransmitCacheBitVec, pInfo->m_pTransmitEdict);
 	pInfo->m_pTransmitEdict->Or(g_nEntityTransmitCache.pAlwaysTransmitBits, pInfo->m_pTransmitEdict);
 	if (bIsHLTV)
 		pInfo->m_pTransmitAlways->Or(g_nEntityTransmitCache.pAlwaysTransmitBits, pInfo->m_pTransmitAlways);
+
+	// Like the engine forcing an always transmitted child's parents, but through SetTransmit so that the player's
+	// attachments and weapons come along (see EntityTransmitCache::MarkAlwaysTransmit).
+	for (int i=0; i<g_nEntityTransmitCache.nAlwaysTransmitPlayerCount; ++i)
+	{
+		CBaseEntity* pPlayer = g_pEntityCache[g_nEntityTransmitCache.pAlwaysTransmitPlayers[i]];
+		if (pPlayer)
+			pPlayer->SetTransmit(pInfo, true);
+	}
 
 	for (int i=0; i<=g_nEntityTransmitCache.nFullEdictCount; ++i)
 	{
@@ -1645,16 +1690,6 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 			continue;
 
 		const int iEdict = pEntEdict->m_EdictIndex;
-		if (iEdict == clientEntIndex) {
-			pInfo->m_pTransmitEdict->CopyTo(&pClientCache);
-			bWasTransmitToPlayer = true;
-		} else if (bWasTransmitToPlayer) {
-			// We Xor it so that the pClientCache contains all bits / entities
-			// that were sent specifically to our client in it's transmit check.
-			pInfo->m_pTransmitEdict->Xor(pClientCache, &pClientCache);
-			bWasTransmitToPlayer = false;
-		}
-
 		if (pInfo->m_pTransmitEdict->Get(iEdict) || g_pDontTransmitCache.Get(iEdict))
 			continue;
 
@@ -1671,7 +1706,7 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 			continue;
 
 		// Now only PVS remains
-		DoTransmitPVSCheck(pEnt->edict(), pEnt, bIsHLTV, pInfo, bForceTransmit, skyBoxArea, clientPosition, maxTransmitRange);
+		DoTransmitPVSCheck(pEnt->edict(), pEnt, bIsHLTV, pInfo, bForceTransmit, skyBoxArea, clientPosition, maxTransmitRange, pPVSQuery);
 	}
 
 	if (networking_areasplit.GetBool())
@@ -1697,7 +1732,7 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 					continue;
 
 				// Now only PVS remains
-				DoTransmitPVSCheck(pEdict, pEnt, bIsHLTV, pInfo, bForceTransmit, skyBoxArea, clientPosition, maxTransmitRange);
+				DoTransmitPVSCheck(pEdict, pEnt, bIsHLTV, pInfo, bForceTransmit, skyBoxArea, clientPosition, maxTransmitRange, pPVSQuery);
 			}
 		}
 	}
@@ -1717,14 +1752,7 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 			continue;
 
 		// Now only PVS remains
-		DoTransmitPVSCheck(pEdict, pEnt, bIsHLTV, pInfo, bForceTransmit, skyBoxArea, clientPosition, maxTransmitRange);
-	}
-
-	if (bWasTransmitToPlayer)
-	{
-		// Same here just in case the player was the only pvs thing (which should like almost never be the case tho)
-		pInfo->m_pTransmitEdict->Xor(pClientCache, &pClientCache);
-		bWasTransmitToPlayer = false;
+		DoTransmitPVSCheck(pEdict, pEnt, bIsHLTV, pInfo, bForceTransmit, skyBoxArea, clientPosition, maxTransmitRange, pPVSQuery);
 	}
 
 	if (networking_transmit_onfullupdate.GetBool())
@@ -1759,17 +1787,7 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 		}
 	}
 
-	// HLTV has different networking! Some things might transmit when for normal players they wouldn't!
-	// ObserverMode also influences how things are networked!
-	if (bFastPath && !bIsHLTV && !(pRecipientPlayer->GetObserverMode() == OBS_MODE_IN_EYE && pRecipientPlayer->GetObserverTarget()))
-	{
-		PlayerTransmitTickCache& nTransmitCache = g_pPlayerTransmitTickCache[clientIndex];
-		// Remove player's viewmodels from the cache since those are supposed to only be networked to the recipient player
-
-		pInfo->m_pTransmitEdict->CopyTo(&nTransmitCache.pClientBitVec);
-		CBitVec_AndNot(&nTransmitCache.pClientBitVec, &pClientCache);
-		nTransmitCache.nAreaNum = clientArea;
-	}
+	TransmitBoundAttachmentsToViewers(pRecipientPlayer, pInfo, clientIndex);
 	pInfo->m_pTransmitEdict->Or(g_pGlobalTransmitTickCache.g_bWasSeenByPlayer, &g_pGlobalTransmitTickCache.g_bWasSeenByPlayer);
 
 	return true;
@@ -2013,6 +2031,8 @@ void CNetworkingModule::InitDetour(bool bPreServer)
 	if (bPreServer)
 		return;
 
+	g_pTransmitPVSCache.Reset();
+	g_pGlobalTransmitTickCache.g_iLastCheckTransmit = -1;
 	Plat_FastMemset(g_pEntityCache, 0, sizeof(g_pEntityCache));
 	g_pReplaceCServerGameEnts_CheckTransmit = false;
 #if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
@@ -2200,6 +2220,8 @@ void CNetworkingModule::InitDetour(bool bPreServer)
 
 void CNetworkingModule::ServerActivate(edict_t* pEdictList, int edictCount, int clientMax)
 {
+	g_pTransmitPVSCache.Reset();
+	g_pGlobalTransmitTickCache.g_iLastCheckTransmit = -1;
 	if (pEdictList)
 	{
 		for (int i=0; i<edictCount; ++i)
@@ -2318,6 +2340,7 @@ void CNetworkingModule::ServerActivate(edict_t* pEdictList, int edictCount, int 
 extern CGlobalVars *gpGlobals;
 void CNetworkingModule::Shutdown()
 {
+	g_pTransmitPVSCache.Reset();
 	g_pReplaceCServerGameEnts_CheckTransmit = false;
 
 	// The default 64-bit transmit path does not resolve the snapshot manager.

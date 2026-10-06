@@ -37,7 +37,8 @@ public:
 	inline void SetNetworkParent( EHANDLE hParent );
 	inline CCServerNetworkProperty* GetNetworkParent();
 	inline void			SetUpdateInterval( float N );
-	inline bool IsInPVS( const CCheckTransmitInfo *pInfo );
+	template <typename HeadnodeQuery>
+	inline bool IsInPVS( const CCheckTransmitInfo *pInfo, HeadnodeQuery&& headnodeQuery );
 	inline bool IsInPVS( const edict_t *pRecipient, const void *pvs, int pvssize );
 	inline virtual void FireEvent();
 	inline void RecomputePVSInformation();
@@ -87,7 +88,9 @@ inline bool CheckAreasConnected(int area1, int area2)
 	return g_BSPData->map_areas[area1].floodnum == g_BSPData->map_areas[area2].floodnum;
 }
 
-inline bool CCServerNetworkProperty::IsInPVS( const CCheckTransmitInfo *pInfo )
+// headnodeQuery(headnode) answers engine->CheckHeadnodeVisible for this recipient's PVS (see TransmitPVSQuery).
+template <typename HeadnodeQuery>
+inline bool CCServerNetworkProperty::IsInPVS( const CCheckTransmitInfo *pInfo, HeadnodeQuery&& headnodeQuery )
 {
 	// PVS data must be up to date
 	// Assert( !m_pPev || ( ( m_pPev->m_fStateFlags & FL_EDICT_DIRTY_PVS_INFORMATION ) == 0 ) );
@@ -138,7 +141,7 @@ inline bool CCServerNetworkProperty::IsInPVS( const CCheckTransmitInfo *pInfo )
 	
 	if ( m_PVSInfo.m_nClusterCount < 0 )   // too many clusters, use headnode
 	{
-		return (engine->CheckHeadnodeVisible( m_PVSInfo.m_nHeadNode, pPVS, pInfo->m_nPVSSize ) != 0);
+		return headnodeQuery(m_PVSInfo.m_nHeadNode);
 	}
 	
 	for ( i = m_PVSInfo.m_nClusterCount; --i >= 0; )
