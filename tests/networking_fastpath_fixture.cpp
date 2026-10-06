@@ -212,10 +212,14 @@ void CBaseEntity::SetTransmit(CCheckTransmitInfo* info, bool always)
 	else
 		BaseSetTransmit(info, always);
 }
+static CCServerNetworkProperty* GetNetworkParentSafe(CCServerNetworkProperty* property) { return property->parent; }
+static std::vector<edict_t*> alwaysEdicts; // FL_EDICT_ALWAYS edicts, marked on every tick's first transmit.
 struct EntityTransmitCache
 {
 	struct AreaCache { int nCount = 0; CBaseEntity* pEntities[64]{}; };
 	CBitVec<MAX_EDICTS> pNeverTransmitBits, pAlwaysTransmitBits;
+	int nAlwaysTransmitPlayerCount = 0;
+	int pAlwaysTransmitPlayers[MAX_PLAYERS]{};
 	int nFullEdictCount = -1, nPVSEdictCount = -1;
 	CBaseEntity* pFullEntityList[256]{};
 	CBaseEntity* pPVSEntityList[64]{};
@@ -223,8 +227,13 @@ struct EntityTransmitCache
 	void UpdateEntities(const unsigned short*, int)
 	{
 		pNeverTransmitBits.ClearAll();
+		pAlwaysTransmitBits.ClearAll();
+		nAlwaysTransmitPlayerCount = 0;
+		for (edict_t* always : alwaysEdicts)
+			MarkAlwaysTransmit(always, always->m_EdictIndex);
 		// PRODUCTION_ATTACHMENT_EXCLUSION
 	}
+	// PRODUCTION_ALWAYS_TRANSMIT
 };
 static EntityTransmitCache g_nEntityTransmitCache;
 // PRODUCTION_GLOBAL_CACHE
@@ -232,7 +241,6 @@ static void RebuildEntityCacheForTick() {}
 static CBaseEntity* GetViewEntity(CBasePlayer* player) { return player->view; }
 static int GetSkybox3DArea(CBasePlayer* player) { return player->skybox; }
 static CCollisionProperty* GetEntityCollisionProperty(CBaseEntity* ent) { return &ent->collision; }
-static CCServerNetworkProperty* GetNetworkParentSafe(CCServerNetworkProperty* property) { return property->parent; }
 // PRODUCTION_IS_IN_PVS
 static vec_t g_nTransmitRange = -1.0f;
 // PRODUCTION_DO_TRANSMIT
@@ -321,6 +329,7 @@ static void ResetObserverWorld(bool fast)
 		g_pShouldPrevent[i].ClearAll();
 	}
 	g_nEntityTransmitCache = {};
+	alwaysEdicts.clear();
 	g_pTransmitPVSCache.Reset();
 	g_pGlobalTransmitTickCache.g_iLastCheckTransmit = -1;
 	globals.maxClients = 3;
@@ -534,6 +543,30 @@ static bool CheckObserverAttachments()
 	return true;
 }
 
+// An always transmitted child of a player (a projected texture, a TRANSMIT_ALWAYS SENT) forces that player for
+// every recipient. Its SetTransmit hook must still run, or the owner loses its viewmodels, hands and weapons.
+static void CheckAlwaysTransmitParents()
+{
+	for (bool fast : {true, false})
+	{
+		ResetObserverWorld(fast);
+		entities[2].observerMode = OBS_MODE_NONE;
+		entities[2].observerTarget = nullptr;
+		entities[450].property.parent = &entities[1].property;
+		alwaysEdicts.push_back(&entities[450].entry);
+		const auto owner = ObserverTransmit(1);
+		assert(owner.Get(450) && owner.Get(1) && owner.Get(510) && owner.Get(601));
+		assert(owner.Get(710) && owner.Get(711));
+		entities[1].othersTransmit = FL_EDICT_DONTSEND; // Hidden, but forced by its always transmitted child.
+		const auto other = ObserverTransmit(3);
+		assert(other.Get(450) && other.Get(1) && other.Get(710));
+		assert(!other.Get(510) && !other.Get(601) && !other.Get(711));
+		assert(!g_nEntityTransmitCache.pAlwaysTransmitBits.Get(1));
+	}
+	std::cout << "Always transmitted children: their player parent still sends its attachments and weapons, "
+		"both cache settings passed\n";
+}
+
 int main()
 {
 	for (int i = 0; i < MAX_EDICTS; ++i)
@@ -561,7 +594,7 @@ int main()
 	unsigned short clusters[] = {1, 2};
 	entities[330].property.m_PVSInfo.m_nClusterCount = 2;
 	entities[330].property.m_PVSInfo.m_pClusters = clusters;
-	g_nEntityTransmitCache.pAlwaysTransmitBits.Set(400);
+	alwaysEdicts.push_back(&entities[400].entry);
 
 	for (bool split : {false, true})
 	{
@@ -605,4 +638,5 @@ int main()
 	assert(!New_CServerGameEnts_CheckTransmit(Util::servergameents, &info, nullptr, 0));
 	if (!CheckObserverAttachments())
 		return 1;
+	CheckAlwaysTransmitParents();
 }

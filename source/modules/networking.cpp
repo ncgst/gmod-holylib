@@ -603,6 +603,7 @@ struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, t
 		memset(pEntityTransmitStates, 0, sizeof(pEntityTransmitStates));
 #endif
 		Plat_FastMemset(&pAlwaysTransmitBits, 0, sizeof(pAlwaysTransmitBits) * 4); // Again, very "safe"
+		nAlwaysTransmitPlayerCount = 0;
 		//pAlwaysTransmitBits.ClearAll();
 		//pNeverTransmitBits.ClearAll();
 		//pPVSTransmitBits.ClearAll();
@@ -685,22 +686,7 @@ struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, t
 
 			if (nFlags & FL_EDICT_ALWAYS)
 			{
-				while (pEdict) // Stop if we got no edict / for example have no further parent
-				{
-					pAlwaysTransmitBits.Set(iEdict);
-
-					CCServerNetworkProperty *pEnt = static_cast<CCServerNetworkProperty*>(pEdict->GetNetworkable());
-					if (!pEnt)
-						break;
-
-					CCServerNetworkProperty *pParent = GetNetworkParentSafe(pEnt);
-					if (!pParent)
-						break;
-
-					pEdict = pParent->edict();
-					if (pEdict)
-						iEdict = pEdict->m_EdictIndex; // Source engine normally uses pParent->entindex() which needs no null check due to it using ENTINDEX internally
-				}
+				MarkAlwaysTransmit(pEdict, iEdict);
 				continue;
 			}
 
@@ -756,6 +742,10 @@ struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, t
 				if (pAlwaysTransmitBits.IsBitSet(i))
 					Msg("    %i\n", i);
 			}
+
+			Msg("Always (players, transmitted through SetTransmit):\n");
+			for (int i=0; i<nAlwaysTransmitPlayerCount; ++i)
+				Msg("    %i\n", pAlwaysTransmitPlayers[i]);
 
 			if (networking_areasplit.GetBool())
 			{
@@ -816,6 +806,48 @@ struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, t
 
 			networking_cachedump.SetValue(0);
 		}
+	}
+
+	// Marks an FL_EDICT_ALWAYS entity and the move parents that SetTransmit would force along with it.
+	// Players are not marked: a set bit makes CheckTransmit skip their SetTransmit hook, which is the only place
+	// that sends their bound attachments and weapons, so the owner would lose its viewmodels.
+	// CheckTransmit calls SetTransmit on them for every recipient instead, which also forces the rest of the chain.
+	inline void MarkAlwaysTransmit(edict_t* pEdict, int iEdict)
+	{
+		while (pEdict) // Stop if we got no edict / for example have no further parent
+		{
+			if (iEdict >= 1 && iEdict <= gpGlobals->maxClients)
+			{
+				AddAlwaysTransmitPlayer(iEdict);
+				return;
+			}
+
+			pAlwaysTransmitBits.Set(iEdict);
+
+			CCServerNetworkProperty *pEnt = static_cast<CCServerNetworkProperty*>(pEdict->GetNetworkable());
+			if (!pEnt)
+				break;
+
+			CCServerNetworkProperty *pParent = GetNetworkParentSafe(pEnt);
+			if (!pParent)
+				break;
+
+			pEdict = pParent->edict();
+			if (pEdict)
+				iEdict = pEdict->m_EdictIndex; // Source engine normally uses pParent->entindex() which needs no null check due to it using ENTINDEX internally
+		}
+	}
+
+	inline void AddAlwaysTransmitPlayer(int iEdict)
+	{
+		for (int i=0; i<nAlwaysTransmitPlayerCount; ++i)
+		{
+			if (pAlwaysTransmitPlayers[i] == iEdict)
+				return;
+		}
+
+		if (nAlwaysTransmitPlayerCount < MAX_PLAYERS)
+			pAlwaysTransmitPlayers[nAlwaysTransmitPlayerCount++] = iEdict;
 	}
 
 	void EntityRemoved(CBaseEntity* pEntity, edict_t* pEdict)
@@ -985,6 +1017,10 @@ struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, t
 	CBitVec<MAX_EDICTS> pNeverTransmitBits;
 	CBitVec<MAX_EDICTS> pPVSTransmitBits;
 	CBitVec<MAX_EDICTS> pFullTransmitBits;
+
+	// Edict indices of players that are the move parent of an always transmitted entity, see MarkAlwaysTransmit.
+	int nAlwaysTransmitPlayerCount = 0;
+	int pAlwaysTransmitPlayers[MAX_PLAYERS] = {0};
 
 	// int nEntityCluster[MAX_EDICTS] = {0};
 	// CBitVec<MAX_EDICTS> bDirtyEntities = {false}; // Their Cluster changed compared to last tick.
@@ -1644,6 +1680,15 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 	pInfo->m_pTransmitEdict->Or(g_nEntityTransmitCache.pAlwaysTransmitBits, pInfo->m_pTransmitEdict);
 	if (bIsHLTV)
 		pInfo->m_pTransmitAlways->Or(g_nEntityTransmitCache.pAlwaysTransmitBits, pInfo->m_pTransmitAlways);
+
+	// Like the engine forcing an always transmitted child's parents, but through SetTransmit so that the player's
+	// attachments and weapons come along (see EntityTransmitCache::MarkAlwaysTransmit).
+	for (int i=0; i<g_nEntityTransmitCache.nAlwaysTransmitPlayerCount; ++i)
+	{
+		CBaseEntity* pPlayer = g_pEntityCache[g_nEntityTransmitCache.pAlwaysTransmitPlayers[i]];
+		if (pPlayer)
+			pPlayer->SetTransmit(pInfo, true);
+	}
 
 	for (int i=0; i<=g_nEntityTransmitCache.nFullEdictCount; ++i)
 	{
