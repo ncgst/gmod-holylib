@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <string.h> // Production code calls memmove unqualified.
 #include <vector>
 
 constexpr int MAX_PLAYERS = 128, MAX_EDICTS = 1024, MAX_MAP_AREAS = 4;
@@ -14,6 +15,7 @@ constexpr int OBS_MODE_NONE = 0, OBS_MODE_IN_EYE = 4, OBS_MODE_CHASE = 5;
 constexpr int FL_EDICT_FULLCHECK = 0, FL_EDICT_ALWAYS = 8, FL_EDICT_DONTSEND = 16, FL_EDICT_PVSCHECK = 32;
 #define PROJECT_NAME "fixture"
 #define Warning(...) ((void)0)
+#define DevMsg(...) ((void)0)
 #define BitVec_BitInByte(n) (1u << ((n) & 7))
 
 template <std::size_t N> struct CBitVec
@@ -21,6 +23,7 @@ template <std::size_t N> struct CBitVec
 	std::bitset<N> bits;
 	void ClearAll() { bits.reset(); }
 	void Set(int index) { bits.set(index); }
+	void Clear(int index) { bits.reset(index); }
 	bool Get(int index) const { return bits.test(index); }
 	bool IsBitSet(int index) const { return Get(index); }
 	void CopyTo(CBitVec* out) const { *out = *this; }
@@ -102,6 +105,7 @@ struct CBaseEntity
 	CBaseEntity() { entry.entity = this; entry.property = &property; property.owner = &entry; }
 	edict_t* edict() { return hasEdict ? &entry : nullptr; }
 	bool IsPlayer() const { return player; }
+	const char* GetClassname() const { return "fixture"; }
 	// No GetObserverMode()/GetObserverTarget() members: production must read the networked fields instead of
 	// calling CBasePlayer virtuals, and calling them would no longer compile here.
 	const Vector& EyePosition() const { return collision.position; }
@@ -217,7 +221,8 @@ static std::vector<edict_t*> alwaysEdicts; // FL_EDICT_ALWAYS edicts, marked on 
 struct EntityTransmitCache
 {
 	struct AreaCache { int nCount = 0; CBaseEntity* pEntities[64]{}; };
-	CBitVec<MAX_EDICTS> pNeverTransmitBits, pAlwaysTransmitBits;
+	bool m_bIsActivelyNetworking = false;
+	CBitVec<MAX_EDICTS> pNeverTransmitBits, pAlwaysTransmitBits, pPVSTransmitBits, pFullTransmitBits;
 	int nAlwaysTransmitPlayerCount = 0;
 	int pAlwaysTransmitPlayers[MAX_PLAYERS]{};
 	int nFullEdictCount = -1, nPVSEdictCount = -1;
@@ -234,6 +239,7 @@ struct EntityTransmitCache
 		// PRODUCTION_ATTACHMENT_EXCLUSION
 	}
 	// PRODUCTION_ALWAYS_TRANSMIT
+	// PRODUCTION_ENTITY_REMOVED
 };
 static EntityTransmitCache g_nEntityTransmitCache;
 // PRODUCTION_GLOBAL_CACHE
@@ -567,6 +573,23 @@ static void CheckAlwaysTransmitParents()
 		"both cache settings passed\n";
 }
 
+// Removing an entity from a full area list during networking must stay inside that list.
+static void CheckEntityRemovedFromFullArea()
+{
+	static EntityTransmitCache cache;
+	cache.m_bIsActivelyNetworking = true;
+	auto& area = cache.nAreaEntities[0];
+	for (auto*& entity : area.pEntities)
+		entity = &entities[300];
+	area.nCount = 64;
+	area.pEntities[10] = &entities[301];
+	cache.nAreaEntities[1].nCount = 5;
+	cache.EntityRemoved(&entities[301], &entities[301].entry);
+	assert(area.nCount == 63 && area.pEntities[62] == &entities[300] && area.pEntities[63] == nullptr);
+	assert(cache.nAreaEntities[1].nCount == 5);
+	std::cout << "EntityRemoved: removal from a full area list stays in bounds\n";
+}
+
 int main()
 {
 	for (int i = 0; i < MAX_EDICTS; ++i)
@@ -650,4 +673,5 @@ int main()
 	if (!CheckObserverAttachments())
 		return 1;
 	CheckAlwaysTransmitParents();
+	CheckEntityRemovedFromFullArea();
 }

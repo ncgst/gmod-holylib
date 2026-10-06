@@ -895,7 +895,7 @@ struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, t
 				if (i < (pArea.nCount - 1))
 					memmove(&pArea.pEntities[i], &pArea.pEntities[i + 1], (pArea.nCount - i - 1) * sizeof(CBaseEntity*));
 
-				pArea.pEntities[pArea.nCount--] = nullptr;
+				pArea.pEntities[--pArea.nCount] = nullptr; // nCount is a count here, unlike the preincremented lists above
 				break;
 			}
 		}

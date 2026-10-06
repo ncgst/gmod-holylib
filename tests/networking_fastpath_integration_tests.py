@@ -29,6 +29,7 @@ def main():
         "CHARACTER_TRANSMIT": between(net, "static void hook_CBaseCombatCharacter_SetTransmit(", "\nstatic inline bool IsInPVS("),
         "ATTACHMENT_EXCLUSION": between(net, "\t\t// First we build data based off all players", "\n\t\tfor (int i=0; i < nEdicts; ++i)"),
         "ALWAYS_TRANSMIT": between(net, "\tinline void MarkAlwaysTransmit(", "\n\tvoid EntityRemoved("),
+        "ENTITY_REMOVED": between(net, "\tvoid EntityRemoved(", "\n\t// Only called with areasplit enabled"),
         "PVS": prop[prop.index("template <typename HeadnodeQuery>\ninline bool CCServerNetworkProperty::IsInPVS("):],
     }
     for name, body in bodies.items():
