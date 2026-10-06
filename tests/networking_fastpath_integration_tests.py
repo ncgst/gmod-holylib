@@ -48,7 +48,8 @@ def main():
             command = [os.environ.get("CXX", "c++"), "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic",
                        "-Wno-unused-parameter", f"-I{root / 'source'}", str(cpp), "-o", str(binary)]
             if args.sanitize:
-                command += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+                # UBSan only reports and continues unless recovery is disabled.
+                command += ["-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer"]
         subprocess.run(command, cwd=temp, check=True)
         subprocess.run([str(binary)], cwd=temp, check=True)
 

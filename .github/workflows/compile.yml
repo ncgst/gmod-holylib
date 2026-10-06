@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Exercise bounded PVS caching under sanitizers
         run: |
-          c++ -std=c++17 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined -Isource tests/networking_pvs_cache_tests.cpp -o /tmp/networking_pvs_cache_tests
+          c++ -std=c++17 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined -fno-sanitize-recover=all -Isource tests/networking_pvs_cache_tests.cpp -o /tmp/networking_pvs_cache_tests
           /tmp/networking_pvs_cache_tests
       - name: Compare production transmit decisions for 120 recipients
         run: python3 tests/networking_fastpath_integration_tests.py --sanitize

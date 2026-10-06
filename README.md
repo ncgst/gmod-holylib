@@ -2238,17 +2238,11 @@ Supports: Linux32 | Linux64<br>
 ### Convars
 
 #### holylib_networking_fastpath(default `0`)
-If enabled, it will cache the transmit data for players in the same engine area.<br>
-This can noticeably improve performance of `CServerGameEnts::CheckTransmit` especially if players are in the same area.<br>
-In game, you can see the area you're in using `r_ShowViewerArea 1` which is used for the caching.<br>
-
-How to test around with it:<br>
-1. Spawn a bot so that he becomes the first player<br>
-2. Enable `sv_stressbots 1`<br>
-3. Enable this convar.<br>
-4. **Only now** join the server so that you become the second player.<br>
-The order is important since now, the bot will be the first player and will be calculated normally, while you as the second player will hit the cache.<br>
-5. Test around and see if maybe anything is broken, like entities not being transmitted or such.<br>
+Experimental. If enabled, the results of `CheckHeadnodeVisible`, the PVS test for entities that touch too many clusters, are cached per exact PVS until the map changes.<br>
+Players with byte-identical PVS data share these results, and a player whose PVS stays the same reuses them on later ticks.<br>
+Every other transmit decision (`ShouldTransmit`, `SetTransmit`, area portals, prevent transmit, full updates) still runs for every player, so the gain depends on how many such entities a map has.<br>
+Use `holylib_networking_fastpath_stats` to see how often the cache is hit. [docs/networking-fastpath.md](docs/networking-fastpath.md) describes the design and how to measure it.<br>
+`holylib_networking_fastpath_usecluster` is kept for old configs but no longer does anything.<br>
 
 #### holylib_networking_fasttransmit(default `1`)
 If enabled, it will use our own version of `CServerGameEnts::CheckTransmit` which should be slightly faster.<br>
@@ -2278,11 +2272,13 @@ Setting it to `1` causes it to network the additional weapon to **all** players<
 Setting it to `2` causes it to network the additional weapon **only** to the owner<br>
 
 #### holylib_networking_bind_gmodhands_to_player(default `1`)
-If enabled, the GMOD Hands entity / the entity set with `Player:SetHands` will be bound to the player and only networked with the player himself.<br>
+If enabled, the GMOD Hands entity / the entity set with `Player:SetHands` will be bound to the player.<br>
+It is then only networked to the player himself, to spectators watching him in first person and to SourceTV, skipping its PVS checks.<br>
 Will become useless with https://github.com/Facepunch/garrysmod-requests/issues/2839<br>
 
 #### holylib_networking_bind_viewmodels_to_player(default `1`)
-If enabled, the viewmodels will be bound to the player and only networked if the player is networked.<br>
+If enabled, the viewmodels will be bound to the player.<br>
+Like in the engine, they are then only networked to the player himself, to spectators watching him in first person and to SourceTV, skipping their PVS checks.<br>
 Will become useless with https://github.com/Facepunch/garrysmod-requests/issues/2839<br>
 
 #### holylib_networking_transmit_newweapons(default `1`)
@@ -2301,6 +2297,12 @@ For other players, if another player has a full update, they will be networked t
 #### holylib_networking_transmit_ticks(default `100`)
 How many ticks are used in which new weapons or full updates are networked.<br>
 This tick count is used by the `holylib_networking_transmit_newweapons`, `holylib_networking_transmit_onfullupdate` and `holylib_networking_transmit_onfullupdate_networktoothers` convars internally.<br>
+
+### ConCommands
+
+#### holylib_networking_fastpath_stats
+Prints the counters of the `holylib_networking_fastpath` cache since the module was loaded or the map started.<br>
+A context hit means a player's PVS data was already cached, a headnode hit means a `CheckHeadnodeVisible` call was saved.<br>
 
 ## steamworks
 This module adds a few functions related to steam.<br>
