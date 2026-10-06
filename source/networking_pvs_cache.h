@@ -7,15 +7,14 @@
 
 namespace Networking
 {
-// Only caches the pure CheckHeadnodeVisible(headnode, PVS, size) query. Area
-// connectivity and all entity/recipient decisions must remain outside the cache.
-// The networking module calls this from the server thread, once visibility has
-// been built for a recipient. No engine, entity or client pointers are retained.
+// Only caches the pure CheckHeadnodeVisible(headnode, PVS, size) query. Its answer depends only on the map's BSP
+// and these bytes, so results stay valid across ticks until Reset(), which must run whenever a map is activated.
+// Area connectivity and all entity/recipient decisions must remain outside the cache.
+// The networking module calls this from the server thread. No engine, entity or client pointers are retained.
 template <std::size_t MaxPVSBytes, std::size_t MaxContexts, std::size_t NodesPerContext = 256>
 class PVSCache
 {
 	static_assert(MaxPVSBytes > 0 && MaxContexts > 0 && NodesPerContext > 0, "Empty PVS cache");
-	static constexpr std::size_t BucketCount = MaxContexts * 2;
 
 	struct Node
 	{
@@ -27,7 +26,6 @@ class PVSCache
 public:
 	struct Context
 	{
-		std::uint64_t hash = 0;
 		int size = 0;
 		std::array<unsigned char, MaxPVSBytes> pvs{};
 		std::array<Node, NodesPerContext> nodes{};
@@ -37,6 +35,7 @@ public:
 	{
 		std::uint64_t contextHits = 0;
 		std::uint64_t contextMisses = 0;
+		std::uint64_t contextEvictions = 0;
 		std::uint64_t contextBypasses = 0;
 		std::uint64_t nodeHits = 0;
 		std::uint64_t nodeMisses = 0;
@@ -44,67 +43,60 @@ public:
 
 	void Reset()
 	{
-		m_hasTick = false;
 		m_contextCount = 0;
-		m_buckets.fill(0);
+		m_clock = 0;
 		m_stats = {};
 	}
 
-	void BeginTick(int tick)
-	{
-		if (m_hasTick && m_tick == tick)
-			return;
-
-		m_hasTick = true;
-		m_tick = tick;
-		m_contextCount = 0;
-		m_buckets.fill(0);
-	}
-
-	// Call once per recipient, after SetupVisibility/PreCheckTransmit. The PVS
-	// remains fixed throughout that recipient's CheckTransmit invocation.
+	// Returns the context holding exactly this PVS. A new PVS takes a free context, or recycles the least recently
+	// used one once all are taken. The pointer stays valid until the next FindContext() or Reset() call.
 	Context* FindContext(const unsigned char* pvs, int size)
 	{
-		if (!m_hasTick || !pvs || size <= 0 || static_cast<std::size_t>(size) > MaxPVSBytes)
+		if (!pvs || size <= 0 || static_cast<std::size_t>(size) > MaxPVSBytes)
 		{
 			++m_stats.contextBypasses;
 			return nullptr;
 		}
 
-		const auto hash = HashPVS(pvs, size);
-		std::size_t bucket = hash % BucketCount;
-		for (std::size_t probe = 0; probe < BucketCount; ++probe)
+		const std::uint64_t hash = HashPVS(pvs, size);
+		for (std::size_t index = 0; index < m_contextCount; ++index)
 		{
-			const std::size_t index = m_buckets[bucket];
-			if (index == 0)
-			{
-				if (m_contextCount == MaxContexts)
-					break;
-
-				Context& context = m_contexts[m_contextCount];
-				context.hash = hash;
-				context.size = size;
-				std::memcpy(context.pvs.data(), pvs, size);
-				for (Node& node : context.nodes)
-					node.state = 0;
-				m_buckets[bucket] = ++m_contextCount;
-				++m_stats.contextMisses;
-				return &context;
-			}
-
-			Context& context = m_contexts[index - 1];
+			Context& context = m_contexts[index];
 			// Hashes only locate candidates. A collision must never share visibility.
-			if (context.hash == hash && context.size == size &&
+			if (m_hashes[index] == hash && context.size == size &&
 				std::memcmp(context.pvs.data(), pvs, size) == 0)
 			{
+				m_lastUse[index] = ++m_clock;
 				++m_stats.contextHits;
 				return &context;
 			}
-			bucket = (bucket + 1) % BucketCount;
 		}
 
-		++m_stats.contextBypasses;
-		return nullptr;
+		std::size_t index = m_contextCount;
+		if (index < MaxContexts)
+		{
+			++m_contextCount;
+		}
+		else
+		{
+			index = 0;
+			for (std::size_t candidate = 1; candidate < MaxContexts; ++candidate)
+			{
+				if (m_lastUse[candidate] < m_lastUse[index])
+					index = candidate;
+			}
+			++m_stats.contextEvictions;
+		}
+
+		Context& context = m_contexts[index];
+		m_hashes[index] = hash;
+		m_lastUse[index] = ++m_clock;
+		context.size = size;
+		std::memcpy(context.pvs.data(), pvs, size);
+		for (Node& node : context.nodes)
+			node.state = 0;
+		++m_stats.contextMisses;
+		return &context;
 	}
 
 	template <typename Query>
@@ -131,7 +123,6 @@ public:
 
 	const Stats& GetStats() const { return m_stats; }
 
-private:
 	static std::uint64_t HashPVS(const unsigned char* pvs, int size)
 	{
 		std::uint64_t hash = 14695981039346656037ULL;
@@ -149,10 +140,12 @@ private:
 		return hash;
 	}
 
-	bool m_hasTick = false;
-	int m_tick = 0;
+private:
 	std::size_t m_contextCount = 0;
-	std::array<std::size_t, BucketCount> m_buckets{};
+	std::uint64_t m_clock = 0;
+	// Kept outside the contexts, so lookups and evictions scan small arrays instead of the large contexts.
+	std::array<std::uint64_t, MaxContexts> m_hashes{};
+	std::array<std::uint64_t, MaxContexts> m_lastUse{};
 	std::array<Context, MaxContexts> m_contexts{};
 	Stats m_stats;
 };

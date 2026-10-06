@@ -426,18 +426,6 @@ static inline int GetSkybox3DArea(const void* pPlayer) // Fully safe access :3
 	return *(int*)pSkybox3DArea;
 }
 
-static inline CBaseEntity* IndexToEntity(const int nEntIndex)
-{
-	// Should never happen anyways (This is very very expensive apparently?)
-	if (nEntIndex < 0 || nEntIndex >= MAX_EDICTS)
-		return nullptr;
-
-	if (!g_pEntityList)
-		return Util::GetCBaseEntityFromIndex(nEntIndex); // The cache can outlive the entity, see EHandleToEntity.
-
-	return g_pEntityCache[nEntIndex];
-}
-
 static inline CBaseEntity* EHandleToEntity(const CBaseHandle* pHandle)
 {
 	if (!g_pEntityList)
@@ -1195,30 +1183,34 @@ public:
 };
 static NetworkingGameEventListener g_pNetworkGameEventListener;
 
-// Bounded storage shared only by recipients with byte-identical PVS data.
+// Bounded storage shared only by recipients with byte-identical PVS data. Reset on map activation.
 using TransmitPVSCache = Networking::PVSCache<sizeof(CCheckTransmitInfo::m_PVS), MAX_PLAYERS>;
 static TransmitPVSCache g_pTransmitPVSCache;
 
 struct TransmitPVSQuery
 {
-	explicit TransmitPVSQuery(bool enabled) : bEnabled(enabled) {}
+	explicit TransmitPVSQuery(bool bEnabled) : bPending(bEnabled) {}
 
 	bool CheckHeadnode(const CCheckTransmitInfo* pInfo, int headnode)
 	{
 		// Most small entities use direct cluster bit tests. Do not hash/copy a
 		// recipient's PVS unless an expensive headnode query actually needs it.
-		if (bEnabled && !bInitialized)
+		if (bPending)
 		{
 			pContext = g_pTransmitPVSCache.FindContext(pInfo->m_PVS, pInfo->m_nPVSSize);
-			bInitialized = true;
+			bPending = false;
 		}
-		return g_pTransmitPVSCache.CheckHeadnode(pContext, headnode, [pInfo, headnode]() {
-			return engine->CheckHeadnodeVisible(headnode, const_cast<unsigned char*>(pInfo->m_PVS), pInfo->m_nPVSSize) != 0;
+
+		// Answer misses from the context's own copy, so a stored answer always belongs to the PVS it is stored under,
+		// even if something changes the recipient's PVS buffer during the transmit.
+		const unsigned char* pPVS = pContext ? pContext->pvs.data() : pInfo->m_PVS;
+		const int nPVSSize = pContext ? pContext->size : pInfo->m_nPVSSize;
+		return g_pTransmitPVSCache.CheckHeadnode(pContext, headnode, [pPVS, nPVSSize, headnode]() {
+			return engine->CheckHeadnodeVisible(headnode, pPVS, nPVSSize) != 0;
 		});
 	}
 
-	bool bEnabled;
-	bool bInitialized = false;
+	bool bPending; // The context is still to be looked up.
 	TransmitPVSCache::Context* pContext = nullptr;
 };
 
@@ -1594,15 +1586,15 @@ static void TransmitBoundAttachmentsToViewers(CBasePlayer* pRecipientPlayer, CCh
 	TransmitAttachmentsOf(pTarget);
 }
 
-static ConVar networking_fastpath("holylib_networking_fastpath", "0", 0, "Experimental - Reuse BSP headnode visibility queries for identical PVS data within a tick; all recipient transmit decisions still run");
+static ConVar networking_fastpath("holylib_networking_fastpath", "0", 0, "Experimental - Cache BSP headnode visibility results per exact PVS until the map changes; all recipient transmit decisions still run");
 static ConVar networking_fastpath_usecluster("holylib_networking_fastpath_usecluster", "1", 0, "Deprecated compatibility setting; fastpath always matches exact PVS data, never just an area or cluster");
 static void NetworkingFastPathStats(const CCommand&)
 {
 	const auto& stats = g_pTransmitPVSCache.GetStats();
-	Msg("HolyLib networking fastpath: contexts hit=%llu miss=%llu bypass=%llu; headnodes hit=%llu miss=%llu\n",
+	Msg("HolyLib networking fastpath: contexts hit=%llu miss=%llu evicted=%llu bypass=%llu; headnodes hit=%llu miss=%llu\n",
 		static_cast<unsigned long long>(stats.contextHits), static_cast<unsigned long long>(stats.contextMisses),
-		static_cast<unsigned long long>(stats.contextBypasses), static_cast<unsigned long long>(stats.nodeHits),
-		static_cast<unsigned long long>(stats.nodeMisses));
+		static_cast<unsigned long long>(stats.contextEvictions), static_cast<unsigned long long>(stats.contextBypasses),
+		static_cast<unsigned long long>(stats.nodeHits), static_cast<unsigned long long>(stats.nodeMisses));
 }
 static ConCommand networking_fastpath_stats("holylib_networking_fastpath_stats", NetworkingFastPathStats,
 	"Show fastpath cache counters since module initialization or map activation", 0);
@@ -1626,7 +1618,7 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 	const int clientIndex = pInfo->m_pClientEnt->m_EdictIndex - 1;
 
 	// BUG: Can this even happen? Probably, when people screw with the gameserver module & disable spawn safety
-	if (clientIndex >= gpGlobals->maxClients || clientIndex >= MAX_PLAYERS || clientIndex < 0)
+	if (clientIndex >= gpGlobals->maxClients || clientIndex < 0)
 		return true; // We don't return false since we never want to transmit anything to a player in a invalid slot!
 
 	CBaseEntity* pViewEntity = GetViewEntity(pRecipientPlayer);
@@ -1668,9 +1660,8 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 	}
 
 	// Sharing a final transmit bitset skips ShouldTransmit, SetTransmit and
-	// full-update handling. Share only pure BSP queries; HLTV keeps its own path.
-	g_pTransmitPVSCache.BeginTick(nCurrentTick);
-	TransmitPVSQuery pPVSQuery(networking_fastpath.GetBool() && !bIsHLTV);
+	// full-update handling. Share only pure BSP queries; HLTV never queries the PVS.
+	TransmitPVSQuery pPVSQuery(networking_fastpath.GetBool());
 
 	g_pShouldPrevent[clientIndex].CopyTo(&g_pDontTransmitCache); // We combine Gmod's prevent transmit with also our things to remove unessesary checks.
 	g_nEntityTransmitCache.pNeverTransmitBits.Or(g_pDontTransmitCache, &g_pDontTransmitCache);

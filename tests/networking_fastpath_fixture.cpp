@@ -619,20 +619,31 @@ int main()
 
 	// The cheap cluster branch must not pay for a PVS hash or context copy.
 	g_pTransmitPVSCache.Reset();
-	g_pTransmitPVSCache.BeginTick(12);
 	CCheckTransmitInfo info;
 	info.m_PVS[0] = 0xFF;
 	portalOpen = true;
 	TransmitPVSQuery query(true);
 	assert(IsInPVS(&entities[330].property, &info, query));
-	assert(!query.bInitialized && g_pTransmitPVSCache.GetStats().contextMisses == 0);
+	assert(query.bPending && g_pTransmitPVSCache.GetStats().contextMisses == 0);
 
 	// A disabled cache still performs every underlying headnode query.
 	TransmitPVSQuery disabled(false);
 	const int before = engine->headnodeCalls;
 	assert(IsInPVS(&entities[300].property, &info, disabled));
 	assert(IsInPVS(&entities[300].property, &info, disabled));
-	assert(engine->headnodeCalls == before + 2 && !disabled.bInitialized);
+	assert(engine->headnodeCalls == before + 2 && !disabled.bPending && !disabled.pContext);
+
+	// Misses are answered from the context's copy. Bits that a callback adds to the live PVS buffer later in the
+	// same transmit must not be stored under the original PVS and served to another recipient.
+	g_pTransmitPVSCache.Reset();
+	CCheckTransmitInfo changing, unchanged;
+	changing.m_PVS[0] = unchanged.m_PVS[0] = 0x01; // Headnode 0 is visible, headnode 5 is not.
+	TransmitPVSQuery changingQuery(true), unchangedQuery(true);
+	assert(IsInPVS(&entities[300].property, &changing, changingQuery));
+	changing.m_PVS[0] |= 0x20; // For example AddOriginToPVS from an entity callback.
+	(void)IsInPVS(&entities[305].property, &changing, changingQuery);
+	assert(!IsInPVS(&entities[305].property, &unchanged, unchangedQuery));
+	assert(g_pTransmitPVSCache.GetStats().contextHits == 1);
 
 	globals.maxClients = MAX_PLAYERS + 1;
 	assert(!New_CServerGameEnts_CheckTransmit(Util::servergameents, &info, nullptr, 0));

@@ -37,7 +37,6 @@ public:
 	inline void SetNetworkParent( EHANDLE hParent );
 	inline CCServerNetworkProperty* GetNetworkParent();
 	inline void			SetUpdateInterval( float N );
-	inline bool IsInPVS( const CCheckTransmitInfo *pInfo );
 	template <typename HeadnodeQuery>
 	inline bool IsInPVS( const CCheckTransmitInfo *pInfo, HeadnodeQuery&& headnodeQuery );
 	inline bool IsInPVS( const edict_t *pRecipient, const void *pvs, int pvssize );
@@ -89,13 +88,7 @@ inline bool CheckAreasConnected(int area1, int area2)
 	return g_BSPData->map_areas[area1].floodnum == g_BSPData->map_areas[area2].floodnum;
 }
 
-inline bool CCServerNetworkProperty::IsInPVS( const CCheckTransmitInfo *pInfo )
-{
-	return IsInPVS(pInfo, [pInfo](int headnode) {
-		return engine->CheckHeadnodeVisible(headnode, const_cast<unsigned char*>(pInfo->m_PVS), pInfo->m_nPVSSize) != 0;
-	});
-}
-
+// headnodeQuery(headnode) answers engine->CheckHeadnodeVisible for this recipient's PVS (see TransmitPVSQuery).
 template <typename HeadnodeQuery>
 inline bool CCServerNetworkProperty::IsInPVS( const CCheckTransmitInfo *pInfo, HeadnodeQuery&& headnodeQuery )
 {
