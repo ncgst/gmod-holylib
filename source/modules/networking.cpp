@@ -545,6 +545,20 @@ static inline CBaseViewModel* GetViewModel(const void* pPlayer, const int nViewM
 	return (CBaseViewModel*)EHandleToEntity((CBasePlayer::CBaseViewModelHandle*)m_hViewModel_Offset.GetPointerArray(pPlayer, nViewModelSlot));
 }
 
+// Don't use CBasePlayer::GetObserverMode()/GetObserverTarget(), they are virtual and GMod's vtable differs from the SDK.
+// On current x86-64 branch builds the SDK's slots hold SetObserverMode(int) and ObserverUse(bool) instead.
+static DTVarByOffset m_iObserverMode_Offset("DT_BasePlayer", "m_iObserverMode");
+static inline int GetObserverMode(const void* pPlayer)
+{
+	return *(const int*)m_iObserverMode_Offset.GetPointer(pPlayer);
+}
+
+static DTVarByOffset m_hObserverTarget_Offset("DT_BasePlayer", "m_hObserverTarget");
+static inline CBaseEntity* GetObserverTarget(const void* pPlayer)
+{
+	return EHandleToEntity((CBaseHandle*)m_hObserverTarget_Offset.GetPointer(pPlayer));
+}
+
 // DT_LocalPlayerExclusive is based off CBasePlayer! So we don't need to get it first as offsets are all for CBasePlayer
 static DTVarByOffset m_hViewEntity_Offset("DT_LocalPlayerExclusive", "m_hViewEntity");
 static inline CBaseEntity* GetViewEntity(void* pPlayer)
@@ -1488,40 +1502,60 @@ static inline void DoTransmitPVSCheck(
 	}
 }
 
-static void TransmitInEyeObserver(CBasePlayer* pRecipientPlayer, CCheckTransmitInfo* pInfo, int clientIndex)
+// The engine's CBaseViewModel::ShouldTransmit sends a player's viewmodels to the owner, to spectators watching
+// that player in first person and to HLTV. Binding moves viewmodels and hands out of the ordinary entity checks
+// and hook_CBaseCombatCharacter_SetTransmit only adds them for their owner, so this adds the other two viewers.
+static void TransmitBoundAttachmentsToViewers(CBasePlayer* pRecipientPlayer, CCheckTransmitInfo* pInfo, int clientIndex)
 {
-	if (pInfo->m_pTransmitAlways || pRecipientPlayer->GetObserverMode() != OBS_MODE_IN_EYE)
-		return;
-
-	CBaseEntity* pObserverTarget = pRecipientPlayer->GetObserverTarget();
-	if (!pObserverTarget || pObserverTarget == pRecipientPlayer || !pObserverTarget->IsPlayer())
-		return;
+	const bool bBindViewModels = networking_bind_viewmodels_to_player.GetBool();
+	const bool bBindHands = networking_bind_gmodhands_to_player.GetBool();
+	if (!networking_fastcharactertransmit.GetBool() || (!bBindViewModels && !bBindHands))
+		return; // Nothing is bound, everything went through the ordinary checks.
 
 	const CBitVec<MAX_EDICTS>& preventTransmit = g_pShouldPrevent[clientIndex];
-	const auto TransmitIfAllowed = [pInfo, &preventTransmit](CBaseEntity* pEntity) {
+	const auto TransmitAttachment = [pInfo, &preventTransmit](CBaseEntity* pEntity) {
 		edict_t* pEdict = pEntity ? pEntity->edict() : nullptr;
 		if (!pEdict || pEdict->m_EdictIndex <= 0 || pEdict->m_EdictIndex >= MAX_EDICTS ||
-			preventTransmit.Get(pEdict->m_EdictIndex))
-			return false;
+			(pEdict->m_fStateFlags & FL_EDICT_DONTSEND) || preventTransmit.Get(pEdict->m_EdictIndex))
+			return;
 
+		// Like in the engine, this also sends the move parent, so the owner comes along with its viewmodel.
 		pEntity->SetTransmit(pInfo, true);
-		return true;
+	};
+	const auto TransmitAttachmentsOf = [&](CBaseEntity* pOwner) {
+		if (bBindViewModels)
+		{
+			for (int i = 0; i < MAX_VIEWMODELS; ++i)
+				TransmitAttachment(GetViewModel(pOwner, i));
+		}
+
+		if (bBindHands)
+			TransmitAttachment(GetGMODPlayerHands(pOwner));
 	};
 
-	if (TransmitIfAllowed(pObserverTarget))
+	if (pInfo->m_pTransmitAlways) // HLTV gets them like everything else, it doesn't cull by PVS.
 	{
-		// Bound attachments are excluded from ordinary entity checks. The target
-		// may already be marked, so its SetTransmit hook alone cannot add them.
-		// Keep the real recipient: spectators must not gain owner-only inventory.
-		CBasePlayer* pObserverPlayer = static_cast<CBasePlayer*>(pObserverTarget);
-		for (int i = 0; i < MAX_VIEWMODELS; ++i)
-			TransmitIfAllowed(GetViewModel(pObserverPlayer, i));
-		TransmitIfAllowed(GetGMODPlayerHands(pObserverPlayer));
+		for (int iPlayerIndex = 1; iPlayerIndex <= gpGlobals->maxClients; ++iPlayerIndex)
+		{
+			if (g_pEntityCache[iPlayerIndex])
+				TransmitAttachmentsOf(g_pEntityCache[iPlayerIndex]);
+		}
+		return;
 	}
 
-	// SetTransmit can recursively add a prevented attachment or parent. Filter
-	// after all recipient additions and full updates, before the packing union.
-	CBitVec_AndNot(pInfo->m_pTransmitEdict, &preventTransmit);
+	if (GetObserverMode(pRecipientPlayer) != OBS_MODE_IN_EYE)
+		return;
+
+	CBaseEntity* pTarget = GetObserverTarget(pRecipientPlayer);
+	edict_t* pTargetEdict = pTarget ? pTarget->edict() : nullptr;
+	if (!pTargetEdict || pTarget == pRecipientPlayer || !pTarget->IsPlayer())
+		return;
+
+	// A target hidden from this spectator must not come back as the move parent of its attachments.
+	if (preventTransmit.Get(pTargetEdict->m_EdictIndex))
+		return;
+
+	TransmitAttachmentsOf(pTarget);
 }
 
 static ConVar networking_fastpath("holylib_networking_fastpath", "0", 0, "Experimental - Reuse BSP headnode visibility queries for identical PVS data within a tick; all recipient transmit decisions still run");
@@ -1717,7 +1751,7 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 		}
 	}
 
-	TransmitInEyeObserver(pRecipientPlayer, pInfo, clientIndex);
+	TransmitBoundAttachmentsToViewers(pRecipientPlayer, pInfo, clientIndex);
 	pInfo->m_pTransmitEdict->Or(g_pGlobalTransmitTickCache.g_bWasSeenByPlayer, &g_pGlobalTransmitTickCache.g_bWasSeenByPlayer);
 
 	return true;

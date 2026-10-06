@@ -97,20 +97,20 @@ struct CBaseEntity
 	bool player = false, evenOnly = false;
 	bool hasEdict = true;
 	int observerMode = OBS_MODE_NONE;
+	int othersTransmit = FL_EDICT_DONTSEND; // A player's ShouldTransmit result for everyone but itself.
 	int skybox = 3;
 	CBaseEntity() { entry.entity = this; entry.property = &property; property.owner = &entry; }
 	edict_t* edict() { return hasEdict ? &entry : nullptr; }
 	bool IsPlayer() const { return player; }
-	int GetObserverMode() const { return observerMode; }
-	CBaseEntity* GetObserverTarget() const { return observerTarget; }
+	// No GetObserverMode()/GetObserverTarget() members: production must read the networked fields instead of
+	// calling CBasePlayer virtuals, and calling them would no longer compile here.
 	const Vector& EyePosition() const { return collision.position; }
 	int ShouldTransmit(CCheckTransmitInfo* info)
 	{
 		++shouldTransmitCalls;
 		const int recipient = info->m_pClientEnt->m_EdictIndex;
 		if (player)
-			return recipient == entry.m_EdictIndex || info->m_pClientEnt->entity->observerTarget == this
-				? FL_EDICT_ALWAYS : FL_EDICT_DONTSEND;
+			return recipient == entry.m_EdictIndex ? FL_EDICT_ALWAYS : othersTransmit;
 		if (evenOnly && recipient % 2 != 0)
 			return FL_EDICT_DONTSEND;
 		return FL_EDICT_PVSCHECK;
@@ -132,6 +132,8 @@ static CBaseEntity* GetGMODPlayerHands(const CBaseEntity* player) { return playe
 static CBaseViewModel* GetViewModel(const CBaseEntity* player, int slot) { return player->viewmodels[slot]; }
 static CBaseEntity* GetMyWeapon(const CBaseEntity* player, int slot) { return player->weapons[slot]; }
 static CBaseEntity* GetActiveWeapon(const CBaseEntity* player) { return player->activeWeapon; }
+static int GetObserverMode(const CBaseEntity* player) { return player->observerMode; }
+static CBaseEntity* GetObserverTarget(const CBaseEntity* player) { return player->observerTarget; }
 static void BaseCharacterTransmit(CBaseCombatCharacter* character, CCheckTransmitInfo* info, bool always)
 {
 	character->BaseSetTransmit(info, always);
@@ -283,7 +285,7 @@ static Result Run(bool fast, int tick, bool areaSplit)
 		assert(g_nTransmitRange == -1.0f);
 		assert(transmit.Get(recipient) && transmit.Get(500 + recipient) && transmit.Get(700 + recipient));
 		assert(transmit.Get(900 + recipient));
-		assert(transmit.Get(501) == (recipient == 1));
+		assert(transmit.Get(501) == (recipient == 1 || recipient % 19 == 0)); // Owner and HLTV only.
 		if (recipient % 3 == 0)
 			assert(!transmit.Get(301));
 		if (recipient % 2 != 0)
@@ -339,14 +341,21 @@ static void ResetObserverWorld(bool fast)
 	for (int i = 1; i <= 3; ++i)
 	{
 		entities[i].player = true;
+		entities[i].othersTransmit = FL_EDICT_PVSCHECK;
 		g_pEntityCache[i] = &entities[i];
 		g_nEntityTransmitCache.pFullEntityList[++g_nEntityTransmitCache.nFullEdictCount] = &entities[i];
 	}
 	for (int owner : {1, 3})
 	{
+		// Engine hierarchy: viewmodels follow their owner and the hands follow the first viewmodel, so
+		// SetTransmit on an attachment also sends its move parents.
 		for (int slot = 0; slot < MAX_VIEWMODELS; ++slot)
+		{
 			entities[owner].viewmodels[slot] = &entities[500 + owner * 10 + slot];
+			entities[500 + owner * 10 + slot].transmitDependency = &entities[owner];
+		}
 		entities[owner].hands = &entities[600 + owner];
+		entities[600 + owner].transmitDependency = entities[owner].viewmodels[0];
 		entities[owner].weapons[0] = &entities[700 + owner * 10];
 		entities[owner].weapons[1] = &entities[701 + owner * 10];
 		entities[owner].activeWeapon = entities[owner].weapons[0];
@@ -362,6 +371,19 @@ static void ResetObserverWorld(bool fast)
 	// out of the ordinary PVS loop.
 	for (int i : {510, 511, 512, 601, 710, 711, 530, 531, 532, 603, 730, 731, 300})
 		g_nEntityTransmitCache.pPVSEntityList[++g_nEntityTransmitCache.nPVSEdictCount] = &entities[i];
+}
+
+// UpdateEntities never lists FL_EDICT_DONTSEND edicts for the ordinary checks.
+static void RemoveFromPVSList(int index)
+{
+	auto& cache = g_nEntityTransmitCache;
+	int kept = -1;
+	for (int i = 0; i <= cache.nPVSEdictCount; ++i)
+	{
+		if (cache.pPVSEntityList[i] != &entities[index])
+			cache.pPVSEntityList[++kept] = cache.pPVSEntityList[i];
+	}
+	cache.nPVSEdictCount = kept;
 }
 
 static CBitVec<MAX_EDICTS> ObserverTransmit(int recipient, bool preMarked = false, bool hltv = false)
@@ -412,31 +434,71 @@ static bool CheckObserverAttachments()
 			}
 		}
 
-		// Explicitly prevented attachments must stay absent, even when another
-		// attachment's SetTransmit recursively adds their bits.
-		for (int blocked : {510, 601, 1})
+		// A prevented attachment is never forced, and a prevented target keeps all of its attachments back so
+		// that it can't return as their move parent.
+		for (int blocked : {511, 601, 1})
 		{
 			ResetObserverWorld(fast);
 			g_pShouldPrevent[1].Set(blocked);
-			if (blocked == 510)
-				entities[601].transmitDependency = &entities[510];
-			if (blocked == 601)
-				entities[510].transmitDependency = &entities[601];
-			if (blocked == 1)
-				g_pPlayerTransmitCache[1].full = true; // Full-update bits also obey the final mask.
 			const auto spectator = ObserverTransmit(2);
-			assert(!spectator.Get(blocked));
-			assert(!g_pGlobalTransmitTickCache.g_bWasSeenByPlayer.Get(blocked));
+			assert(!spectator.Get(blocked) && !g_pGlobalTransmitTickCache.g_bWasSeenByPlayer.Get(blocked));
 			assert(!spectator.Get(711));
 			if (blocked == 1)
-				assert(!spectator.Get(510) && !spectator.Get(601));
+				assert(!spectator.Get(510) && !spectator.Get(511) && !spectator.Get(512) && !spectator.Get(601));
 			else
-				assert(spectator.Get(blocked == 510 ? 601 : 510));
+				assert(spectator.Get(1) && spectator.Get(510) && spectator.Get(blocked == 511 ? 601 : 511));
 		}
 
-		// Chase/free observers, absent or non-player targets, and HLTV do not
-		// receive the in-eye-only additions.
-		for (int scenario = 0; scenario < 6; ++scenario)
+		// There is no spectator-only prevent mask. A prevented parent pulled in by a visible child, and
+		// full-update player bits, arrive exactly as they do for a recipient that isn't spectating.
+		ResetObserverWorld(fast);
+		entities[300].transmitDependency = &entities[450];
+		g_pShouldPrevent[1].Set(450);
+		g_pShouldPrevent[2].Set(450);
+		const auto inEyeChild = ObserverTransmit(2);
+		const auto playingChild = ObserverTransmit(3);
+		assert(inEyeChild.Get(300) && inEyeChild.Get(450) && playingChild.Get(300) && playingChild.Get(450));
+		bool fullUpdate[2] = {};
+		for (int mode : {OBS_MODE_NONE, OBS_MODE_IN_EYE})
+		{
+			ResetObserverWorld(fast);
+			entities[2].observerMode = mode;
+			g_pShouldPrevent[1].Set(3);
+			g_pPlayerTransmitCache[1].full = true;
+			fullUpdate[mode == OBS_MODE_IN_EYE] = ObserverTransmit(2).Get(3);
+		}
+		assert(fullUpdate[0] == fullUpdate[1]);
+
+		// A target hidden by its own ShouldTransmit (EF_NODRAW) still arrives as the move parent of a visible
+		// viewmodel, as in the engine. Nothing forces it when all of its attachments are DONTSEND.
+		ResetObserverWorld(fast);
+		entities[1].othersTransmit = FL_EDICT_DONTSEND;
+		const auto hiddenTarget = ObserverTransmit(2);
+		assert(hiddenTarget.Get(1) && hiddenTarget.Get(510) && hiddenTarget.Get(601));
+		ResetObserverWorld(fast);
+		entities[1].othersTransmit = FL_EDICT_DONTSEND;
+		for (int i : {510, 511, 512, 601})
+			entities[i].entry.m_fStateFlags = FL_EDICT_DONTSEND;
+		const auto hiddenAll = ObserverTransmit(2);
+		assert(!hiddenAll.Get(1) && !hiddenAll.Get(510) && !hiddenAll.Get(511) && !hiddenAll.Get(512));
+		assert(!hiddenAll.Get(601));
+
+		// DONTSEND attachments, like unused viewmodel slots, are not forced to a spectator.
+		ResetObserverWorld(fast);
+		entities[512].entry.m_fStateFlags = FL_EDICT_DONTSEND;
+		const auto unusedSlot = ObserverTransmit(2);
+		assert(unusedSlot.Get(510) && unusedSlot.Get(511) && unusedSlot.Get(601) && !unusedSlot.Get(512));
+
+		// Without binding, attachments keep their ordinary checks and nothing is forced.
+		ResetObserverWorld(fast);
+		networking_bind_viewmodels_to_player.value = false;
+		networking_bind_gmodhands_to_player.value = false;
+		entities[511].entry.m_fStateFlags = FL_EDICT_DONTSEND;
+		RemoveFromPVSList(511);
+		assert(!ObserverTransmit(2).Get(511));
+
+		// Chase/free observers and absent, non-player or edict-less targets don't receive the in-eye additions.
+		for (int scenario = 0; scenario < 5; ++scenario)
 		{
 			ResetObserverWorld(fast);
 			if (scenario == 0) entities[2].observerMode = OBS_MODE_CHASE;
@@ -444,9 +506,16 @@ static bool CheckObserverAttachments()
 			if (scenario == 2) entities[2].observerTarget = nullptr;
 			if (scenario == 3) entities[2].observerTarget = &entities[400];
 			if (scenario == 4) entities[1].hasEdict = false;
-			const auto spectator = ObserverTransmit(2, false, scenario == 5);
+			const auto spectator = ObserverTransmit(2);
 			assert(!spectator.Get(510) && !spectator.Get(601) && !spectator.Get(711));
 		}
+
+		// HLTV receives every player's visible bound attachments, as the engine's PVS rule for HLTV does, but
+		// no owner-only weapons.
+		ResetObserverWorld(fast);
+		const auto hltv = ObserverTransmit(2, false, true);
+		assert(hltv.Get(1) && hltv.Get(510) && hltv.Get(601) && hltv.Get(3) && hltv.Get(530) && hltv.Get(603));
+		assert(!hltv.Get(711) && !hltv.Get(731));
 
 		ResetObserverWorld(fast);
 		const auto first = ObserverTransmit(2);
@@ -459,8 +528,9 @@ static bool CheckObserverAttachments()
 		const auto cleared = ObserverTransmit(2);
 		assert(!cleared.Get(510) && !cleared.Get(530) && !cleared.Get(601) && !cleared.Get(603));
 	}
-	std::cout << "In-eye observer: production character hook and attachment exclusion, both cache settings, "
-		"source orders, premarked targets, inventory privacy, prevent masks and target changes passed\n";
+	std::cout << "Bound attachments for in-eye spectators and HLTV: production character hook and attachment "
+		"exclusion, both cache settings, source orders, premarked and hidden targets, inventory privacy, "
+		"prevent rules, DONTSEND attachments, unbound attachments and target changes passed\n";
 	return true;
 }
 
@@ -472,6 +542,7 @@ int main()
 	{
 		entities[i].player = true;
 		entities[i].viewmodels[0] = &entities[500 + i];
+		entities[500 + i].transmitDependency = &entities[i]; // Viewmodels follow their owner.
 		entities[i].weapons[0] = &entities[700 + i];
 		entities[i].activeWeapon = entities[i].weapons[0];
 		g_pEntityCache[i] = &entities[i];
