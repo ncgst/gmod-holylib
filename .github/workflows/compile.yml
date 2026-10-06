@@ -45,6 +45,18 @@ jobs:
       - name: Check borrowed VProf node ownership under sanitizers
         run: python3 tests/vprof_node_ownership_tests.py
 
+  networking_fastpath_tests:
+    name: "Networking fastpath regressions"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Exercise bounded PVS caching under sanitizers
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined -Isource tests/networking_pvs_cache_tests.cpp -o /tmp/networking_pvs_cache_tests
+          /tmp/networking_pvs_cache_tests
+      - name: Compare production transmit decisions for 120 recipients
+        run: python3 tests/networking_fastpath_integration_tests.py --sanitize
+
   teleport_guard_tests:
     name: "Teleport recursion guard tests"
     runs-on: ubuntu-latest
