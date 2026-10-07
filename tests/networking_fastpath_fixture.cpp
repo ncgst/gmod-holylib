@@ -15,6 +15,7 @@ constexpr int MAX_PLAYERS = 128, MAX_EDICTS = 1024, MAX_MAP_AREAS = 4;
 constexpr int MAX_VIEWMODELS = 3, MAX_WEAPONS = 4;
 constexpr int OBS_MODE_NONE = 0, OBS_MODE_IN_EYE = 4, OBS_MODE_CHASE = 5;
 constexpr int FL_EDICT_FULLCHECK = 0, FL_EDICT_ALWAYS = 8, FL_EDICT_DONTSEND = 16, FL_EDICT_PVSCHECK = 32;
+constexpr int FL_EDICT_DIRTY_PVS_INFORMATION = 128;
 #define PROJECT_NAME "fixture"
 #define Warning(...) ((void)0)
 #define DevMsg(...) ((void)0)
@@ -76,9 +77,14 @@ struct CCServerNetworkProperty
 	PVSInfo m_PVSInfo;
 	edict_t* owner = nullptr;
 	CCServerNetworkProperty* parent = nullptr;
-	int AreaNum() const { return m_PVSInfo.m_nAreaNum; }
+	// Like the engine: AreaNum() brings dirty PVS data up to date, which clears the dirty flag.
+	int AreaNum() { RecomputePVSInformation(); return m_PVSInfo.m_nAreaNum; }
 	edict_t* edict() { return owner; }
-	void RecomputePVSInformation() {}
+	void RecomputePVSInformation()
+	{
+		if (owner)
+			owner->m_fStateFlags &= ~FL_EDICT_DIRTY_PVS_INFORMATION;
+	}
 	template <typename HeadnodeQuery>
 	bool IsInPVS(const CCheckTransmitInfo* pInfo, HeadnodeQuery&& headnodeQuery);
 };
@@ -197,7 +203,7 @@ static ConVar networking_fastcharactertransmit{true};
 static ConVar networking_bind_gmodhands_to_player{true}, networking_bind_viewmodels_to_player{true};
 static ConVar networking_transmit_all_weapons{true}, networking_transmit_all_weapons_to_owner{true};
 static ConVar networking_transmit_one_per_tick, networking_transmit_newweapons{true};
-static ConVar networking_transmit_profile, networking_transmit_weaponlist{true};
+static ConVar networking_transmit_profile, networking_transmit_weaponlist{true}, networking_pvssnapshot;
 static ConVar forceTransmit;
 static ConVar* sv_force_transmit_ents = &forceTransmit;
 static bool fillWeaponLists = false; // Whether NextTick builds the per-tick weapon list as production does.
@@ -291,6 +297,8 @@ static Result Run(bool fast, int tick, bool areaSplit)
 	networking_fastpath.value = fast;
 	networking_areasplit.value = areaSplit;
 	shouldTransmitCalls = engine->headnodeCalls = 0;
+	entities[320].property.m_PVSInfo.m_nHeadNode = 20; // Moved during the previous run.
+	entities[325].property.m_PVSInfo.m_nHeadNode = 25;
 	Result result;
 	for (int recipient = 1; recipient <= 120; ++recipient)
 	{
@@ -300,7 +308,22 @@ static Result Run(bool fast, int tick, bool areaSplit)
 		entities[recipient].collision.position.x = recipient % 2 == 0 ? 0.0f : 100.0f;
 		entities[recipient].view = recipient % 7 == 0 ? &entities[1] : nullptr;
 		entities[recipient].skybox = recipient % 11 == 0 ? 2 : 3;
+		// Moving an entity changes its PVS data and marks it dirty, as the engine does.
 		entities[310].property.m_PVSInfo.m_nHeadNode = recipient % 2 == 0 ? 1 : 0;
+		entities[310].entry.m_fStateFlags |= FL_EDICT_DIRTY_PVS_INFORMATION;
+		if (recipient == 61)
+		{
+			// 320, the parent of 305, moves. 305 comes first and isn't visible to 61, so its parent walk recomputes
+			// 320 and clears the dirty flag before 320's own check; that check must still use the new data.
+			entities[320].property.m_PVSInfo.m_nHeadNode = 7;
+			entities[320].entry.m_fStateFlags |= FL_EDICT_DIRTY_PVS_INFORMATION;
+		}
+		if (recipient == 62)
+		{
+			// 325 moves; its own check recomputes it, later recipients must keep using the new data.
+			entities[325].property.m_PVSInfo.m_nHeadNode = 7;
+			entities[325].entry.m_fStateFlags |= FL_EDICT_DIRTY_PVS_INFORMATION;
+		}
 		g_pPlayerTransmitCache[recipient - 1].full = recipient % 17 == 0;
 		g_pShouldPrevent[recipient - 1].ClearAll();
 		if (recipient % 3 == 0)
@@ -657,6 +680,7 @@ int main()
 	}
 	// Parent visibility and ordinary cluster checks use the same production path.
 	entities[331].property.parent = &entities[300].property;
+	entities[305].property.parent = &entities[320].property; // A parent later in the PVS list.
 	unsigned short clusters[] = {1, 2};
 	entities[330].property.m_PVSInfo.m_nClusterCount = 2;
 	entities[330].property.m_PVSInfo.m_pClusters = clusters;
@@ -708,6 +732,21 @@ int main()
 		fillWeaponLists = false;
 		assert(unlisted.bits == baseline.bits && unlisted.always == baseline.always && unlisted.packed == baseline.packed);
 		assert(g_pTransmitProfile.nCharacterListCalls == 0 && g_pTransmitProfile.nCharacterSlotScans > 0);
+
+		// The PVS snapshot must make the same decisions in the same order, including the headnode queries.
+		networking_pvssnapshot.value = true;
+		const Result snapshot = Run(false, 14, split);
+		const Result snapshotCached = Run(true, 15, split);
+		networking_pvssnapshot.value = false;
+		assert(snapshot.bits == baseline.bits && snapshot.always == baseline.always && snapshot.packed == baseline.packed);
+		assert(snapshot.callbacks == baseline.callbacks && snapshot.queries == baseline.queries);
+		assert(snapshotCached.bits == baseline.bits && snapshotCached.always == baseline.always);
+		assert(snapshotCached.packed == baseline.packed && snapshotCached.queries == cached.queries);
+		assert(g_pPVSSnapshot.IsValid(15) == !split);
+		if (!split)
+			assert(g_pPVSSnapshot.pStale.Get(310) && g_pPVSSnapshot.pStale.Get(320) && g_pPVSSnapshot.pStale.Get(325) &&
+				!g_pPVSSnapshot.pStale.Get(300));
+		std::cout << "PVS snapshot, areaSplit=" << split << ": 120 recipients matched, moved entities checked live\n";
 	}
 
 	// The cheap cluster branch must not pay for a PVS hash or context copy.

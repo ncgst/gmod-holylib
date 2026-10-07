@@ -2303,6 +2303,11 @@ If enabled, the weapons of each player are collected once per tick, and every pl
 If disabled, all weapon slots of a player are checked again for every player that receives them.<br>
 Both send the same weapons, the setting only exists to compare them or to fall back without a restart.<br>
 
+#### holylib_networking_pvssnapshot(default `0`)
+Experimental. If enabled, the PVS data (areas, clusters, headnode) of all PVS checked entities is copied once per tick, and every player is checked against that copy.<br>
+Most entities aren't visible to a given player, and this avoids reading each of their entity objects once per player. The entity itself is still used to send it and to check its parents.<br>
+Entities whose PVS data changes during the transmit are checked directly, as before. The copy isn't used for SourceTV, for players with a transmit range (`pvs.SetMaxViewDistance`) or with `holylib_networking_areasplit`.<br>
+
 #### holylib_networking_transmit_profile(default `0`)
 If enabled, our `CServerGameEnts::CheckTransmit` is timed by phase. Use `holylib_networking_transmit_stats` to read the result.<br>
 

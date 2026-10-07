@@ -24,7 +24,7 @@ def main():
     bodies = {
         "GLOBAL_CACHE": between(net, "using TransmitPVSCache =", "\n#if 0 // Would be needed"),
         "IS_IN_PVS": between(net, "static inline bool IsInPVS(", "\nstatic vec_t g_nTransmitRange"),
-        "DO_TRANSMIT": between(net, "static inline void DoTransmitPVSCheck(", "\nstatic ConVar networking_fastpath("),
+        "DO_TRANSMIT": between(net, "// Per-tick copy of the PVS data of every entity in the PVS list", "\nstatic ConVar networking_fastpath("),
         "CHECK_TRANSMIT": between(net, "bool New_CServerGameEnts_CheckTransmit(", "\nvoid SV_FillHLTVData("),
         "TRANSMIT_PROFILE": between(net, "// Transmit profiling: timings are summed", "// End of transmit profiling"),
         "CHARACTER_TRANSMIT": between(net, "static void hook_CBaseCombatCharacter_SetTransmit(", "\nstatic inline bool IsInPVS("),

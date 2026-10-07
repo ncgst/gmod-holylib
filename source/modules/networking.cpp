@@ -1283,6 +1283,7 @@ static ConVar networking_transmit_one_per_tick("holylib_networking_transmit_one_
 static ConVar networking_fasttransmit("holylib_networking_fasttransmit", "1", 0, "Replaces CServerGameEnts::CheckTransmit with our own implementation");
 static ConVar networking_transmit_profile("holylib_networking_transmit_profile", "0", 0, "If enabled, time our CheckTransmit by phase; read the result with holylib_networking_transmit_stats");
 static ConVar networking_transmit_weaponlist("holylib_networking_transmit_weaponlist", "1", 0, "If enabled, a player's weapons are sent from a list built once per tick instead of checking every weapon slot for every recipient");
+static ConVar networking_pvssnapshot("holylib_networking_pvssnapshot", "0", 0, "Experimental - Copy the PVS data of all PVS checked entities once per tick and check every recipient against that copy");
 
 // Transmit profiling: timings are summed over all recipient passes since the last reset.
 struct TransmitProfile
@@ -1510,59 +1511,116 @@ void Networking_SetNextTransmitRange(vec_t nRange)
 	g_nTransmitRange = nRange;
 }
 
-// Very expensive!
-static inline void DoTransmitPVSCheck(
-	edict_t* pEdict, CBaseEntity* pEnt, const bool bIsHLTV, CCheckTransmitInfo *pInfo,
-	const bool bForceTransmit, const int skyBoxArea, const Vector& clientPosition, const vec_t maxTransmitRange,
-	TransmitPVSQuery& pPVSQuery
-)
+// Per-tick copy of the PVS data of every entity in the PVS list (holylib_networking_pvssnapshot).
+// Most PVS checked entities aren't visible to a given recipient. Checking them against this contiguous copy
+// avoids touching every entity object once per recipient; the entity is only used to send it or walk its parents.
+// An entry is only used while the entity's PVS data is unchanged since Build(): a dirty entity, or one whose data
+// was recomputed during this tick's transmit (pStale), goes through DoTransmitPVSCheck like before.
+struct PVSSnapshot
 {
-	CCServerNetworkProperty *netProp = static_cast<CCServerNetworkProperty*>( pEdict->GetNetworkable() );
-	if ( !netProp )
+	static constexpr int nInlineClusters = 4;
+	enum : unsigned short
 	{
-		Warning(PROJECT_NAME " - networking: Somehow CCServerNetworkProperty was NULL!\n");
-		return;
-	}
+		FLAG_LIVE = 1 << 0, // No network property or an unusual area: always use DoTransmitPVSCheck.
+		FLAG_HAS_PARENT = 1 << 1,
+	};
 
-	if ( bIsHLTV )
+	struct Entry
 	{
-		// for the HLTV/Replay we don't cull against PVS
-		pEnt->SetTransmit( pInfo, netProp->AreaNum() == skyBoxArea );
-		return;
-	}
+		edict_t* pEdict;
+		short nAreaNum;
+		short nAreaNum2;
+		short nClusterCount; // Negative: use the headnode.
+		short nHeadNode;
+		unsigned short nEdict;
+		unsigned short nFlags;
+		unsigned short pClusters[nInlineClusters];
+	};
 
-	// Always send entities in the player's 3d skybox.
-	// Sidenote: call of AreaNum() ensures that PVS data is up to date for this entity
-	const bool bSameAreaAsSky = netProp->AreaNum() == skyBoxArea;
-	if ( bSameAreaAsSky )
+	void Build(int nTick)
 	{
-		pEnt->SetTransmit( pInfo, true );
-		return;
-	}
-
-	// Check if we have a range set and if so skip transmit
-	if (maxTransmitRange != -1.0f)
-	{
-		CCollisionProperty* pCollision = GetEntityCollisionProperty(pEnt);
-		if (pCollision)
+		nCount = 0;
+		pStale.ClearAll();
+		const EntityTransmitCache& pCache = g_nEntityTransmitCache;
+		for (int i=0; i<=pCache.nPVSEdictCount; ++i)
 		{
-			const vec_t dist = pCollision->WorldSpaceCenter().DistTo(clientPosition);
-			float radius = pCollision->BoundingRadius();
-			if ((dist - radius) > maxTransmitRange)
-				return;
+			CBaseEntity* pEnt = pCache.pPVSEntityList[i];
+			edict_t* pEdict = pEnt ? pEnt->edict() : nullptr;
+			if (!pEdict) // Skipped by the PVS loop as well.
+				continue;
+
+			const int nIndex = nCount++;
+			Entry& pEntry = pEntries[nIndex];
+			pEntry.pEdict = pEdict;
+			pEntry.nEdict = static_cast<unsigned short>(pEdict->m_EdictIndex);
+			pEntry.nFlags = 0;
+			pEntity[nIndex] = pEnt;
+
+			CCServerNetworkProperty* pNetProp = static_cast<CCServerNetworkProperty*>(pEdict->GetNetworkable());
+			pNetworkProperty[nIndex] = pNetProp;
+			if (!pNetProp)
+			{
+				pEntry.nFlags = FLAG_LIVE;
+				continue;
+			}
+
+			pNetProp->RecomputePVSInformation();
+			const auto& pInfo = pNetProp->m_PVSInfo;
+			pEntry.nAreaNum = static_cast<short>(pInfo.m_nAreaNum);
+			pEntry.nAreaNum2 = static_cast<short>(pInfo.m_nAreaNum2);
+			pEntry.nClusterCount = static_cast<short>(pInfo.m_nClusterCount);
+			pEntry.nHeadNode = static_cast<short>(pInfo.m_nHeadNode);
+			pClusterList[nIndex] = pInfo.m_pClusters;
+			if (pEntry.nClusterCount > 0 && pEntry.nClusterCount <= nInlineClusters)
+			{
+				for (int nCluster=0; nCluster<pEntry.nClusterCount; ++nCluster)
+					pEntry.pClusters[nCluster] = pInfo.m_pClusters[nCluster];
+			}
+
+			if (pEntry.nAreaNum < 0 || pEntry.nAreaNum >= MAX_MAP_AREAS || pEntry.nAreaNum2 < 0 || pEntry.nAreaNum2 >= MAX_MAP_AREAS)
+				pEntry.nFlags |= FLAG_LIVE;
+
+			if (GetNetworkParentSafe(pNetProp))
+				pEntry.nFlags |= FLAG_HAS_PARENT;
 		}
+
+		nBuildTick = nTick;
+		bValid = true;
 	}
 
-	const bool bInPVS = IsInPVS(netProp, pInfo, pPVSQuery);
-	if ( bInPVS || bForceTransmit )
+	inline bool IsValid(int nTick) const
 	{
-		// only send if entity is in PVS
-		pEnt->SetTransmit( pInfo, false );
-		return;
+		return bValid && nBuildTick == nTick;
 	}
 
-	// If the entity is marked "check PVS" but it's in hierarchy, walk up the hierarchy looking for the
-	//  for any parent which is also in the PVS.  If none are found, then we don't need to worry about sending ourself
+	inline void Invalidate()
+	{
+		bValid = false;
+	}
+
+	// Called before PVS data is recomputed during the transmit, so that the entry isn't used anymore.
+	inline void MarkStale(const edict_t* pEdict)
+	{
+		if ((pEdict->m_fStateFlags & FL_EDICT_DIRTY_PVS_INFORMATION) != 0)
+			pStale.Set(pEdict->m_EdictIndex);
+	}
+
+	bool bValid = false;
+	int nBuildTick = -1;
+	int nCount = 0;
+	CBitVec<MAX_EDICTS> pStale;
+	Entry pEntries[MAX_EDICTS];
+	// Only needed when an entity is sent, has parents or needs the live check.
+	CBaseEntity* pEntity[MAX_EDICTS];
+	CCServerNetworkProperty* pNetworkProperty[MAX_EDICTS];
+	const unsigned short* pClusterList[MAX_EDICTS];
+};
+static PVSSnapshot g_pPVSSnapshot;
+
+// If the entity is marked "check PVS" but it's in hierarchy, walk up the hierarchy looking for
+// any parent which is also in the PVS. If none are found, then we don't need to worry about sending ourself.
+static inline void TransmitIfParentVisible(CCServerNetworkProperty* netProp, CBaseEntity* pEnt, CCheckTransmitInfo *pInfo, TransmitPVSQuery& pPVSQuery)
+{
 	CCServerNetworkProperty *check = GetNetworkParentSafe(netProp);
 
 	// BUG BUG:  I think it might be better to build up a list of edict indices which "depend" on other answers and then
@@ -1624,6 +1682,7 @@ static inline void DoTransmitPVSCheck(
 		if ( checkFlags & FL_EDICT_PVSCHECK )
 		{
 			// Check pvs
+			g_pPVSSnapshot.MarkStale(checkEdict);
 			check->RecomputePVSInformation();
 			const bool bMoveParentInPVS = IsInPVS(check, pInfo, pPVSQuery);
 			if ( bMoveParentInPVS )
@@ -1635,6 +1694,144 @@ static inline void DoTransmitPVSCheck(
 
 		// Continue up chain just in case the parent itself has a parent that's in the PVS...
 		check = GetNetworkParentSafe(check);
+	}
+}
+
+// Very expensive!
+static inline void DoTransmitPVSCheck(
+	edict_t* pEdict, CBaseEntity* pEnt, const bool bIsHLTV, CCheckTransmitInfo *pInfo,
+	const bool bForceTransmit, const int skyBoxArea, const Vector& clientPosition, const vec_t maxTransmitRange,
+	TransmitPVSQuery& pPVSQuery
+)
+{
+	CCServerNetworkProperty *netProp = static_cast<CCServerNetworkProperty*>( pEdict->GetNetworkable() );
+	if ( !netProp )
+	{
+		Warning(PROJECT_NAME " - networking: Somehow CCServerNetworkProperty was NULL!\n");
+		return;
+	}
+
+	g_pPVSSnapshot.MarkStale(pEdict); // AreaNum() below recomputes dirty PVS data.
+
+	if ( bIsHLTV )
+	{
+		// for the HLTV/Replay we don't cull against PVS
+		pEnt->SetTransmit( pInfo, netProp->AreaNum() == skyBoxArea );
+		return;
+	}
+
+	// Always send entities in the player's 3d skybox.
+	// Sidenote: call of AreaNum() ensures that PVS data is up to date for this entity
+	const bool bSameAreaAsSky = netProp->AreaNum() == skyBoxArea;
+	if ( bSameAreaAsSky )
+	{
+		pEnt->SetTransmit( pInfo, true );
+		return;
+	}
+
+	// Check if we have a range set and if so skip transmit
+	if (maxTransmitRange != -1.0f)
+	{
+		CCollisionProperty* pCollision = GetEntityCollisionProperty(pEnt);
+		if (pCollision)
+		{
+			const vec_t dist = pCollision->WorldSpaceCenter().DistTo(clientPosition);
+			float radius = pCollision->BoundingRadius();
+			if ((dist - radius) > maxTransmitRange)
+				return;
+		}
+	}
+
+	const bool bInPVS = IsInPVS(netProp, pInfo, pPVSQuery);
+	if ( bInPVS || bForceTransmit )
+	{
+		// only send if entity is in PVS
+		pEnt->SetTransmit( pInfo, false );
+		return;
+	}
+
+	TransmitIfParentVisible(netProp, pEnt, pInfo, pPVSQuery);
+}
+
+// The PVS entity loop of CheckTransmit using g_pPVSSnapshot, for a recipient that isn't HLTV and has no transmit range.
+// Makes the same decisions in the same order as DoTransmitPVSCheck over pPVSEntityList.
+static void TransmitPVSSnapshot(CCheckTransmitInfo *pInfo, const bool bForceTransmit, const int skyBoxArea,
+	const Vector& clientPosition, TransmitPVSQuery& pPVSQuery)
+{
+	// Whether an area is connected to one of the recipient's areas, filled in for the areas entities are in.
+	signed char pAreaConnected[MAX_MAP_AREAS];
+	memset(pAreaConnected, -1, sizeof(pAreaConnected));
+	const auto IsAreaConnected = [pInfo, &pAreaConnected](int nArea) {
+		signed char& nState = pAreaConnected[nArea];
+		if (nState < 0)
+		{
+			nState = 0;
+			for (int i=0; i<pInfo->m_AreasNetworked; ++i)
+			{
+				const int clientArea = pInfo->m_Areas[i];
+				if (clientArea == nArea || CheckAreasConnected(clientArea, nArea))
+				{
+					nState = 1;
+					break;
+				}
+			}
+		}
+
+		return nState != 0;
+	};
+
+	const PVSSnapshot& pSnapshot = g_pPVSSnapshot;
+	for (int i=0; i<pSnapshot.nCount; ++i)
+	{
+		const PVSSnapshot::Entry& pEntry = pSnapshot.pEntries[i];
+		const int iEdict = pEntry.nEdict;
+		if (pInfo->m_pTransmitEdict->Get(iEdict) || g_pDontTransmitCache.Get(iEdict))
+			continue;
+
+		CBaseEntity* pEnt = pSnapshot.pEntity[i];
+		if ((pEntry.nFlags & PVSSnapshot::FLAG_LIVE) || (pEntry.pEdict->m_fStateFlags & FL_EDICT_DIRTY_PVS_INFORMATION) || pSnapshot.pStale.Get(iEdict))
+		{
+			DoTransmitPVSCheck(pEntry.pEdict, pEnt, false, pInfo, bForceTransmit, skyBoxArea, clientPosition, -1.0f, pPVSQuery);
+			continue;
+		}
+
+		// Always send entities in the player's 3d skybox.
+		if (pEntry.nAreaNum == skyBoxArea)
+		{
+			pEnt->SetTransmit(pInfo, true);
+			continue;
+		}
+
+		// CCServerNetworkProperty::IsInPVS
+		bool bInPVS = false;
+		if (IsAreaConnected(pEntry.nAreaNum) || (pEntry.nAreaNum2 != 0 && IsAreaConnected(pEntry.nAreaNum2)))
+		{
+			if (pEntry.nClusterCount < 0)
+			{
+				bInPVS = pPVSQuery.CheckHeadnode(pInfo, pEntry.nHeadNode);
+			} else {
+				const unsigned short* pClusters = pEntry.nClusterCount <= PVSSnapshot::nInlineClusters ? pEntry.pClusters : pSnapshot.pClusterList[i];
+				const unsigned char* pPVS = pInfo->m_PVS;
+				for (int nCluster = pEntry.nClusterCount; --nCluster >= 0; )
+				{
+					const int nClusterIndex = pClusters[nCluster];
+					if (((int)(pPVS[nClusterIndex >> 3])) & BitVec_BitInByte(nClusterIndex))
+					{
+						bInPVS = true;
+						break;
+					}
+				}
+			}
+		}
+
+		if (bInPVS || bForceTransmit)
+		{
+			pEnt->SetTransmit(pInfo, false);
+			continue;
+		}
+
+		if (pEntry.nFlags & PVSSnapshot::FLAG_HAS_PARENT)
+			TransmitIfParentVisible(pSnapshot.pNetworkProperty[i], pEnt, pInfo, pPVSQuery);
 	}
 }
 
@@ -1801,6 +1998,11 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 
 		g_nEntityTransmitCache.UpdateEntities(pEdictIndices, nEdicts);
 		g_pGlobalTransmitTickCache.NewTick(nCurrentTick);
+
+		if (networking_pvssnapshot.GetBool() && !networking_areasplit.GetBool())
+			g_pPVSSnapshot.Build(nCurrentTick);
+		else
+			g_pPVSSnapshot.Invalidate();
 	}
 
 	const double fProfileTick = bProfile ? TransmitProfileNow() : 0.0;
@@ -1885,22 +2087,27 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 		}
 	}
 
-	for (int i=0; i<=g_nEntityTransmitCache.nPVSEdictCount; ++i)
+	if (g_pPVSSnapshot.IsValid(nCurrentTick) && !bIsHLTV && maxTransmitRange == -1.0f && !networking_areasplit.GetBool())
 	{
-		CBaseEntity* pEnt = g_nEntityTransmitCache.pPVSEntityList[i];
+		TransmitPVSSnapshot(pInfo, bForceTransmit, skyBoxArea, clientPosition, pPVSQuery);
+	} else {
+		for (int i=0; i<=g_nEntityTransmitCache.nPVSEdictCount; ++i)
+		{
+			CBaseEntity* pEnt = g_nEntityTransmitCache.pPVSEntityList[i];
 
-		// EntityRemoved() only runs off the entity listener. Keep the guard for the resolution-failure fallback,
-		// where an entity removed while we are still networking this tick can stay in the list.
-		edict_t* pEdict = pEnt ? pEnt->edict() : nullptr;
-		if (!pEdict)
-			continue;
+			// EntityRemoved() only runs off the entity listener. Keep the guard for the resolution-failure fallback,
+			// where an entity removed while we are still networking this tick can stay in the list.
+			edict_t* pEdict = pEnt ? pEnt->edict() : nullptr;
+			if (!pEdict)
+				continue;
 
-		const int iEdict = pEdict->m_EdictIndex;
-		if (pInfo->m_pTransmitEdict->Get(iEdict) || g_pDontTransmitCache.Get(iEdict))
-			continue;
+			const int iEdict = pEdict->m_EdictIndex;
+			if (pInfo->m_pTransmitEdict->Get(iEdict) || g_pDontTransmitCache.Get(iEdict))
+				continue;
 
-		// Now only PVS remains
-		DoTransmitPVSCheck(pEdict, pEnt, bIsHLTV, pInfo, bForceTransmit, skyBoxArea, clientPosition, maxTransmitRange, pPVSQuery);
+			// Now only PVS remains
+			DoTransmitPVSCheck(pEdict, pEnt, bIsHLTV, pInfo, bForceTransmit, skyBoxArea, clientPosition, maxTransmitRange, pPVSQuery);
+		}
 	}
 
 	const double fProfileFinish = bProfile ? TransmitProfileNow() : 0.0;
@@ -2142,6 +2349,8 @@ void CNetworkingModule::OnEntityDeleted(CBaseEntity* pEntity)
 	{
 		for (PlayerTransmitCache& pCache : g_pPlayerTransmitCache)
 			pCache.InvalidateWeaponList();
+
+		g_pPVSSnapshot.Invalidate(); // The PVS list itself just changed.
 	}
 }
 
