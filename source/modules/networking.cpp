@@ -12,6 +12,8 @@
 #include "eiface.h"
 #include "baseclient.h"
 #include <bitset>
+#include <chrono>
+#include <cstdint>
 #include <datacache/imdlcache.h>
 #include <cmodel_private.h>
 #include "server.h"
@@ -1079,11 +1081,15 @@ struct PlayerTransmitCache
 		} else {
 			nLastAcknowledgedTick = nTick - nTransmitTicks;
 		}
-		
+
+		nWeaponCount = 0;
 		for (int i=0; i<MAX_WEAPONS; ++i)
 		{
 			WeaponSlot& pSlot = pWeapons[i];
 			CBaseEntity *pWeapon = GetMyWeapon(pPlayer, i);
+			if (pWeapon)
+				pWeaponList[nWeaponCount++] = pWeapon;
+
 			if (pWeapon && pWeapon->edict())
 			{
 				if (!pSlot.bIsValid || pWeapon != pSlot.pWeapon)
@@ -1106,9 +1112,24 @@ struct PlayerTransmitCache
 			}
 		}
 
+		pWeaponListOwner = pPlayer;
+		nWeaponListTick = nTick;
+
 		// If you have less weapons, they will be transmitted more frequently
 		if (++nNextWeaponSlot >= nHighestWeaponSlot)
 			nNextWeaponSlot = 0;
+	}
+
+	// The weapon list is only valid for the player and tick NextTick built it for.
+	// Outside our CheckTransmit, or after an entity was deleted, callers scan all weapon slots instead.
+	inline bool HasWeaponList(const CBaseEntity* pPlayer, int nTick) const
+	{
+		return pWeaponListOwner && pWeaponListOwner == pPlayer && nWeaponListTick == nTick;
+	}
+
+	inline void InvalidateWeaponList()
+	{
+		pWeaponListOwner = nullptr;
 	}
 
 	void Reset()
@@ -1157,6 +1178,13 @@ struct PlayerTransmitCache
 	int nNextWeaponSlot = 0;
 	int nHighestWeaponSlot = 0;
 	WeaponSlot pWeapons[MAX_WEAPONS];
+
+	// The weapons the player holds this tick, in slot order. hook_CBaseCombatCharacter_SetTransmit runs for every
+	// recipient that receives the player, and walking all MAX_WEAPONS handles each time costs far more than this.
+	const CBaseEntity* pWeaponListOwner = nullptr;
+	int nWeaponListTick = 0;
+	int nWeaponCount = 0;
+	CBaseEntity* pWeaponList[MAX_WEAPONS] = {nullptr};
 };
 // NOTE: Index is playerslot / entindex - 1
 static PlayerTransmitCache g_pPlayerTransmitCache[MAX_PLAYERS];
@@ -1253,6 +1281,68 @@ static ConVar networking_transmit_all_weapons("holylib_networking_transmit_all_w
 static ConVar networking_transmit_all_weapons_to_owner("holylib_networking_transmit_all_weapons_to_owner", "1", 0, "By default all weapons are networked to the owner");
 static ConVar networking_transmit_one_per_tick("holylib_networking_transmit_one_per_tick", "0", 0, "If enabled, one additional weapon is networked per tick");
 static ConVar networking_fasttransmit("holylib_networking_fasttransmit", "1", 0, "Replaces CServerGameEnts::CheckTransmit with our own implementation");
+static ConVar networking_transmit_profile("holylib_networking_transmit_profile", "0", 0, "If enabled, time our CheckTransmit by phase; read the result with holylib_networking_transmit_stats");
+static ConVar networking_transmit_weaponlist("holylib_networking_transmit_weaponlist", "1", 0, "If enabled, a player's weapons are sent from a list built once per tick instead of checking every weapon slot for every recipient");
+
+// Transmit profiling: timings are summed over all recipient passes since the last reset.
+struct TransmitProfile
+{
+	double fTickSetup = 0.0;
+	double fRecipientSetup = 0.0;
+	double fFullCheck = 0.0;
+	double fPVSCheck = 0.0;
+	double fFinish = 0.0;
+	double fCharacter = 0.0; // Time inside hook_CBaseCombatCharacter_SetTransmit, already part of the phases above.
+	std::uint64_t nTicks = 0;
+	std::uint64_t nPasses = 0;
+	std::uint64_t nFullEntities = 0;
+	std::uint64_t nPVSEntities = 0;
+	std::uint64_t nCharacterCalls = 0;
+	std::uint64_t nCharacterListCalls = 0;
+	std::uint64_t nCharacterWeapons = 0;
+	std::uint64_t nCharacterSlotScans = 0;
+	int nCharacterDepth = 0;
+
+	void Reset() { *this = TransmitProfile(); }
+};
+static TransmitProfile g_pTransmitProfile;
+
+static inline double TransmitProfileNow()
+{
+	return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Times the outermost character SetTransmit call; weapons and viewmodels can re-enter it through their move parent.
+struct TransmitProfileCharacterScope
+{
+	explicit TransmitProfileCharacterScope(bool bProfile) : bEnabled(bProfile)
+	{
+		if (bEnabled && g_pTransmitProfile.nCharacterDepth++ == 0)
+		{
+			bOuter = true;
+			fStart = TransmitProfileNow();
+		}
+	}
+
+	~TransmitProfileCharacterScope()
+	{
+		if (!bEnabled)
+			return;
+
+		--g_pTransmitProfile.nCharacterDepth;
+		if (bOuter)
+		{
+			g_pTransmitProfile.fCharacter += TransmitProfileNow() - fStart;
+			++g_pTransmitProfile.nCharacterCalls;
+		}
+	}
+
+	bool bEnabled;
+	bool bOuter = false;
+	double fStart = 0.0;
+};
+// End of transmit profiling
+
 static void hook_CBaseCombatCharacter_SetTransmit(CBaseCombatCharacter* pCharacter, CCheckTransmitInfo *pInfo, bool bAlways)
 {
 	// IMPORANT: Apparently CBaseCombatCharacter is inherited by more than just the player, so we MUST check m_EdictIndex!
@@ -1268,6 +1358,7 @@ static void hook_CBaseCombatCharacter_SetTransmit(CBaseCombatCharacter* pCharact
 	if (pInfo->m_pTransmitEdict->Get(pCharacterEdict->m_EdictIndex)) // Already being networked!
 		return;
 
+	const TransmitProfileCharacterScope pProfileScope(networking_transmit_profile.GetBool());
 	func_CBaseAnimating_SetTransmit(pCharacter, pInfo, bAlways); // Base transmit
 
 	const bool bLocalPlayer = pInfo->m_pClientEnt == pCharacterEdict;
@@ -1294,14 +1385,31 @@ static void hook_CBaseCombatCharacter_SetTransmit(CBaseCombatCharacter* pCharact
 
 	if (networking_transmit_all_weapons.GetBool() || (bLocalPlayer && networking_transmit_all_weapons_to_owner.GetBool()))
 	{
-		for (int i=0; i < MAX_WEAPONS; ++i)
+		const PlayerTransmitCache& pWeaponCache = g_pPlayerTransmitCache[pCharacterEdict->m_EdictIndex-1];
+		if (networking_transmit_weaponlist.GetBool() && pWeaponCache.HasWeaponList(pCharacter, gpGlobals->tickcount))
 		{
-			CBaseEntity *pWeapon = GetMyWeapon(pCharacter, i);
-			if (!pWeapon)
-				continue;
+			// Same weapons in the same order as the slot scan below, resolved once this tick.
+			for (int i=0; i < pWeaponCache.nWeaponCount; ++i)
+				pWeaponCache.pWeaponList[i]->SetTransmit(pInfo, bAlways);
 
-			// The local player is sent all of his weapons.
-			pWeapon->SetTransmit(pInfo, bAlways);
+			if (pProfileScope.bEnabled)
+			{
+				++g_pTransmitProfile.nCharacterListCalls;
+				g_pTransmitProfile.nCharacterWeapons += pWeaponCache.nWeaponCount;
+			}
+		} else {
+			for (int i=0; i < MAX_WEAPONS; ++i)
+			{
+				CBaseEntity *pWeapon = GetMyWeapon(pCharacter, i);
+				if (!pWeapon)
+					continue;
+
+				// The local player is sent all of his weapons.
+				pWeapon->SetTransmit(pInfo, bAlways);
+			}
+
+			if (pProfileScope.bEnabled)
+				++g_pTransmitProfile.nCharacterSlotScans;
 		}
 	} else {
 		CBaseEntity* pActiveWeapon = GetActiveWeapon(pCharacter);
@@ -1598,6 +1706,39 @@ static void NetworkingFastPathStats(const CCommand&)
 }
 static ConCommand networking_fastpath_stats("holylib_networking_fastpath_stats", NetworkingFastPathStats,
 	"Show fastpath cache counters since module initialization or map activation", 0);
+
+static void NetworkingTransmitStats(const CCommand& args)
+{
+	TransmitProfile& pProfile = g_pTransmitProfile;
+	if (args.ArgC() > 1 && V_stricmp(args.Arg(1), "reset") == 0)
+	{
+		const int nDepth = pProfile.nCharacterDepth; // Keep an active scope balanced.
+		pProfile.Reset();
+		pProfile.nCharacterDepth = nDepth;
+		Msg("HolyLib transmit profile: reset\n");
+		return;
+	}
+
+	const double fTicks = pProfile.nTicks > 0 ? static_cast<double>(pProfile.nTicks) : 1.0;
+	const double fPasses = pProfile.nPasses > 0 ? static_cast<double>(pProfile.nPasses) : 1.0;
+	const double fTotal = pProfile.fTickSetup + pProfile.fRecipientSetup + pProfile.fFullCheck + pProfile.fPVSCheck + pProfile.fFinish;
+	Msg("HolyLib transmit profile (%s): %llu ticks, %llu recipient passes, %.3f ms per tick in our CheckTransmit\n",
+		networking_transmit_profile.GetBool() ? "recording" : "stopped",
+		static_cast<unsigned long long>(pProfile.nTicks), static_cast<unsigned long long>(pProfile.nPasses), fTotal * 1000.0 / fTicks);
+	Msg("  tick setup (entity lists, once per tick)  %8.3f ms/tick\n", pProfile.fTickSetup * 1000.0 / fTicks);
+	Msg("  recipient setup (prevent/always bits)     %8.3f ms/tick\n", pProfile.fRecipientSetup * 1000.0 / fTicks);
+	Msg("  full-check entities (ShouldTransmit)      %8.3f ms/tick, %.0f entities per pass\n",
+		pProfile.fFullCheck * 1000.0 / fTicks, static_cast<double>(pProfile.nFullEntities) / fPasses);
+	Msg("  PVS entities                              %8.3f ms/tick, %.0f entities per pass\n",
+		pProfile.fPVSCheck * 1000.0 / fTicks, static_cast<double>(pProfile.nPVSEntities) / fPasses);
+	Msg("  full updates and bound attachments        %8.3f ms/tick\n", pProfile.fFinish * 1000.0 / fTicks);
+	Msg("  of which player SetTransmit hook          %8.3f ms/tick, %.0f calls per tick, %.1f weapons per listed call, %llu slot scans\n",
+		pProfile.fCharacter * 1000.0 / fTicks, static_cast<double>(pProfile.nCharacterCalls) / fTicks,
+		pProfile.nCharacterListCalls > 0 ? static_cast<double>(pProfile.nCharacterWeapons) / static_cast<double>(pProfile.nCharacterListCalls) : 0.0,
+		static_cast<unsigned long long>(pProfile.nCharacterSlotScans));
+}
+static ConCommand networking_transmit_stats("holylib_networking_transmit_stats", NetworkingTransmitStats,
+	"Show the timings recorded while holylib_networking_transmit_profile is 1; 'holylib_networking_transmit_stats reset' clears them", 0);
 bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmitInfo *pInfo, const unsigned short *pEdictIndices, int nEdicts)
 {
 	vec_t maxTransmitRange = g_nTransmitRange;
@@ -1620,6 +1761,9 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 	// BUG: Can this even happen? Probably, when people screw with the gameserver module & disable spawn safety
 	if (clientIndex >= gpGlobals->maxClients || clientIndex < 0)
 		return true; // We don't return false since we never want to transmit anything to a player in a invalid slot!
+
+	const bool bProfile = networking_transmit_profile.GetBool();
+	const double fProfileStart = bProfile ? TransmitProfileNow() : 0.0;
 
 	CBaseEntity* pViewEntity = GetViewEntity(pRecipientPlayer);
 	const Vector& clientPosition = pViewEntity ? pViewEntity->EyePosition() : pRecipientPlayer->EyePosition();
@@ -1659,6 +1803,8 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 		g_pGlobalTransmitTickCache.NewTick(nCurrentTick);
 	}
 
+	const double fProfileTick = bProfile ? TransmitProfileNow() : 0.0;
+
 	// Sharing a final transmit bitset skips ShouldTransmit, SetTransmit and
 	// full-update handling. Share only pure BSP queries; HLTV never queries the PVS.
 	TransmitPVSQuery pPVSQuery(networking_fastpath.GetBool());
@@ -1681,6 +1827,7 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 			pPlayer->SetTransmit(pInfo, true);
 	}
 
+	const double fProfileFull = bProfile ? TransmitProfileNow() : 0.0;
 	for (int i=0; i<=g_nEntityTransmitCache.nFullEdictCount; ++i)
 	{
 		CBaseEntity* pEnt = g_nEntityTransmitCache.pFullEntityList[i];
@@ -1709,6 +1856,7 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 		DoTransmitPVSCheck(pEnt->edict(), pEnt, bIsHLTV, pInfo, bForceTransmit, skyBoxArea, clientPosition, maxTransmitRange, pPVSQuery);
 	}
 
+	const double fProfilePVS = bProfile ? TransmitProfileNow() : 0.0;
 	if (networking_areasplit.GetBool())
 	{
 		const int nClientArea = Util::engineserver->GetArea(clientPosition);
@@ -1755,6 +1903,7 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 		DoTransmitPVSCheck(pEdict, pEnt, bIsHLTV, pInfo, bForceTransmit, skyBoxArea, clientPosition, maxTransmitRange, pPVSQuery);
 	}
 
+	const double fProfileFinish = bProfile ? TransmitProfileNow() : 0.0;
 	if (networking_transmit_onfullupdate.GetBool())
 	{
 		if (g_pPlayerTransmitCache[clientIndex].InFullUpdate())
@@ -1789,6 +1938,26 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 
 	TransmitBoundAttachmentsToViewers(pRecipientPlayer, pInfo, clientIndex);
 	pInfo->m_pTransmitEdict->Or(g_pGlobalTransmitTickCache.g_bWasSeenByPlayer, &g_pGlobalTransmitTickCache.g_bWasSeenByPlayer);
+
+	if (bProfile)
+	{
+		TransmitProfile& pProfile = g_pTransmitProfile;
+		if (bFirstTransmit)
+		{
+			pProfile.fTickSetup += fProfileTick - fProfileStart;
+			++pProfile.nTicks;
+		} else {
+			pProfile.fRecipientSetup += fProfileTick - fProfileStart;
+		}
+
+		pProfile.fRecipientSetup += fProfileFull - fProfileTick;
+		pProfile.fFullCheck += fProfilePVS - fProfileFull;
+		pProfile.fPVSCheck += fProfileFinish - fProfilePVS;
+		pProfile.fFinish += TransmitProfileNow() - fProfileFinish;
+		pProfile.nFullEntities += g_nEntityTransmitCache.nFullEdictCount + 1;
+		pProfile.nPVSEntities += g_nEntityTransmitCache.nPVSEdictCount + 1;
+		++pProfile.nPasses;
+	}
 
 	return true;
 }
@@ -1966,6 +2135,14 @@ void CNetworkingModule::OnEntityDeleted(CBaseEntity* pEntity)
 	CleanupSetPreventTransmit(pEntity);
 	g_pEntityCache[pEdict->m_EdictIndex] = nullptr;
 	g_pForceWeaponTransmitIndexes.Clear(pEdict->m_EdictIndex);
+
+	// Deleted after this tick's weapon lists were built? One of them may hold it, so scan the slots again for the
+	// rest of the tick. Deletions earlier in the frame only touch lists of a previous tick, which aren't used.
+	if (gpGlobals && !g_pGlobalTransmitTickCache.IsNewTick(gpGlobals->tickcount))
+	{
+		for (PlayerTransmitCache& pCache : g_pPlayerTransmitCache)
+			pCache.InvalidateWeaponList();
+	}
 }
 
 void CNetworkingModule::OnEntityCreated(CBaseEntity* pEntity)

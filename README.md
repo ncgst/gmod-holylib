@@ -2298,11 +2298,24 @@ For other players, if another player has a full update, they will be networked t
 How many ticks are used in which new weapons or full updates are networked.<br>
 This tick count is used by the `holylib_networking_transmit_newweapons`, `holylib_networking_transmit_onfullupdate` and `holylib_networking_transmit_onfullupdate_networktoothers` convars internally.<br>
 
+#### holylib_networking_transmit_weaponlist(default `1`)
+If enabled, the weapons of each player are collected once per tick, and every player that receives them gets them from that list.<br>
+If disabled, all weapon slots of a player are checked again for every player that receives them.<br>
+Both send the same weapons, the setting only exists to compare them or to fall back without a restart.<br>
+
+#### holylib_networking_transmit_profile(default `0`)
+If enabled, our `CServerGameEnts::CheckTransmit` is timed by phase. Use `holylib_networking_transmit_stats` to read the result.<br>
+
 ### ConCommands
 
 #### holylib_networking_fastpath_stats
 Prints the counters of the `holylib_networking_fastpath` cache since the module was loaded or the map started.<br>
 A context hit means a player's PVS data was already cached, a headnode hit means a `CheckHeadnodeVisible` call was saved.<br>
+
+#### holylib_networking_transmit_stats [reset]
+Prints the time spent per tick in each phase of our `CServerGameEnts::CheckTransmit` while `holylib_networking_transmit_profile` is enabled.<br>
+The time spent in the player `SetTransmit` hook, which sends a player's weapons, viewmodels and hands, is also shown, it is already part of the phases above.<br>
+`reset` clears the collected timings.<br>
 
 ## steamworks
 This module adds a few functions related to steam.<br>

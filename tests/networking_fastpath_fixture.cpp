@@ -4,7 +4,9 @@
 #include <array>
 #include <bitset>
 #include <cassert>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <string.h> // Production code calls memmove unqualified.
 #include <vector>
@@ -195,8 +197,10 @@ static ConVar networking_fastcharactertransmit{true};
 static ConVar networking_bind_gmodhands_to_player{true}, networking_bind_viewmodels_to_player{true};
 static ConVar networking_transmit_all_weapons{true}, networking_transmit_all_weapons_to_owner{true};
 static ConVar networking_transmit_one_per_tick, networking_transmit_newweapons{true};
+static ConVar networking_transmit_profile, networking_transmit_weaponlist{true};
 static ConVar forceTransmit;
 static ConVar* sv_force_transmit_ents = &forceTransmit;
+static bool fillWeaponLists = false; // Whether NextTick builds the per-tick weapon list as production does.
 struct PlayerTransmitCache
 {
 	struct WeaponSlot { bool bIsNew = false, bAlwaysNetwork = false; };
@@ -204,10 +208,29 @@ struct PlayerTransmitCache
 	int nNextWeaponSlot = 0;
 	bool full = false;
 	int nLastAcknowledgedTick = 0;
-	void NextTick(CBaseEntity*, int) {}
+	const CBaseEntity* pWeaponListOwner = nullptr;
+	int nWeaponListTick = 0, nWeaponCount = 0;
+	CBaseEntity* pWeaponList[MAX_WEAPONS]{};
+	void NextTick(CBaseEntity* player, int tick)
+	{
+		if (!fillWeaponLists)
+			return;
+		nWeaponCount = 0;
+		for (int i = 0; i < MAX_WEAPONS; ++i)
+			if (CBaseEntity* weapon = GetMyWeapon(player, i))
+				pWeaponList[nWeaponCount++] = weapon;
+		pWeaponListOwner = player;
+		nWeaponListTick = tick;
+	}
+	bool HasWeaponList(const CBaseEntity* player, int tick) const
+	{
+		return pWeaponListOwner && pWeaponListOwner == player && nWeaponListTick == tick;
+	}
+	void InvalidateWeaponList() { pWeaponListOwner = nullptr; }
 	bool InFullUpdate(int = 0) const { return full; }
 };
 static PlayerTransmitCache g_pPlayerTransmitCache[MAX_PLAYERS];
+// PRODUCTION_TRANSMIT_PROFILE
 // PRODUCTION_CHARACTER_TRANSMIT
 void CBaseEntity::SetTransmit(CCheckTransmitInfo* info, bool always)
 {
@@ -573,6 +596,26 @@ static void CheckAlwaysTransmitParents()
 		"both cache settings passed\n";
 }
 
+// A weapon list is used for the rest of its tick; once invalidated (CNetworkingModule::OnEntityDeleted does this
+// when an entity is deleted mid-tick) the character hook scans the weapon slots again.
+static void CheckWeaponListInvalidation()
+{
+	fillWeaponLists = true;
+	ResetObserverWorld(false);
+	networking_transmit_all_weapons.value = true;
+	const auto first = ObserverTransmit(1);
+	assert(first.Get(710) && first.Get(711) && !first.Get(712));
+	entities[1].weapons[2] = &entities[712]; // Changed after this tick's lists were built.
+	assert(!ObserverTransmit(1).Get(712)); // The list is in use for this tick.
+	g_pPlayerTransmitCache[0].InvalidateWeaponList();
+	assert(ObserverTransmit(1).Get(712));
+	++globals.tickcount;
+	const auto nextTick = ObserverTransmit(1); // A new tick rebuilds the list, which now holds the new weapon.
+	assert(nextTick.Get(712) && g_pPlayerTransmitCache[0].HasWeaponList(&entities[1], globals.tickcount));
+	fillWeaponLists = false;
+	std::cout << "Weapon lists: used within their tick, slot scan after invalidation, rebuilt on the next tick\n";
+}
+
 // Removing an entity from a full area list during networking must stay inside that list.
 static void CheckEntityRemovedFromFullArea()
 {
@@ -638,6 +681,33 @@ int main()
 		assert(cached.queries < baseline.queries);
 		std::cout << "Production transmit fixture, areaSplit=" << split
 			<< ": 120 recipients matched, headnode queries " << baseline.queries << " -> " << cached.queries << '\n';
+
+		// The per-tick weapon list must send what the slot scan sends, and timing must not change any decision.
+		fillWeaponLists = true;
+		networking_transmit_profile.value = true;
+		g_pTransmitProfile.Reset();
+		const Result listed = Run(false, 12, split);
+		networking_transmit_profile.value = false;
+		fillWeaponLists = false;
+		assert(listed.bits == baseline.bits && listed.always == baseline.always && listed.packed == baseline.packed);
+		assert(listed.callbacks == baseline.callbacks && listed.queries == baseline.queries);
+		assert(g_pTransmitProfile.nTicks == 1 && g_pTransmitProfile.nPasses == 120);
+		assert(g_pTransmitProfile.nCharacterListCalls > 0 && g_pTransmitProfile.nCharacterSlotScans == 0);
+		assert(g_pTransmitProfile.nCharacterDepth == 0);
+		std::cout << "Per-tick weapon lists with profiling, areaSplit=" << split << ": 120 recipients matched the slot scan, "
+			<< g_pTransmitProfile.nCharacterListCalls << " listed player transmits\n";
+
+		// Turning the list off at runtime goes back to the slot scan.
+		fillWeaponLists = true;
+		networking_transmit_weaponlist.value = false;
+		networking_transmit_profile.value = true;
+		g_pTransmitProfile.Reset();
+		const Result unlisted = Run(false, 13, split);
+		networking_transmit_profile.value = false;
+		networking_transmit_weaponlist.value = true;
+		fillWeaponLists = false;
+		assert(unlisted.bits == baseline.bits && unlisted.always == baseline.always && unlisted.packed == baseline.packed);
+		assert(g_pTransmitProfile.nCharacterListCalls == 0 && g_pTransmitProfile.nCharacterSlotScans > 0);
 	}
 
 	// The cheap cluster branch must not pay for a PVS hash or context copy.
@@ -670,8 +740,14 @@ int main()
 
 	globals.maxClients = MAX_PLAYERS + 1;
 	assert(!New_CServerGameEnts_CheckTransmit(Util::servergameents, &info, nullptr, 0));
-	if (!CheckObserverAttachments())
-		return 1;
-	CheckAlwaysTransmitParents();
+	for (bool lists : {false, true})
+	{
+		fillWeaponLists = lists;
+		if (!CheckObserverAttachments())
+			return 1;
+		CheckAlwaysTransmitParents();
+	}
+	fillWeaponLists = false;
+	CheckWeaponListInvalidation();
 	CheckEntityRemovedFromFullArea();
 }

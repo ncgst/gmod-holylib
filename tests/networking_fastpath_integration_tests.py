@@ -26,6 +26,7 @@ def main():
         "IS_IN_PVS": between(net, "static inline bool IsInPVS(", "\nstatic vec_t g_nTransmitRange"),
         "DO_TRANSMIT": between(net, "static inline void DoTransmitPVSCheck(", "\nstatic ConVar networking_fastpath("),
         "CHECK_TRANSMIT": between(net, "bool New_CServerGameEnts_CheckTransmit(", "\nvoid SV_FillHLTVData("),
+        "TRANSMIT_PROFILE": between(net, "// Transmit profiling: timings are summed", "// End of transmit profiling"),
         "CHARACTER_TRANSMIT": between(net, "static void hook_CBaseCombatCharacter_SetTransmit(", "\nstatic inline bool IsInPVS("),
         "ATTACHMENT_EXCLUSION": between(net, "\t\t// First we build data based off all players", "\n\t\tfor (int i=0; i < nEdicts; ++i)"),
         "ALWAYS_TRANSMIT": between(net, "\tinline void MarkAlwaysTransmit(", "\n\tvoid EntityRemoved("),
