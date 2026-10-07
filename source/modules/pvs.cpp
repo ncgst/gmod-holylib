@@ -735,30 +735,24 @@ LUA_FUNCTION_STATIC(pvs_AddEntityToTransmit)
 	return 0;
 }
 
-#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
 static Symbols::CBaseEntity_GMOD_SetShouldPreventTransmitToPlayer func_SetShouldPreventTransmit = nullptr;
 #if MODULE_EXISTS_NETWORKING
 extern Symbols::CBaseEntity_GMOD_SetShouldPreventTransmitToPlayer Networking_GetSetShouldPreventTransmit();
 #endif
-#endif
 
 static void SetShouldPreventTransmit(CBaseEntity* ent, CBasePlayer* ply, bool prevent)
 {
-#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
-	// The SDK's virtual slot is stale on current Linux64 builds. Resolve the
-	// same entry used by Entity:SetPreventTransmit, including any installed hook.
+	// Don't use the SDK's virtual. GMod declares CBaseEntity::UpdateWaterState virtual and the SDK doesn't,
+	// so the SDK's later CBaseEntity slots are one short and its slot for the setter holds GMOD_ShouldPreventTransmitToPlayer.
+	// Resolve the same entry used by Entity:SetPreventTransmit, including any installed hook.
 	func_SetShouldPreventTransmit(ent, ply, prevent);
-#else
-	ent->GMOD_SetShouldPreventTransmitToPlayer(ply, prevent);
-#endif
 }
 
 LUA_FUNCTION_STATIC(pvs_SetPreventTransmitBulk)
 {
-#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
 	if (!func_SetShouldPreventTransmit)
 		LUA->ThrowError("Failed to resolve CBaseEntity::GMOD_SetShouldPreventTransmitToPlayer");
-#endif
+
 	std::vector<CBasePlayer*> filterplys;
 	if (LUA->IsType(2, GarrysMod::Lua::Type::RecipientFilter))
 	{
@@ -1119,7 +1113,6 @@ void CPVSModule::InitDetour(bool bPreServer)
 	if (bPreServer)
 		return;
 	SourceSDK::ModuleLoader server_loader("server");
-#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
 #if MODULE_EXISTS_NETWORKING
 	func_SetShouldPreventTransmit = Networking_GetSetShouldPreventTransmit();
 #endif
@@ -1127,7 +1120,6 @@ void CPVSModule::InitDetour(bool bPreServer)
 		func_SetShouldPreventTransmit = (Symbols::CBaseEntity_GMOD_SetShouldPreventTransmitToPlayer)Detour::GetFunction(
 			server_loader.GetModule(), Symbols::CBaseEntity_GMOD_SetShouldPreventTransmitToPlayerSym);
 	Detour::CheckFunction((void*)func_SetShouldPreventTransmit, "CBaseEntity::GMOD_SetShouldPreventTransmitToPlayer(PVS)");
-#endif
 
 #ifndef HOLYLIB_MANUALNETWORKING
 	DETOUR_PREPARE_THISCALL();
@@ -1153,9 +1145,7 @@ void CPVSModule::InitDetour(bool bPreServer)
 
 void CPVSModule::Shutdown()
 {
-#if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)
 	func_SetShouldPreventTransmit = nullptr;
-#endif
 #if MODULE_EXISTS_NETWORKING
 	Networking_SwitchToOURTransmit();
 #endif

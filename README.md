@@ -1038,7 +1038,7 @@ table ents - A sequential table containing all the entities that should be affec
 table plys - A sequential table containing all the players that it should set it for.<br>
 bool notransmit - If the entity should stop being transmitted.<br>
 
-Adds the given Entity to be transmitted.<br>
+Calls `Entity:SetPreventTransmit(ply, notransmit)` for every given entity and player.<br>
 
 #### bool / table pvs.TestPVS(Entity ent / Vector origin, Entity ent / Vector pos / EntityList list)
 Returns `true` if the given entity / position is inside the PVS of the given origin.<br>
