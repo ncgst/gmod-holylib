@@ -72,9 +72,15 @@ struct PVSInfo
 	int m_nAreaNum = 2, m_nAreaNum2 = 0, m_nClusterCount = -1, m_nHeadNode = 0;
 	unsigned short* m_pClusters = nullptr;
 };
+struct ServerClass
+{
+	const char* m_pNetworkName = "CFixture";
+	const char* GetName() const { return m_pNetworkName; }
+};
 struct CCServerNetworkProperty
 {
 	PVSInfo m_PVSInfo;
+	ServerClass* m_pServerClass = nullptr;
 	edict_t* owner = nullptr;
 	CCServerNetworkProperty* parent = nullptr;
 	// Like the engine: AreaNum() brings dirty PVS data up to date, which clears the dirty flag.
@@ -107,8 +113,10 @@ struct CBaseEntity
 	CBaseEntity* transmitDependency = nullptr;
 	bool player = false, evenOnly = false;
 	bool hasEdict = true;
+	bool manipulator = false; // GMod's manipulate_bone/manipulate_flex: ShouldTransmit asks the parent.
 	int observerMode = OBS_MODE_NONE;
 	int othersTransmit = FL_EDICT_DONTSEND; // A player's ShouldTransmit result for everyone but itself.
+	int transmitState = -1; // >= 0: the base ShouldTransmit's answer from the entity's transmit state.
 	int skybox = 3;
 	CBaseEntity() { entry.entity = this; entry.property = &property; property.owner = &entry; }
 	edict_t* edict() { return hasEdict ? &entry : nullptr; }
@@ -120,6 +128,13 @@ struct CBaseEntity
 	int ShouldTransmit(CCheckTransmitInfo* info)
 	{
 		++shouldTransmitCalls;
+		if (manipulator)
+		{
+			CBaseEntity* parent = property.parent && property.parent->owner ? property.parent->owner->entity : nullptr;
+			return parent ? parent->ShouldTransmit(info) : FL_EDICT_DONTSEND;
+		}
+		if (transmitState >= 0)
+			return transmitState;
 		const int recipient = info->m_pClientEnt->m_EdictIndex;
 		if (player)
 			return recipient == entry.m_EdictIndex ? FL_EDICT_ALWAYS : othersTransmit;
@@ -204,6 +219,7 @@ static ConVar networking_bind_gmodhands_to_player{true}, networking_bind_viewmod
 static ConVar networking_transmit_all_weapons{true}, networking_transmit_all_weapons_to_owner{true};
 static ConVar networking_transmit_one_per_tick, networking_transmit_newweapons{true};
 static ConVar networking_transmit_profile, networking_transmit_weaponlist{true}, networking_pvssnapshot;
+static ConVar networking_bind_manipulators{true};
 static ConVar forceTransmit;
 static ConVar* sv_force_transmit_ents = &forceTransmit;
 static bool fillWeaponLists = false; // Whether NextTick builds the per-tick weapon list as production does.
@@ -246,6 +262,7 @@ void CBaseEntity::SetTransmit(CCheckTransmitInfo* info, bool always)
 		BaseSetTransmit(info, always);
 }
 static CCServerNetworkProperty* GetNetworkParentSafe(CCServerNetworkProperty* property) { return property->parent; }
+// PRODUCTION_MANIPULATOR
 static std::vector<edict_t*> alwaysEdicts; // FL_EDICT_ALWAYS edicts, marked on every tick's first transmit.
 struct EntityTransmitCache
 {
@@ -254,9 +271,10 @@ struct EntityTransmitCache
 	CBitVec<MAX_EDICTS> pNeverTransmitBits, pAlwaysTransmitBits, pPVSTransmitBits, pFullTransmitBits;
 	int nAlwaysTransmitPlayerCount = 0;
 	int pAlwaysTransmitPlayers[MAX_PLAYERS]{};
-	int nFullEdictCount = -1, nPVSEdictCount = -1;
+	int nFullEdictCount = -1, nPVSEdictCount = -1, nAlwaysManipulatorCount = -1;
 	CBaseEntity* pFullEntityList[256]{};
 	CBaseEntity* pPVSEntityList[64]{};
+	CBaseEntity* pAlwaysManipulatorList[64]{};
 	AreaCache nAreaEntities[MAX_MAP_AREAS - 1];
 	void UpdateEntities(const unsigned short*, int)
 	{
@@ -447,7 +465,8 @@ static void RemoveFromPVSList(int index)
 	cache.nPVSEdictCount = kept;
 }
 
-static CBitVec<MAX_EDICTS> ObserverTransmit(int recipient, bool preMarked = false, bool hltv = false)
+static CBitVec<MAX_EDICTS> ObserverTransmit(int recipient, bool preMarked = false, bool hltv = false,
+	CBitVec<MAX_EDICTS>* alwaysOut = nullptr)
 {
 	CBitVec<MAX_EDICTS> transmit, always;
 	if (preMarked)
@@ -461,6 +480,8 @@ static CBitVec<MAX_EDICTS> ObserverTransmit(int recipient, bool preMarked = fals
 	g_nTransmitRange = -1.0f;
 	assert(New_CServerGameEnts_CheckTransmit(Util::servergameents, &info, nullptr, 0));
 	assert((transmit.bits & ~g_pGlobalTransmitTickCache.g_bWasSeenByPlayer.bits).none());
+	if (alwaysOut)
+		*alwaysOut = always;
 	return transmit;
 }
 
@@ -656,6 +677,94 @@ static void CheckEntityRemovedFromFullArea()
 	std::cout << "EntityRemoved: removal from a full area list stays in bounds\n";
 }
 
+// GMod's manipulators answer with their parent's ShouldTransmit. Sending those of always transmitted parents from their
+// own list must give every recipient, a prevented one and HLTV included, what the full check gives, minus the calls.
+static void CheckManipulators()
+{
+	const int manipulators[] = {451, 452, 453, 454, 455};
+	const int parents[] = {450, 450, 1, 460, 0}; // 455 has no parent.
+	static ServerClass boneClass{"CBoneManipulate"}, flexClass{"CFlexManipulate"}, propClass{"CDynamicProp"};
+	for (bool fast : {true, false})
+	{
+		std::vector<std::bitset<MAX_EDICTS>> sent[2], always[2];
+		int calls[2] = {};
+		for (int bound = 0; bound < 2; ++bound)
+		{
+			ResetObserverWorld(fast);
+			networking_bind_manipulators.value = bound;
+			entities[450].entry.m_fStateFlags = FL_EDICT_ALWAYS;
+			entities[450].transmitState = FL_EDICT_ALWAYS;
+			alwaysEdicts.push_back(&entities[450].entry);
+			g_nEntityTransmitCache.pPVSEntityList[++g_nEntityTransmitCache.nPVSEdictCount] = &entities[460];
+			for (int i = 0; i < 5; ++i)
+			{
+				CBaseEntity& entity = entities[manipulators[i]];
+				entity.manipulator = true;
+				entity.property.m_pServerClass = i == 1 ? &flexClass : &boneClass;
+				entity.entry.m_fStateFlags = FL_EDICT_FULLCHECK;
+				if (parents[i])
+				{
+					entity.property.parent = &entities[parents[i]].property;
+					entity.transmitDependency = &entities[parents[i]]; // SetTransmit also sends the move parent.
+				}
+			}
+
+			// Production classification, as UpdateEntities applies it.
+			entities[456].property.m_pServerClass = &propClass;
+			entities[456].property.parent = &entities[450].property;
+			assert(!IsManipulatorOfAlwaysTransmitted(&entities[456].entry));
+			entities[457].property.parent = &entities[450].property; // No server class.
+			assert(!IsManipulatorOfAlwaysTransmitted(&entities[457].entry));
+			entities[450].entry.m_fStateFlags = FL_EDICT_ALWAYS | FL_EDICT_DONTSEND;
+			assert(!IsManipulatorOfAlwaysTransmitted(&entities[451].entry));
+			entities[450].entry.m_fStateFlags = FL_EDICT_ALWAYS;
+			const int playerFlags = entities[1].entry.m_fStateFlags;
+			entities[1].entry.m_fStateFlags = FL_EDICT_ALWAYS; // A player's answer depends on the recipient regardless.
+			assert(!IsManipulatorOfAlwaysTransmitted(&entities[453].entry));
+			entities[1].entry.m_fStateFlags = playerFlags;
+			auto& cache = g_nEntityTransmitCache;
+			for (int i : manipulators)
+			{
+				const bool withAlwaysParent = IsManipulatorOfAlwaysTransmitted(&entities[i].entry);
+				assert(withAlwaysParent == (i == 451 || i == 452));
+				if (bound && withAlwaysParent)
+					cache.pAlwaysManipulatorList[++cache.nAlwaysManipulatorCount] = &entities[i];
+				else
+					cache.pFullEntityList[++cache.nFullEdictCount] = &entities[i];
+			}
+
+			g_pShouldPrevent[2].Set(451); // Recipient 3 must not receive this manipulator...
+			g_pShouldPrevent[0].Set(450); // ...while a prevented always transmitted parent changes nothing.
+			shouldTransmitCalls = 0;
+			for (int recipient : {1, 2, 3, 2})
+			{
+				const bool hltv = always[bound].size() == 3;
+				CBitVec<MAX_EDICTS> alwaysBits;
+				sent[bound].push_back(ObserverTransmit(recipient, false, hltv, &alwaysBits).bits);
+				always[bound].push_back(alwaysBits.bits);
+			}
+			calls[bound] = shouldTransmitCalls;
+
+			const auto& first = sent[bound][0];
+			assert(first.test(450) && first.test(451) && first.test(452) && first.test(453) && first.test(454));
+			assert(!first.test(455));
+			assert(!sent[bound][2].test(451) && sent[bound][2].test(452));
+			assert(always[bound][3].test(451) && always[bound][3].test(452));
+		}
+		assert(sent[0] == sent[1] && always[0] == always[1]);
+		assert(calls[0] - calls[1] == 4 * 2 + 3 * 2); // Manipulator and parent call, minus the prevented recipient.
+
+		auto& cache = g_nEntityTransmitCache;
+		cache.m_bIsActivelyNetworking = true;
+		cache.EntityRemoved(&entities[451], &entities[451].entry);
+		assert(cache.nAlwaysManipulatorCount == 0 && cache.pAlwaysManipulatorList[0] == &entities[452]);
+		assert(cache.pAlwaysManipulatorList[1] == nullptr);
+	}
+	networking_bind_manipulators.value = true;
+	std::cout << "Manipulators of always transmitted parents: same recipients, prevent bits and HLTV always bits "
+		"as the full check, without its ShouldTransmit calls; removal mid-tick\n";
+}
+
 int main()
 {
 	for (int i = 0; i < MAX_EDICTS; ++i)
@@ -789,4 +898,5 @@ int main()
 	fillWeaponLists = false;
 	CheckWeaponListInvalidation();
 	CheckEntityRemovedFromFullArea();
+	CheckManipulators();
 }

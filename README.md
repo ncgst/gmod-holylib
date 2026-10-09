@@ -2308,6 +2308,11 @@ Experimental. If enabled, the PVS data (areas, clusters, headnode) of all PVS ch
 Most entities aren't visible to a given player, and this avoids reading each of their entity objects once per player. The entity itself is still used to send it and to check its parents.<br>
 Entities whose PVS data changes during the transmit are checked directly, as before. The copy isn't used for SourceTV, for players with a transmit range (`pvs.SetMaxViewDistance`) or with `holylib_networking_areasplit`.<br>
 
+#### holylib_networking_bind_manipulators(default `1`)
+GMod creates a `manipulate_bone` or `manipulate_flex` entity for every entity whose bones or flexes are manipulated (`Entity:ManipulateBone*`, also with networking disabled, and `Entity:SetFlex*`). It is parented to that entity, and its `ShouldTransmit` returns the parent's `ShouldTransmit` for every player. For most entities that runs the parent's `UpdateTransmitState` again, which for scripted entities is a Lua call: one per manipulator and player every tick.<br>
+If enabled, manipulators of a non-player entity in the always transmit state are sent like always transmitted entities instead, unless they are prevented for that player.<br>
+This assumes that the parent's transmit state only changes when it is updated (for example after `EFL_FORCE_CHECK_TRANSMIT`), not between two checks of the same tick.<br>
+
 #### holylib_networking_transmit_profile(default `0`)
 If enabled, our `CServerGameEnts::CheckTransmit` is timed by phase. Use `holylib_networking_transmit_stats` to read the result.<br>
 

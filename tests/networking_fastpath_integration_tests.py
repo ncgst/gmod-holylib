@@ -29,6 +29,7 @@ def main():
         "TRANSMIT_PROFILE": between(net, "// Transmit profiling: timings are summed", "// End of transmit profiling"),
         "CHARACTER_TRANSMIT": between(net, "static void hook_CBaseCombatCharacter_SetTransmit(", "\nstatic inline bool IsInPVS("),
         "ATTACHMENT_EXCLUSION": between(net, "\t\t// First we build data based off all players", "\n\t\tfor (int i=0; i < nEdicts; ++i)"),
+        "MANIPULATOR": between(net, "// GMod's bone and flex manipulators", "\nstruct EntityTransmitCache"),
         "ALWAYS_TRANSMIT": between(net, "\tinline void MarkAlwaysTransmit(", "\n\tvoid EntityRemoved("),
         "ENTITY_REMOVED": between(net, "\tvoid EntityRemoved(", "\n\t// Only called with areasplit enabled"),
         "PVS": prop[prop.index("template <typename HeadnodeQuery>\ninline bool CCServerNetworkProperty::IsInPVS("):],

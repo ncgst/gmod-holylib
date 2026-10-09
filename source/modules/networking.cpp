@@ -579,6 +579,29 @@ static ConVar networking_bind_viewmodels_to_player("holylib_networking_bind_view
 static ConVar networking_cachedump("holylib_networking_cachedump", "0", 0, "Debug. You wouldn't need this...");
 static ConVar networking_areasplit("holylib_networking_areasplit", "0", 0, "PVS entities are split into areas");
 static ConVar networking_fastcharactertransmit("holylib_networking_fastcharactertransmit", "1", 0, "Experimental");
+static ConVar networking_bind_manipulators("holylib_networking_bind_manipulators", "1", 0, "If enabled, bone and flex manipulators of always transmitted entities are sent with them instead of asking the parent's ShouldTransmit for every recipient, which runs the parent's UpdateTransmitState (a Lua call for scripted entities)");
+
+// GMod's bone and flex manipulators (Entity:ManipulateBone*, Entity:SetFlex*) are full check entities parented to the
+// manipulated entity. Their ShouldTransmit returns the parent's ShouldTransmit for every recipient, and with the base
+// implementation that runs the parent's UpdateTransmitState again. For a parent in the always transmit state the answer
+// is FL_EDICT_ALWAYS, so such a manipulator is sent like an always transmitted entity, still honouring its own prevent bit.
+// Players are excluded since their answer depends on the recipient. They are recognized by their network class.
+static inline bool IsManipulatorOfAlwaysTransmitted(edict_t* pEdict)
+{
+	CCServerNetworkProperty* pNetProp = static_cast<CCServerNetworkProperty*>(pEdict->GetNetworkable());
+	ServerClass* pServerClass = pNetProp ? pNetProp->m_pServerClass : nullptr;
+	const char* pNetworkName = pServerClass ? pServerClass->GetName() : nullptr;
+	if (!pNetworkName || (strcmp(pNetworkName, "CBoneManipulate") != 0 && strcmp(pNetworkName, "CFlexManipulate") != 0))
+		return false;
+
+	CCServerNetworkProperty* pParent = GetNetworkParentSafe(pNetProp);
+	edict_t* pParentEdict = pParent ? pParent->edict() : nullptr;
+	if (!pParentEdict || pParentEdict->m_EdictIndex <= gpGlobals->maxClients)
+		return false;
+
+	return (pParentEdict->m_fStateFlags & (FL_EDICT_ALWAYS|FL_EDICT_DONTSEND)) == FL_EDICT_ALWAYS;
+}
+
 struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, though its a good foundation now.
 {
 	// Updates the cache for the current tick
@@ -601,12 +624,14 @@ struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, t
 
 		nPVSEdictCount = -1;
 		nFullEdictCount = -1; // -1 so that we can use preincrement :hehe:
+		nAlwaysManipulatorCount = -1;
 		Plat_FastMemset(pPVSEntityList, 0, sizeof(pPVSEntityList) * 2); // * 2 to also clear nFullEdictList which lies directly after it in memory. I know. very "safe" but I want this in 1 call
 
 		// nAreaEntities is ~1 MB (255 areas x 512 entities) and only AddPVSEntity ever fills it, which only
 		// runs with areasplit enabled. Clearing it unconditionally every tick evicts a megabyte of cache
 		// immediately before the transmit loop wants that cache. The flag keeps a runtime 1 -> 0 flip
 		// correct: we still do one final clear, so EntityRemoved never walks a stale nCount.
+		const bool bBindManipulators = networking_bind_manipulators.GetBool();
 		const bool bAreaSplit = networking_areasplit.GetBool();
 		if (bAreaSplit || m_bAreaCacheFilled)
 		{
@@ -688,6 +713,12 @@ struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, t
 
 				if (nFlags == FL_EDICT_FULLCHECK)
 				{
+					if (bBindManipulators && IsManipulatorOfAlwaysTransmitted(pEdict))
+					{
+						pAlwaysManipulatorList[++nAlwaysManipulatorCount] = pEnt;
+						continue;
+					}
+
 					pFullEntityList[++nFullEdictCount] = pEnt;
 					pFullTransmitBits.Set(iEdict);
 					continue;
@@ -883,6 +914,18 @@ struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, t
 			break;
 		}
 
+		for (int i = 0; i<=nAlwaysManipulatorCount; ++i)
+		{
+			if (pAlwaysManipulatorList[i] != pEntity)
+				continue;
+
+			if (i < nAlwaysManipulatorCount)
+				memmove(&pAlwaysManipulatorList[i], &pAlwaysManipulatorList[i + 1], (nAlwaysManipulatorCount - i) * sizeof(CBaseEntity*));
+
+			pAlwaysManipulatorList[nAlwaysManipulatorCount--] = nullptr;
+			break;
+		}
+
 		for (int nArea = 0; nArea<MAX_MAP_AREAS-1; ++nArea)
 		{
 			AreaCache& pArea = nAreaEntities[nArea];
@@ -1020,6 +1063,10 @@ struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, t
 	int nFullEdictCount = -1;
 	CBaseEntity* pPVSEntityList[MAX_EDICTS] = {nullptr};
 	CBaseEntity* pFullEntityList[MAX_EDICTS] = {nullptr};
+
+	// Full check entities sent like always transmitted ones, see IsManipulatorOfAlwaysTransmitted. Preincrement as well.
+	int nAlwaysManipulatorCount = -1;
+	CBaseEntity* pAlwaysManipulatorList[MAX_EDICTS] = {nullptr};
 
 	/*
 		If holylib_networking_areasplit is enabled
@@ -1297,6 +1344,7 @@ struct TransmitProfile
 	std::uint64_t nTicks = 0;
 	std::uint64_t nPasses = 0;
 	std::uint64_t nFullEntities = 0;
+	std::uint64_t nAlwaysManipulators = 0;
 	std::uint64_t nPVSEntities = 0;
 	std::uint64_t nCharacterCalls = 0;
 	std::uint64_t nCharacterListCalls = 0;
@@ -1924,8 +1972,9 @@ static void NetworkingTransmitStats(const CCommand& args)
 		static_cast<unsigned long long>(pProfile.nTicks), static_cast<unsigned long long>(pProfile.nPasses), fTotal * 1000.0 / fTicks);
 	Msg("  tick setup (entity lists, once per tick)  %8.3f ms/tick\n", pProfile.fTickSetup * 1000.0 / fTicks);
 	Msg("  recipient setup (prevent/always bits)     %8.3f ms/tick\n", pProfile.fRecipientSetup * 1000.0 / fTicks);
-	Msg("  full-check entities (ShouldTransmit)      %8.3f ms/tick, %.0f entities per pass\n",
-		pProfile.fFullCheck * 1000.0 / fTicks, static_cast<double>(pProfile.nFullEntities) / fPasses);
+	Msg("  full-check entities (ShouldTransmit)      %8.3f ms/tick, %.0f entities per pass, %.0f manipulators sent with their always transmitted parent\n",
+		pProfile.fFullCheck * 1000.0 / fTicks, static_cast<double>(pProfile.nFullEntities) / fPasses,
+		static_cast<double>(pProfile.nAlwaysManipulators) / fPasses);
 	Msg("  PVS entities                              %8.3f ms/tick, %.0f entities per pass\n",
 		pProfile.fPVSCheck * 1000.0 / fTicks, static_cast<double>(pProfile.nPVSEntities) / fPasses);
 	Msg("  full updates and bound attachments        %8.3f ms/tick\n", pProfile.fFinish * 1000.0 / fTicks);
@@ -2030,6 +2079,22 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 	}
 
 	const double fProfileFull = bProfile ? TransmitProfileNow() : 0.0;
+	// Their ShouldTransmit would answer FL_EDICT_ALWAYS, see IsManipulatorOfAlwaysTransmitted.
+	for (int i=0; i<=g_nEntityTransmitCache.nAlwaysManipulatorCount; ++i)
+	{
+		CBaseEntity* pEnt = g_nEntityTransmitCache.pAlwaysManipulatorList[i];
+
+		edict_t* pEntEdict = pEnt ? pEnt->edict() : nullptr;
+		if (!pEntEdict)
+			continue;
+
+		const int iEdict = pEntEdict->m_EdictIndex;
+		if (pInfo->m_pTransmitEdict->Get(iEdict) || g_pDontTransmitCache.Get(iEdict))
+			continue;
+
+		pEnt->SetTransmit(pInfo, true);
+	}
+
 	for (int i=0; i<=g_nEntityTransmitCache.nFullEdictCount; ++i)
 	{
 		CBaseEntity* pEnt = g_nEntityTransmitCache.pFullEntityList[i];
@@ -2162,6 +2227,7 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 		pProfile.fPVSCheck += fProfileFinish - fProfilePVS;
 		pProfile.fFinish += TransmitProfileNow() - fProfileFinish;
 		pProfile.nFullEntities += g_nEntityTransmitCache.nFullEdictCount + 1;
+		pProfile.nAlwaysManipulators += g_nEntityTransmitCache.nAlwaysManipulatorCount + 1;
 		pProfile.nPVSEntities += g_nEntityTransmitCache.nPVSEdictCount + 1;
 		++pProfile.nPasses;
 	}
