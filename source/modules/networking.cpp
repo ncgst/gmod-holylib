@@ -14,6 +14,7 @@
 #include <bitset>
 #include <chrono>
 #include <cstdint>
+#include <vector>
 #include <datacache/imdlcache.h>
 #include <cmodel_private.h>
 #include "server.h"
@@ -529,6 +530,13 @@ static inline CBaseEntity* GetMyWeapon(const void* pPlayer, const int nWeaponSlo
 	return EHandleToEntity((CBaseCombatWeaponHandle*)m_hMyWeapons_Offset.GetPointerArray(pPlayer, nWeaponSlot));
 }
 
+// All weapon handles of a player as raw bytes, to notice when one of them changed.
+static constexpr size_t nMyWeaponHandlesSize = MAX_WEAPONS * sizeof(CBaseCombatWeaponHandle);
+static inline const void* GetMyWeaponHandles(const void* pPlayer)
+{
+	return m_hMyWeapons_Offset.GetPointerArray(pPlayer, 0);
+}
+
 static DTVarByOffset m_hViewModel_Offset("DT_BasePlayer", "m_hViewModel", sizeof(CBasePlayer::CBaseViewModelHandle));
 static inline CBaseViewModel* GetViewModel(const void* pPlayer, const int nViewModelSlot)
 {
@@ -586,6 +594,18 @@ static ConVar networking_bind_manipulators("holylib_networking_bind_manipulators
 // implementation that runs the parent's UpdateTransmitState again. For a parent in the always transmit state the answer
 // is FL_EDICT_ALWAYS, so such a manipulator is sent like an always transmitted entity, still honouring its own prevent bit.
 // Players are excluded since their answer depends on the recipient. They are recognized by their network class.
+// The parent is checked again for every recipient: during the tick a manipulator can be detached, and its parent can
+// change its transmit state.
+static inline bool HasAlwaysTransmittedParent(CCServerNetworkProperty* pNetProp)
+{
+	CCServerNetworkProperty* pParent = GetNetworkParentSafe(pNetProp);
+	edict_t* pParentEdict = pParent ? pParent->edict() : nullptr;
+	if (!pParentEdict || pParentEdict->m_EdictIndex <= gpGlobals->maxClients)
+		return false;
+
+	return (pParentEdict->m_fStateFlags & (FL_EDICT_ALWAYS|FL_EDICT_DONTSEND)) == FL_EDICT_ALWAYS;
+}
+
 static inline bool IsManipulatorOfAlwaysTransmitted(edict_t* pEdict)
 {
 	CCServerNetworkProperty* pNetProp = static_cast<CCServerNetworkProperty*>(pEdict->GetNetworkable());
@@ -594,12 +614,7 @@ static inline bool IsManipulatorOfAlwaysTransmitted(edict_t* pEdict)
 	if (!pNetworkName || (strcmp(pNetworkName, "CBoneManipulate") != 0 && strcmp(pNetworkName, "CFlexManipulate") != 0))
 		return false;
 
-	CCServerNetworkProperty* pParent = GetNetworkParentSafe(pNetProp);
-	edict_t* pParentEdict = pParent ? pParent->edict() : nullptr;
-	if (!pParentEdict || pParentEdict->m_EdictIndex <= gpGlobals->maxClients)
-		return false;
-
-	return (pParentEdict->m_fStateFlags & (FL_EDICT_ALWAYS|FL_EDICT_DONTSEND)) == FL_EDICT_ALWAYS;
+	return HasAlwaysTransmittedParent(pNetProp);
 }
 
 struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, though its a good foundation now.
@@ -1098,6 +1113,43 @@ void Networking_ForceWeaponTransmit(int entIndex, bool bForceTransmit) // Expose
 	}
 }
 
+// The weapons a player holds this tick, in slot order (holylib_networking_transmit_weaponlist).
+// hook_CBaseCombatCharacter_SetTransmit runs for every recipient that receives the player, and walking all MAX_WEAPONS
+// handles each time costs far more than this. The list is only used while the player's weapon handles are byte for byte
+// what they were when it was built: a weapon picked up, dropped or stripped later in the same tick sends every caller
+// back to the slot scan. A deleted weapon keeps its handle, so OnEntityDeleted invalidates the lists instead.
+struct PlayerWeaponList
+{
+	inline void Begin(const CBaseEntity* pPlayer, const int nTick)
+	{
+		nCount = 0;
+		pOwner = pPlayer;
+		nBuildTick = nTick;
+		memcpy(pHandles, GetMyWeaponHandles(pPlayer), sizeof(pHandles));
+	}
+
+	inline void Add(CBaseEntity* pWeapon)
+	{
+		pWeapons[nCount++] = pWeapon;
+	}
+
+	inline bool IsValid(const CBaseEntity* pPlayer, const int nTick) const
+	{
+		return pOwner && pOwner == pPlayer && nBuildTick == nTick && memcmp(pHandles, GetMyWeaponHandles(pPlayer), sizeof(pHandles)) == 0;
+	}
+
+	inline void Invalidate()
+	{
+		pOwner = nullptr;
+	}
+
+	const CBaseEntity* pOwner = nullptr;
+	int nBuildTick = 0;
+	int nCount = 0;
+	CBaseEntity* pWeapons[MAX_WEAPONS] = {nullptr};
+	unsigned char pHandles[nMyWeaponHandlesSize] = {0};
+};
+
 // Full cache persisting across ticks, reset only when the player disconnects.
 static ConVar* sv_stressbots = nullptr;
 static ConVar networking_transmit_newweapons("holylib_networking_transmit_newweapons", "1", 0, "If enabled, weapons that a player equipped/was given are networked for the first x ticks");
@@ -1129,13 +1181,13 @@ struct PlayerTransmitCache
 			nLastAcknowledgedTick = nTick - nTransmitTicks;
 		}
 
-		nWeaponCount = 0;
+		pWeaponList.Begin(pPlayer, nTick);
 		for (int i=0; i<MAX_WEAPONS; ++i)
 		{
 			WeaponSlot& pSlot = pWeapons[i];
 			CBaseEntity *pWeapon = GetMyWeapon(pPlayer, i);
 			if (pWeapon)
-				pWeaponList[nWeaponCount++] = pWeapon;
+				pWeaponList.Add(pWeapon);
 
 			if (pWeapon && pWeapon->edict())
 			{
@@ -1159,24 +1211,15 @@ struct PlayerTransmitCache
 			}
 		}
 
-		pWeaponListOwner = pPlayer;
-		nWeaponListTick = nTick;
-
 		// If you have less weapons, they will be transmitted more frequently
 		if (++nNextWeaponSlot >= nHighestWeaponSlot)
 			nNextWeaponSlot = 0;
 	}
 
-	// The weapon list is only valid for the player and tick NextTick built it for.
-	// Outside our CheckTransmit, or after an entity was deleted, callers scan all weapon slots instead.
-	inline bool HasWeaponList(const CBaseEntity* pPlayer, int nTick) const
-	{
-		return pWeaponListOwner && pWeaponListOwner == pPlayer && nWeaponListTick == nTick;
-	}
-
+	// After an entity was deleted, callers scan all weapon slots for the rest of the tick (see PlayerWeaponList).
 	inline void InvalidateWeaponList()
 	{
-		pWeaponListOwner = nullptr;
+		pWeaponList.Invalidate();
 	}
 
 	void Reset()
@@ -1226,12 +1269,7 @@ struct PlayerTransmitCache
 	int nHighestWeaponSlot = 0;
 	WeaponSlot pWeapons[MAX_WEAPONS];
 
-	// The weapons the player holds this tick, in slot order. hook_CBaseCombatCharacter_SetTransmit runs for every
-	// recipient that receives the player, and walking all MAX_WEAPONS handles each time costs far more than this.
-	const CBaseEntity* pWeaponListOwner = nullptr;
-	int nWeaponListTick = 0;
-	int nWeaponCount = 0;
-	CBaseEntity* pWeaponList[MAX_WEAPONS] = {nullptr};
+	PlayerWeaponList pWeaponList;
 };
 // NOTE: Index is playerslot / entindex - 1
 static PlayerTransmitCache g_pPlayerTransmitCache[MAX_PLAYERS];
@@ -1434,19 +1472,32 @@ static void hook_CBaseCombatCharacter_SetTransmit(CBaseCombatCharacter* pCharact
 
 	if (networking_transmit_all_weapons.GetBool() || (bLocalPlayer && networking_transmit_all_weapons_to_owner.GetBool()))
 	{
-		const PlayerTransmitCache& pWeaponCache = g_pPlayerTransmitCache[pCharacterEdict->m_EdictIndex-1];
-		if (networking_transmit_weaponlist.GetBool() && pWeaponCache.HasWeaponList(pCharacter, gpGlobals->tickcount))
+		const PlayerWeaponList& pWeaponList = g_pPlayerTransmitCache[pCharacterEdict->m_EdictIndex-1].pWeaponList;
+		bool bListed = networking_transmit_weaponlist.GetBool() && pWeaponList.IsValid(pCharacter, gpGlobals->tickcount);
+		if (bListed)
 		{
 			// Same weapons in the same order as the slot scan below, resolved once this tick.
-			for (int i=0; i < pWeaponCache.nWeaponCount; ++i)
-				pWeaponCache.pWeaponList[i]->SetTransmit(pInfo, bAlways);
+			for (int i=0; i < pWeaponList.nCount; ++i)
+			{
+				pWeaponList.pWeapons[i]->SetTransmit(pInfo, bAlways);
+				if (!pWeaponList.pOwner)
+				{
+					// An entity was deleted from inside SetTransmit, the remaining pointers may be gone.
+					bListed = false;
+					break;
+				}
+			}
+		}
 
+		if (bListed)
+		{
 			if (pProfileScope.bEnabled)
 			{
 				++g_pTransmitProfile.nCharacterListCalls;
-				g_pTransmitProfile.nCharacterWeapons += pWeaponCache.nWeaponCount;
+				g_pTransmitProfile.nCharacterWeapons += pWeaponList.nCount;
 			}
 		} else {
+			// Also finishes a list that was dropped halfway, SetTransmit returns early for what was already sent.
 			for (int i=0; i < MAX_WEAPONS; ++i)
 			{
 				CBaseEntity *pWeapon = GetMyWeapon(pCharacter, i);
@@ -1564,6 +1615,9 @@ void Networking_SetNextTransmitRange(vec_t nRange)
 // avoids touching every entity object once per recipient; the entity is only used to send it or walk its parents.
 // An entry is only used while the entity's PVS data is unchanged since Build(): a dirty entity, or one whose data
 // was recomputed during this tick's transmit (pStale), goes through DoTransmitPVSCheck like before.
+// The copy owns everything it reads, and an entity deleted during the transmit only loses its entry (EntityRemoved).
+// Not noticed until the next tick: an entity that code running during the transmit moves and that something other
+// than our checks then recomputes, and an entity that gets its first parent during the transmit.
 struct PVSSnapshot
 {
 	static constexpr int nInlineClusters = 4;
@@ -1571,6 +1625,7 @@ struct PVSSnapshot
 	{
 		FLAG_LIVE = 1 << 0, // No network property or an unusual area: always use DoTransmitPVSCheck.
 		FLAG_HAS_PARENT = 1 << 1,
+		FLAG_REMOVED = 1 << 2, // Deleted after Build(), the entity pointers of this entry are gone.
 	};
 
 	struct Entry
@@ -1589,6 +1644,8 @@ struct PVSSnapshot
 	{
 		nCount = 0;
 		pStale.ClearAll();
+		pClusterData.clear();
+		memset(pEntryOfEdict, -1, sizeof(pEntryOfEdict));
 		const EntityTransmitCache& pCache = g_nEntityTransmitCache;
 		for (int i=0; i<=pCache.nPVSEdictCount; ++i)
 		{
@@ -1603,6 +1660,8 @@ struct PVSSnapshot
 			pEntry.nEdict = static_cast<unsigned short>(pEdict->m_EdictIndex);
 			pEntry.nFlags = 0;
 			pEntity[nIndex] = pEnt;
+			pEntryOfEdict[pEdict->m_EdictIndex] = static_cast<short>(nIndex);
+			pClusterOffset[nIndex] = 0;
 
 			CCServerNetworkProperty* pNetProp = static_cast<CCServerNetworkProperty*>(pEdict->GetNetworkable());
 			pNetworkProperty[nIndex] = pNetProp;
@@ -1618,9 +1677,12 @@ struct PVSSnapshot
 			pEntry.nAreaNum2 = static_cast<short>(pInfo.m_nAreaNum2);
 			pEntry.nClusterCount = static_cast<short>(pInfo.m_nClusterCount);
 			pEntry.nHeadNode = static_cast<short>(pInfo.m_nHeadNode);
-			pClusterList[nIndex] = pInfo.m_pClusters;
-			if (pEntry.nClusterCount > 0 && pEntry.nClusterCount <= nInlineClusters)
+			if (pEntry.nClusterCount > nInlineClusters)
 			{
+				// The engine frees and replaces this list when it recomputes the entity, so it is copied as well.
+				pClusterOffset[nIndex] = static_cast<int>(pClusterData.size());
+				pClusterData.insert(pClusterData.end(), pInfo.m_pClusters, pInfo.m_pClusters + pEntry.nClusterCount);
+			} else {
 				for (int nCluster=0; nCluster<pEntry.nClusterCount; ++nCluster)
 					pEntry.pClusters[nCluster] = pInfo.m_pClusters[nCluster];
 			}
@@ -1653,17 +1715,42 @@ struct PVSSnapshot
 			pStale.Set(pEdict->m_EdictIndex);
 	}
 
+	// The entity was deleted. A loop that is walking the entries sees this too: a ShouldTransmit callback of one
+	// entity can delete another one that comes later.
+	inline void EntityRemoved(const edict_t* pEdict)
+	{
+		const int nEdict = pEdict->m_EdictIndex;
+		if (!bValid || nEdict < 0 || nEdict >= MAX_EDICTS)
+			return;
+
+		const int nIndex = pEntryOfEdict[nEdict];
+		if (nIndex < 0)
+			return;
+
+		pEntryOfEdict[nEdict] = -1;
+		pEntries[nIndex].nFlags |= FLAG_REMOVED;
+		pEntity[nIndex] = nullptr;
+		pNetworkProperty[nIndex] = nullptr;
+	}
+
 	bool bValid = false;
 	int nBuildTick = -1;
 	int nCount = 0;
 	CBitVec<MAX_EDICTS> pStale;
 	Entry pEntries[MAX_EDICTS];
+	short pEntryOfEdict[MAX_EDICTS]; // Entry of an edict index, -1 without one.
 	// Only needed when an entity is sent, has parents or needs the live check.
 	CBaseEntity* pEntity[MAX_EDICTS];
 	CCServerNetworkProperty* pNetworkProperty[MAX_EDICTS];
-	const unsigned short* pClusterList[MAX_EDICTS];
+	// Cluster lists that don't fit into their entry, one after another.
+	int pClusterOffset[MAX_EDICTS];
+	std::vector<unsigned short> pClusterData;
 };
 static PVSSnapshot g_pPVSSnapshot;
+
+// Counts the ShouldTransmit calls made from the PVS checks. Such a call can run Lua and change the world, which
+// TransmitPVSSnapshot looks for before it reuses what it looked up earlier in the same pass.
+static unsigned int g_nTransmitCallbacks = 0;
 
 // If the entity is marked "check PVS" but it's in hierarchy, walk up the hierarchy looking for
 // any parent which is also in the PVS. If none are found, then we don't need to worry about sending ourself.
@@ -1714,6 +1801,7 @@ static inline void TransmitIfParentVisible(CCServerNetworkProperty* netProp, CBa
 				return; // RaphaelIT7: ABORT! We got a garbage edict?
 
 			const int nFlags = pCheckEntity->ShouldTransmit( pInfo );
+			++g_nTransmitCallbacks;
 			// Assert( !(nFlags & FL_EDICT_FULLCHECK) );
 			if ( nFlags & FL_EDICT_ALWAYS )
 			{
@@ -1801,14 +1889,39 @@ static inline void DoTransmitPVSCheck(
 	TransmitIfParentVisible(netProp, pEnt, pInfo, pPVSQuery);
 }
 
+// A full check entity answers for every recipient, and may ask for the PVS check.
+static inline void TransmitFullCheckEntity(
+	CBaseEntity* pEnt, const bool bIsHLTV, CCheckTransmitInfo *pInfo,
+	const bool bForceTransmit, const int skyBoxArea, const Vector& clientPosition, const vec_t maxTransmitRange,
+	TransmitPVSQuery& pPVSQuery
+)
+{
+	// do a full ShouldTransmit() check, may return FL_EDICT_CHECKPVS
+	const int nFlags = pEnt->ShouldTransmit(pInfo);
+	if (nFlags & FL_EDICT_ALWAYS)
+	{
+		pEnt->SetTransmit(pInfo, true);
+		// g_pAlwaysTransmitCacheBitVec.Set( iEdict ); We do NOT do this since view models and such would also be included.
+		return;
+	}
+
+	if (!(nFlags & FL_EDICT_PVSCHECK))
+		return;
+
+	// Now only PVS remains
+	DoTransmitPVSCheck(pEnt->edict(), pEnt, bIsHLTV, pInfo, bForceTransmit, skyBoxArea, clientPosition, maxTransmitRange, pPVSQuery);
+}
+
 // The PVS entity loop of CheckTransmit using g_pPVSSnapshot, for a recipient that isn't HLTV and has no transmit range.
 // Makes the same decisions in the same order as DoTransmitPVSCheck over pPVSEntityList.
 static void TransmitPVSSnapshot(CCheckTransmitInfo *pInfo, const bool bForceTransmit, const int skyBoxArea,
 	const Vector& clientPosition, TransmitPVSQuery& pPVSQuery)
 {
 	// Whether an area is connected to one of the recipient's areas, filled in for the areas entities are in.
+	// Looked up again after a ShouldTransmit call, which can open or close an area portal.
 	signed char pAreaConnected[MAX_MAP_AREAS];
 	memset(pAreaConnected, -1, sizeof(pAreaConnected));
+	unsigned int nCallbacks = g_nTransmitCallbacks;
 	const auto IsAreaConnected = [pInfo, &pAreaConnected](int nArea) {
 		signed char& nState = pAreaConnected[nArea];
 		if (nState < 0)
@@ -1833,8 +1946,14 @@ static void TransmitPVSSnapshot(CCheckTransmitInfo *pInfo, const bool bForceTran
 	{
 		const PVSSnapshot::Entry& pEntry = pSnapshot.pEntries[i];
 		const int iEdict = pEntry.nEdict;
-		if (pInfo->m_pTransmitEdict->Get(iEdict) || g_pDontTransmitCache.Get(iEdict))
+		if ((pEntry.nFlags & PVSSnapshot::FLAG_REMOVED) || pInfo->m_pTransmitEdict->Get(iEdict) || g_pDontTransmitCache.Get(iEdict))
 			continue;
+
+		if (nCallbacks != g_nTransmitCallbacks)
+		{
+			memset(pAreaConnected, -1, sizeof(pAreaConnected));
+			nCallbacks = g_nTransmitCallbacks;
+		}
 
 		CBaseEntity* pEnt = pSnapshot.pEntity[i];
 		if ((pEntry.nFlags & PVSSnapshot::FLAG_LIVE) || (pEntry.pEdict->m_fStateFlags & FL_EDICT_DIRTY_PVS_INFORMATION) || pSnapshot.pStale.Get(iEdict))
@@ -1858,7 +1977,7 @@ static void TransmitPVSSnapshot(CCheckTransmitInfo *pInfo, const bool bForceTran
 			{
 				bInPVS = pPVSQuery.CheckHeadnode(pInfo, pEntry.nHeadNode);
 			} else {
-				const unsigned short* pClusters = pEntry.nClusterCount <= PVSSnapshot::nInlineClusters ? pEntry.pClusters : pSnapshot.pClusterList[i];
+				const unsigned short* pClusters = pEntry.nClusterCount <= PVSSnapshot::nInlineClusters ? pEntry.pClusters : &pSnapshot.pClusterData[pSnapshot.pClusterOffset[i]];
 				const unsigned char* pPVS = pInfo->m_PVS;
 				for (int nCluster = pEntry.nClusterCount; --nCluster >= 0; )
 				{
@@ -2092,7 +2211,15 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 		if (pInfo->m_pTransmitEdict->Get(iEdict) || g_pDontTransmitCache.Get(iEdict))
 			continue;
 
-		pEnt->SetTransmit(pInfo, true);
+		CCServerNetworkProperty* pNetProp = static_cast<CCServerNetworkProperty*>(pEntEdict->GetNetworkable());
+		if (pNetProp && HasAlwaysTransmittedParent(pNetProp))
+		{
+			pEnt->SetTransmit(pInfo, true);
+			continue;
+		}
+
+		// Detached, or the parent's transmit state changed, after the list was built this tick: ask it like before.
+		TransmitFullCheckEntity(pEnt, bIsHLTV, pInfo, bForceTransmit, skyBoxArea, clientPosition, maxTransmitRange, pPVSQuery);
 	}
 
 	for (int i=0; i<=g_nEntityTransmitCache.nFullEdictCount; ++i)
@@ -2107,20 +2234,7 @@ bool New_CServerGameEnts_CheckTransmit(IServerGameEnts* gameents, CCheckTransmit
 		if (pInfo->m_pTransmitEdict->Get(iEdict) || g_pDontTransmitCache.Get(iEdict))
 			continue;
 
-		// do a full ShouldTransmit() check, may return FL_EDICT_CHECKPVS
-		const int nFlags = pEnt->ShouldTransmit(pInfo);
-		if (nFlags & FL_EDICT_ALWAYS)
-		{
-			pEnt->SetTransmit(pInfo, true);
-			// g_pAlwaysTransmitCacheBitVec.Set( iEdict ); We do NOT do this since view models and such would also be included.
-			continue;
-		}
-
-		if (!(nFlags & FL_EDICT_PVSCHECK))
-			continue;
-
-		// Now only PVS remains
-		DoTransmitPVSCheck(pEnt->edict(), pEnt, bIsHLTV, pInfo, bForceTransmit, skyBoxArea, clientPosition, maxTransmitRange, pPVSQuery);
+		TransmitFullCheckEntity(pEnt, bIsHLTV, pInfo, bForceTransmit, skyBoxArea, clientPosition, maxTransmitRange, pPVSQuery);
 	}
 
 	const double fProfilePVS = bProfile ? TransmitProfileNow() : 0.0;
@@ -2409,14 +2523,14 @@ void CNetworkingModule::OnEntityDeleted(CBaseEntity* pEntity)
 	g_pEntityCache[pEdict->m_EdictIndex] = nullptr;
 	g_pForceWeaponTransmitIndexes.Clear(pEdict->m_EdictIndex);
 
+	g_pPVSSnapshot.EntityRemoved(pEdict);
+
 	// Deleted after this tick's weapon lists were built? One of them may hold it, so scan the slots again for the
 	// rest of the tick. Deletions earlier in the frame only touch lists of a previous tick, which aren't used.
 	if (gpGlobals && !g_pGlobalTransmitTickCache.IsNewTick(gpGlobals->tickcount))
 	{
 		for (PlayerTransmitCache& pCache : g_pPlayerTransmitCache)
 			pCache.InvalidateWeaponList();
-
-		g_pPVSSnapshot.Invalidate(); // The PVS list itself just changed.
 	}
 }
 

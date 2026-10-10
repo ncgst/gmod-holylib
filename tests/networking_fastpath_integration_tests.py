@@ -27,6 +27,8 @@ def main():
         "DO_TRANSMIT": between(net, "// Per-tick copy of the PVS data of every entity in the PVS list", "\nstatic ConVar networking_fastpath("),
         "CHECK_TRANSMIT": between(net, "bool New_CServerGameEnts_CheckTransmit(", "\nvoid SV_FillHLTVData("),
         "TRANSMIT_PROFILE": between(net, "// Transmit profiling: timings are summed", "// End of transmit profiling"),
+        "WEAPON_LIST": between(net, "// The weapons a player holds this tick, in slot order", "\n// Full cache persisting across ticks"),
+        "ENTITY_DELETED": between(net, "void CNetworkingModule::OnEntityDeleted(", "\nvoid CNetworkingModule::OnEntityCreated("),
         "CHARACTER_TRANSMIT": between(net, "static void hook_CBaseCombatCharacter_SetTransmit(", "\nstatic inline bool IsInPVS("),
         "ATTACHMENT_EXCLUSION": between(net, "\t\t// First we build data based off all players", "\n\t\tfor (int i=0; i < nEdicts; ++i)"),
         "MANIPULATOR": between(net, "// GMod's bone and flex manipulators", "\nstruct EntityTransmitCache"),

@@ -2301,17 +2301,20 @@ This tick count is used by the `holylib_networking_transmit_newweapons`, `holyli
 #### holylib_networking_transmit_weaponlist(default `1`)
 If enabled, the weapons of each player are collected once per tick, and every player that receives them gets them from that list.<br>
 If disabled, all weapon slots of a player are checked again for every player that receives them.<br>
+The list is only used while the player's weapon slots are unchanged since it was collected, so a weapon picked up, dropped or stripped later in the same tick is handled like with the setting disabled.<br>
 Both send the same weapons, the setting only exists to compare them or to fall back without a restart.<br>
 
 #### holylib_networking_pvssnapshot(default `0`)
 Experimental. If enabled, the PVS data (areas, clusters, headnode) of all PVS checked entities is copied once per tick, and every player is checked against that copy.<br>
 Most entities aren't visible to a given player, and this avoids reading each of their entity objects once per player. The entity itself is still used to send it and to check its parents.<br>
 Entities whose PVS data changes during the transmit are checked directly, as before. The copy isn't used for SourceTV, for players with a transmit range (`pvs.SetMaxViewDistance`) or with `holylib_networking_areasplit`.<br>
+Two changes made by code that runs during the transmit (a `HolyLib:PreCheckTransmit`/`HolyLib:PostCheckTransmit` hook or an `ENT:UpdateTransmitState`) only take effect on the next tick: moving an entity and then also having something other than the transmit read its updated PVS data, and giving an entity its first parent.<br>
 
 #### holylib_networking_bind_manipulators(default `1`)
 GMod creates a `manipulate_bone` or `manipulate_flex` entity for every entity whose bones or flexes are manipulated (`Entity:ManipulateBone*`, also with networking disabled, and `Entity:SetFlex*`). It is parented to that entity, and its `ShouldTransmit` returns the parent's `ShouldTransmit` for every player. For most entities that runs the parent's `UpdateTransmitState` again, which for scripted entities is a Lua call: one per manipulator and player every tick.<br>
 If enabled, manipulators of a non-player entity in the always transmit state are sent like always transmitted entities instead, unless they are prevented for that player.<br>
-This assumes that the parent's transmit state only changes when it is updated (for example after `EFL_FORCE_CHECK_TRANSMIT`), not between two checks of the same tick.<br>
+The parent and its transmit state are looked at again for every player. A manipulator that was detached, or whose parent left the always transmit state, during the tick is asked like with the setting disabled.<br>
+The parent's `UpdateTransmitState` is no longer run for every player, so a scripted parent that wants to change its answer has to update its transmit state itself (for example with `EFL_FORCE_CHECK_TRANSMIT`), like for its own transmit.<br>
 
 #### holylib_networking_transmit_profile(default `0`)
 If enabled, our `CServerGameEnts::CheckTransmit` is timed by phase. Use `holylib_networking_transmit_stats` to read the result.<br>

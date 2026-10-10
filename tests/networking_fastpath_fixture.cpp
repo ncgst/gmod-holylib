@@ -98,10 +98,23 @@ static bool portalOpen = true;
 static bool CheckAreasConnected(int a, int b) { return a == b || portalOpen; }
 // PRODUCTION_PVS
 
+// A deleted entity is only really freed when the address sanitizer can report its use. Otherwise it stays allocated,
+// so that the deleted flag makes any later call fail the same way on every compiler.
+#if defined(__SANITIZE_ADDRESS__)
+#define FIXTURE_FREE_DELETED 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define FIXTURE_FREE_DELETED 1
+#endif
+#endif
 static int shouldTransmitCalls = 0;
 struct CBaseEntity
 {
 	edict_t entry;
+	edict_t* engineEdict = nullptr; // The engine's edicts outlive their entity; set for entities a test deletes.
+	bool deleted = false;
+	void (*onShouldTransmit)(CBaseEntity*) = nullptr; // What a Lua UpdateTransmitState could do.
+	void (*onSetTransmit)(CBaseEntity*) = nullptr;
 	CCServerNetworkProperty property;
 	CCollisionProperty collision;
 	CBaseEntity* view = nullptr;
@@ -119,7 +132,7 @@ struct CBaseEntity
 	int transmitState = -1; // >= 0: the base ShouldTransmit's answer from the entity's transmit state.
 	int skybox = 3;
 	CBaseEntity() { entry.entity = this; entry.property = &property; property.owner = &entry; }
-	edict_t* edict() { return hasEdict ? &entry : nullptr; }
+	edict_t* edict() { return !hasEdict ? nullptr : engineEdict ? engineEdict : &entry; }
 	bool IsPlayer() const { return player; }
 	const char* GetClassname() const { return "fixture"; }
 	// No GetObserverMode()/GetObserverTarget() members: production must read the networked fields instead of
@@ -127,7 +140,10 @@ struct CBaseEntity
 	const Vector& EyePosition() const { return collision.position; }
 	int ShouldTransmit(CCheckTransmitInfo* info)
 	{
+		assert(!deleted);
 		++shouldTransmitCalls;
+		if (onShouldTransmit)
+			onShouldTransmit(this);
 		if (manipulator)
 		{
 			CBaseEntity* parent = property.parent && property.parent->owner ? property.parent->owner->entity : nullptr;
@@ -145,6 +161,9 @@ struct CBaseEntity
 	void SetTransmit(CCheckTransmitInfo* info, bool always);
 	void BaseSetTransmit(CCheckTransmitInfo* info, bool always)
 	{
+		assert(!deleted);
+		if (onSetTransmit)
+			onSetTransmit(this);
 		info->m_pTransmitEdict->Set(entry.m_EdictIndex);
 		if (always && info->m_pTransmitAlways)
 			info->m_pTransmitAlways->Set(entry.m_EdictIndex);
@@ -223,6 +242,10 @@ static ConVar networking_bind_manipulators{true};
 static ConVar forceTransmit;
 static ConVar* sv_force_transmit_ents = &forceTransmit;
 static bool fillWeaponLists = false; // Whether NextTick builds the per-tick weapon list as production does.
+// The fixture's weapon slots stand in for the engine's handles.
+constexpr std::size_t nMyWeaponHandlesSize = sizeof(CBaseEntity::weapons);
+static const void* GetMyWeaponHandles(const CBaseEntity* player) { return player->weapons; }
+// PRODUCTION_WEAPON_LIST
 struct PlayerTransmitCache
 {
 	struct WeaponSlot { bool bIsNew = false, bAlwaysNetwork = false; };
@@ -230,25 +253,19 @@ struct PlayerTransmitCache
 	int nNextWeaponSlot = 0;
 	bool full = false;
 	int nLastAcknowledgedTick = 0;
-	const CBaseEntity* pWeaponListOwner = nullptr;
-	int nWeaponListTick = 0, nWeaponCount = 0;
-	CBaseEntity* pWeaponList[MAX_WEAPONS]{};
+	PlayerWeaponList pWeaponList;
 	void NextTick(CBaseEntity* player, int tick)
 	{
 		if (!fillWeaponLists)
 			return;
-		nWeaponCount = 0;
+		// The list calls of the production NextTick, without its slot bookkeeping.
+		pWeaponList.Begin(player, tick);
 		for (int i = 0; i < MAX_WEAPONS; ++i)
 			if (CBaseEntity* weapon = GetMyWeapon(player, i))
-				pWeaponList[nWeaponCount++] = weapon;
-		pWeaponListOwner = player;
-		nWeaponListTick = tick;
+				pWeaponList.Add(weapon);
 	}
-	bool HasWeaponList(const CBaseEntity* player, int tick) const
-	{
-		return pWeaponListOwner && pWeaponListOwner == player && nWeaponListTick == tick;
-	}
-	void InvalidateWeaponList() { pWeaponListOwner = nullptr; }
+	bool HasWeaponList(const CBaseEntity* player, int tick) const { return pWeaponList.IsValid(player, tick); }
+	void InvalidateWeaponList() { pWeaponList.Invalidate(); }
 	bool InFullUpdate(int = 0) const { return full; }
 };
 static PlayerTransmitCache g_pPlayerTransmitCache[MAX_PLAYERS];
@@ -298,6 +315,10 @@ static CCollisionProperty* GetEntityCollisionProperty(CBaseEntity* ent) { return
 static vec_t g_nTransmitRange = -1.0f;
 // PRODUCTION_DO_TRANSMIT
 // PRODUCTION_CHECK_TRANSMIT
+struct CNetworkingModule { void OnEntityDeleted(CBaseEntity* pEntity); };
+static CBitVec<MAX_EDICTS> g_pForceWeaponTransmitIndexes;
+static void CleanupSetPreventTransmit(CBaseEntity*) {}
+// PRODUCTION_ENTITY_DELETED
 
 struct Result
 {
@@ -640,24 +661,233 @@ static void CheckAlwaysTransmitParents()
 		"both cache settings passed\n";
 }
 
-// A weapon list is used for the rest of its tick; once invalidated (CNetworkingModule::OnEntityDeleted does this
-// when an entity is deleted mid-tick) the character hook scans the weapon slots again.
-static void CheckWeaponListInvalidation()
+// Like ObserverTransmit, but only the headnodes and clusters 0-7 named by the given byte are in the PVS.
+static CBitVec<MAX_EDICTS> NarrowTransmit(int recipient, unsigned char visible)
+{
+	CBitVec<MAX_EDICTS> transmit;
+	CCheckTransmitInfo info;
+	info.m_pClientEnt = &entities[recipient].entry;
+	info.m_pTransmitEdict = &transmit;
+	info.m_PVS[0] = visible;
+	g_nTransmitRange = -1.0f;
+	assert(New_CServerGameEnts_CheckTransmit(Util::servergameents, &info, nullptr, 0));
+	return transmit;
+}
+
+// An entity that a callback deletes in the middle of a transmit, through the production OnEntityDeleted.
+static CBaseEntity* deletableEntity = nullptr;
+static CBaseEntity** deletableSlot = nullptr; // A weapon slot holding it; a handle to a deleted entity resolves to null.
+static edict_t deletableEdict;
+static CBaseEntity* NewDeletableEntity(int index)
+{
+	CBaseEntity* entity = new CBaseEntity;
+	entity->entry.m_EdictIndex = index;
+	deletableEdict = entity->entry;
+	entity->engineEdict = &deletableEdict;
+	entity->property.owner = &deletableEdict;
+	g_pEntityCache[index] = entity;
+	deletableEntity = entity;
+	deletableSlot = nullptr;
+	return entity;
+}
+static void DeleteDeletableEntity(CBaseEntity* caller)
+{
+	caller->onShouldTransmit = nullptr;
+	caller->onSetTransmit = nullptr;
+	CNetworkingModule module;
+	module.OnEntityDeleted(deletableEntity);
+	if (deletableSlot)
+		*deletableSlot = nullptr;
+	deletableEntity->deleted = true;
+#ifdef FIXTURE_FREE_DELETED
+	delete deletableEntity;
+#endif
+	deletableEntity = nullptr;
+}
+
+// A weapon list is only used while the player's weapon slots are what they were when it was built: after a pickup,
+// drop or replacement later in the same tick, every recipient gets what the slot scan sends. A deleted weapon keeps its
+// handle, so CNetworkingModule::OnEntityDeleted invalidates the lists, also while one of them is being sent.
+static void CheckWeaponListChanges()
 {
 	fillWeaponLists = true;
+	for (int change = 0; change < 3; ++change)
+	{
+		std::bitset<MAX_EDICTS> sent[2];
+		for (int listed = 0; listed < 2; ++listed)
+		{
+			ResetObserverWorld(false);
+			networking_transmit_all_weapons.value = true;
+			networking_transmit_weaponlist.value = listed;
+			const auto first = ObserverTransmit(1);
+			assert(first.Get(710) && first.Get(711) && !first.Get(712));
+			assert(g_pPlayerTransmitCache[0].HasWeaponList(&entities[1], globals.tickcount));
+			if (change == 0) entities[1].weapons[2] = &entities[712]; // Picked up.
+			if (change == 1) entities[1].weapons[1] = nullptr; // Dropped, the weapon still exists.
+			if (change == 2) entities[1].weapons[1] = &entities[712]; // Replaced in its slot.
+			assert(!g_pPlayerTransmitCache[0].HasWeaponList(&entities[1], globals.tickcount));
+			sent[listed] = ObserverTransmit(3).bits; // A later recipient of the same tick.
+		}
+		assert(sent[0] == sent[1]);
+		assert(sent[1].test(710) && sent[1].test(711) == (change == 0) && sent[1].test(712) == (change != 1));
+	}
+
+	// The first weapon's SetTransmit deletes the second one: the rest comes from the slots, the deleted one isn't used.
+	for (int listed = 0; listed < 2; ++listed)
+	{
+		ResetObserverWorld(false);
+		networking_transmit_all_weapons.value = true;
+		networking_transmit_weaponlist.value = listed;
+		entities[1].weapons[1] = NewDeletableEntity(713);
+		entities[1].weapons[2] = &entities[712];
+		deletableSlot = &entities[1].weapons[1];
+		entities[710].onSetTransmit = &DeleteDeletableEntity;
+		g_nEntityTransmitCache.m_bIsActivelyNetworking = true;
+		const auto sent = ObserverTransmit(1);
+		assert(!deletableEntity && !entities[1].weapons[1]);
+		assert(sent.Get(710) && sent.Get(712) && !sent.Get(713));
+	}
+	networking_transmit_weaponlist.value = true;
+
+	// Invalidated by a deletion elsewhere, and rebuilt on the next tick.
 	ResetObserverWorld(false);
 	networking_transmit_all_weapons.value = true;
-	const auto first = ObserverTransmit(1);
-	assert(first.Get(710) && first.Get(711) && !first.Get(712));
-	entities[1].weapons[2] = &entities[712]; // Changed after this tick's lists were built.
-	assert(!ObserverTransmit(1).Get(712)); // The list is in use for this tick.
+	assert(ObserverTransmit(1).Get(711) && g_pPlayerTransmitCache[0].HasWeaponList(&entities[1], globals.tickcount));
 	g_pPlayerTransmitCache[0].InvalidateWeaponList();
-	assert(ObserverTransmit(1).Get(712));
+	assert(!g_pPlayerTransmitCache[0].HasWeaponList(&entities[1], globals.tickcount) && ObserverTransmit(1).Get(711));
 	++globals.tickcount;
-	const auto nextTick = ObserverTransmit(1); // A new tick rebuilds the list, which now holds the new weapon.
-	assert(nextTick.Get(712) && g_pPlayerTransmitCache[0].HasWeaponList(&entities[1], globals.tickcount));
+	assert(ObserverTransmit(1).Get(711) && g_pPlayerTransmitCache[0].HasWeaponList(&entities[1], globals.tickcount));
 	fillWeaponLists = false;
-	std::cout << "Weapon lists: used within their tick, slot scan after invalidation, rebuilt on the next tick\n";
+	std::cout << "Weapon lists: pickup, drop and replacement within the tick match the slot scan, a weapon deleted "
+		"while its list is sent isn't used, rebuilt on the next tick\n";
+}
+
+// An entity deleted by another entity's ShouldTransmit while the PVS entities are being checked must not be used again,
+// in that pass or later in the tick, and everything else must still be sent. With and without the snapshot.
+static void CheckDeletionDuringPVSChecks()
+{
+	std::bitset<MAX_EDICTS> sent[2], later[2];
+	for (int snapshot = 0; snapshot < 2; ++snapshot)
+	{
+		ResetObserverWorld(false);
+		networking_pvssnapshot.value = snapshot;
+		auto& cache = g_nEntityTransmitCache;
+		cache.nPVSEdictCount = -1;
+		// 300 isn't visible and asks its full check parent 450, whose ShouldTransmit deletes 301. 302 comes after it.
+		entities[300].property.m_PVSInfo.m_nHeadNode = 9;
+		entities[300].property.parent = &entities[450].property;
+		entities[450].entry.m_fStateFlags = FL_EDICT_FULLCHECK;
+		entities[450].transmitState = FL_EDICT_DONTSEND;
+		entities[450].onShouldTransmit = &DeleteDeletableEntity;
+		g_pEntityCache[450] = &entities[450];
+		cache.pPVSEntityList[++cache.nPVSEdictCount] = &entities[300];
+		cache.pPVSEntityList[++cache.nPVSEdictCount] = NewDeletableEntity(301);
+		cache.pPVSEntityList[++cache.nPVSEdictCount] = &entities[302];
+		cache.m_bIsActivelyNetworking = true;
+		sent[snapshot] = NarrowTransmit(1, 0x01).bits;
+		assert(!deletableEntity && g_pPVSSnapshot.IsValid(globals.tickcount) == (snapshot != 0));
+		later[snapshot] = NarrowTransmit(2, 0x01).bits;
+		assert(!sent[snapshot].test(301) && sent[snapshot].test(302) && later[snapshot].test(302));
+	}
+	networking_pvssnapshot.value = false;
+	assert(sent[0] == sent[1] && later[0] == later[1]);
+	std::cout << "Deletion from a ShouldTransmit call during the PVS checks: the deleted entity isn't used, the others "
+		"are sent, with and without the snapshot\n";
+}
+
+// The engine frees an entity's cluster list when it recomputes its PVS data. The snapshot keeps its own copy: a list
+// replaced during the transmit, without our checks seeing it, is not read and doesn't change this tick's answer.
+static void CheckSnapshotOwnsClusters()
+{
+	ResetObserverWorld(false);
+	networking_pvssnapshot.value = true;
+	auto& cache = g_nEntityTransmitCache;
+	cache.nPVSEdictCount = -1;
+	cache.pPVSEntityList[++cache.nPVSEdictCount] = &entities[300];
+	auto& pvsInfo = entities[300].property.m_PVSInfo;
+	unsigned short* built = new unsigned short[5]{16, 18, 20, 22, 24};
+	pvsInfo.m_nClusterCount = 5;
+	pvsInfo.m_pClusters = built;
+	assert(!NarrowTransmit(1, 0x02).Get(300)); // Builds the snapshot; none of the five clusters is visible.
+
+	// Recomputed by something else: a new list, the old one freed, the dirty flag already cleared again.
+	unsigned short replaced[1] = {1};
+	for (int i = 0; i < 5; ++i)
+		built[i] = 1; // What a read of the old list finds where the address sanitizer doesn't stop it.
+#ifdef FIXTURE_FREE_DELETED
+	delete[] built;
+#endif
+	pvsInfo.m_nClusterCount = 1;
+	pvsInfo.m_pClusters = replaced;
+	assert(!NarrowTransmit(2, 0x02).Get(300)); // Still this tick's copy.
+	++globals.tickcount;
+	assert(NarrowTransmit(2, 0x02).Get(300)); // The next tick copies the new data.
+#ifndef FIXTURE_FREE_DELETED
+	delete[] built;
+#endif
+	pvsInfo.m_nClusterCount = -1;
+	pvsInfo.m_pClusters = nullptr;
+	networking_pvssnapshot.value = false;
+	std::cout << "PVS snapshot: owns cluster lists that don't fit into an entry\n";
+}
+
+// A ShouldTransmit call can open an area portal. Entities checked after it in the same pass must see that, also when
+// the snapshot already looked the area up.
+static void OpenPortal(CBaseEntity*) { portalOpen = true; }
+static void CheckPortalChangeDuringPVSChecks()
+{
+	bool sent[2] = {};
+	for (int snapshot = 0; snapshot < 2; ++snapshot)
+	{
+		ResetObserverWorld(false);
+		networking_pvssnapshot.value = snapshot;
+		auto& cache = g_nEntityTransmitCache;
+		cache.nPVSEdictCount = -1;
+		// 300 is behind the closed portal and asks its full check parent 450, which opens it. 301 is in the same area.
+		entities[300].property.parent = &entities[450].property;
+		entities[450].entry.m_fStateFlags = FL_EDICT_FULLCHECK;
+		entities[450].transmitState = FL_EDICT_DONTSEND;
+		entities[450].onShouldTransmit = &OpenPortal;
+		g_pEntityCache[450] = &entities[450];
+		cache.pPVSEntityList[++cache.nPVSEdictCount] = &entities[300];
+		cache.pPVSEntityList[++cache.nPVSEdictCount] = &entities[301];
+		portalOpen = false;
+		sent[snapshot] = ObserverTransmit(1).Get(301);
+	}
+	networking_pvssnapshot.value = false;
+	portalOpen = true;
+	assert(sent[0] && sent[1]);
+	std::cout << "Area portal opened by a ShouldTransmit call during the PVS checks: seen with and without the snapshot\n";
+}
+
+// Two changes the snapshot only sees on the next tick (see PVSSnapshot): an entity that code running during the transmit
+// moved and something other than our checks recomputed, and a first parent. Nothing invalid may be read meanwhile, and
+// the next tick must give the direct check's answer.
+static void CheckSnapshotNextTick()
+{
+	ResetObserverWorld(false);
+	networking_pvssnapshot.value = true;
+	auto& cache = g_nEntityTransmitCache;
+	cache.nPVSEdictCount = -1;
+	cache.pPVSEntityList[++cache.nPVSEdictCount] = &entities[300];
+	cache.pPVSEntityList[++cache.nPVSEdictCount] = &entities[301];
+	entities[301].property.m_PVSInfo.m_nHeadNode = 9;
+	const auto first = NarrowTransmit(1, 0x01);
+	assert(first.Get(300) && !first.Get(301));
+	entities[300].property.m_PVSInfo.m_nHeadNode = 9; // Moved out of sight...
+	entities[300].entry.m_fStateFlags |= FL_EDICT_DIRTY_PVS_INFORMATION;
+	(void)entities[300].property.AreaNum(); // ...and recomputed outside the transmit checks.
+	entities[450].entry.m_fStateFlags = FL_EDICT_ALWAYS;
+	entities[301].property.parent = &entities[450].property; // A first parent, which is always transmitted.
+	(void)NarrowTransmit(2, 0x01);
+	for (bool snapshot : {true, false})
+	{
+		++globals.tickcount;
+		networking_pvssnapshot.value = snapshot;
+		const auto next = NarrowTransmit(2, 0x01);
+		assert(!next.Get(300) && next.Get(301));
+	}
+	std::cout << "PVS snapshot: changes it can't see during the transmit are picked up on the next tick\n";
 }
 
 // Removing an entity from a full area list during networking must stay inside that list.
@@ -763,6 +993,61 @@ static void CheckManipulators()
 	networking_bind_manipulators.value = true;
 	std::cout << "Manipulators of always transmitted parents: same recipients, prevent bits and HLTV always bits "
 		"as the full check, without its ShouldTransmit calls; removal mid-tick\n";
+}
+
+// The list of bound manipulators is built on a tick's first transmit. A manipulator that is detached or moved to another
+// parent, or whose parent leaves the always transmit state, before a later recipient of that tick is asked like without
+// the binding.
+static void CheckManipulatorChangesDuringTick()
+{
+	static ServerClass boneClass{"CBoneManipulate"};
+	for (int change = 0; change < 4; ++change)
+	{
+		std::bitset<MAX_EDICTS> sent[2];
+		for (int bound = 0; bound < 2; ++bound)
+		{
+			ResetObserverWorld(false);
+			networking_bind_manipulators.value = bound;
+			entities[450].entry.m_fStateFlags = FL_EDICT_ALWAYS;
+			entities[450].transmitState = FL_EDICT_ALWAYS;
+			alwaysEdicts.push_back(&entities[450].entry);
+			CBaseEntity& manipulator = entities[451];
+			manipulator.manipulator = true;
+			manipulator.property.m_pServerClass = &boneClass;
+			manipulator.entry.m_fStateFlags = FL_EDICT_FULLCHECK;
+			manipulator.property.parent = &entities[450].property;
+			assert(IsManipulatorOfAlwaysTransmitted(&manipulator.entry));
+			auto& cache = g_nEntityTransmitCache;
+			if (bound)
+				cache.pAlwaysManipulatorList[++cache.nAlwaysManipulatorCount] = &manipulator;
+			else
+				cache.pFullEntityList[++cache.nFullEdictCount] = &manipulator;
+			assert(ObserverTransmit(1).Get(451));
+
+			if (change == 0)
+				manipulator.property.parent = nullptr; // Detached.
+			if (change == 1)
+			{
+				manipulator.property.parent = &entities[2].property; // Now on a player that hides from others.
+				entities[2].othersTransmit = FL_EDICT_DONTSEND;
+			}
+			if (change == 2)
+				entities[450].entry.m_fStateFlags = entities[450].transmitState = FL_EDICT_DONTSEND;
+			if (change == 3)
+			{
+				entities[450].entry.m_fStateFlags = entities[450].transmitState = FL_EDICT_PVSCHECK;
+				portalOpen = false; // The manipulator isn't in the recipient's PVS.
+			}
+			sent[bound] = ObserverTransmit(3).bits;
+			portalOpen = true;
+		}
+		// In the last case the PVS check finds the parent already being sent: it was marked always on the tick's
+		// first transmit, and that stays for the tick.
+		assert(sent[0] == sent[1] && sent[1].test(451) == (change == 3));
+	}
+	networking_bind_manipulators.value = true;
+	std::cout << "Bound manipulators: detached, re-parented or with a parent that left the always transmit state "
+		"during the tick, they match the full check\n";
 }
 
 int main()
@@ -896,7 +1181,12 @@ int main()
 		CheckAlwaysTransmitParents();
 	}
 	fillWeaponLists = false;
-	CheckWeaponListInvalidation();
+	CheckWeaponListChanges();
 	CheckEntityRemovedFromFullArea();
 	CheckManipulators();
+	CheckManipulatorChangesDuringTick();
+	CheckDeletionDuringPVSChecks();
+	CheckSnapshotOwnsClusters();
+	CheckPortalChangeDuringPVSChecks();
+	CheckSnapshotNextTick();
 }
