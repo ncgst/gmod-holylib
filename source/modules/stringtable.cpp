@@ -702,6 +702,9 @@ LUA_FUNCTION_STATIC(INetworkStringTable_SetStringUserData)
 	size_t iLength;
 	const char* pUserData = Util::CheckLString(LUA, 3, &iLength);
 	int nLength = (int)LUA->CheckNumberOpt(4, 0);
+	if (nLength < 0 || (nLength != 0 && (size_t)nLength > iLength))
+		LUA->ArgError(4, "length is out of range of the given data");
+
 	if (nLength != 0)
 		iLength = nLength;
 
