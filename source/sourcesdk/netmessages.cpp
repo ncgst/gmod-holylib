@@ -203,10 +203,9 @@ bool SVC_ServerInfo::WriteToBuffer( bf_write &buffer )
 	buffer.WriteString( m_szMapName );
 	buffer.WriteString( m_szSkyName );
 	buffer.WriteString( m_szHostName );
-
-#if defined( REPLAY_ENABLED )
-	buffer.WriteOneBit( m_bIsReplay?1:0);
-#endif
+	buffer.WriteString( m_szLoadingURL );
+	buffer.WriteString( m_szGameMode );
+	buffer.WriteShort ( m_nMaxClientsVisible );
 
 	return !buffer.IsOverflowed();
 }
@@ -219,6 +218,8 @@ bool SVC_ServerInfo::ReadFromBuffer( bf_read &buffer )
 	m_szMapName = m_szMapNameBuffer;
 	m_szSkyName = m_szSkyNameBuffer;
 	m_szHostName = m_szHostNameBuffer;
+	m_szLoadingURL = m_szLoadingURLBuffer;
+	m_szGameMode = m_szGameModeBuffer;
 
 	m_nProtocol		= buffer.ReadShort();
 	m_nServerCount	= buffer.ReadLong();
@@ -245,18 +246,9 @@ bool SVC_ServerInfo::ReadFromBuffer( bf_read &buffer )
 	buffer.ReadString( m_szMapNameBuffer, sizeof(m_szMapNameBuffer) );
 	buffer.ReadString( m_szSkyNameBuffer, sizeof(m_szSkyNameBuffer) );
 	buffer.ReadString( m_szHostNameBuffer, sizeof(m_szHostNameBuffer) );
-
-#if defined( REPLAY_ENABLED )
-	// Only attempt to read the 'replay' bit if the net channel's protocol
-	// version is greater or equal than the protocol version for replay's release.
-	// INetChannel::GetProtocolVersion() will return PROTOCOL_VERSION for
-	// a regular net channel, or the network protocol version from the demo
-	// file, if we're playing back a demo.
-	if ( m_NetChannel->GetProtocolVersion() >= PROTOCOL_VERSION_REPLAY )
-	{
-		m_bIsReplay = buffer.ReadOneBit() != 0;
-	}
-#endif
+	buffer.ReadString( m_szLoadingURLBuffer, sizeof(m_szLoadingURLBuffer) );
+	buffer.ReadString( m_szGameModeBuffer, sizeof(m_szGameModeBuffer) );
+	m_nMaxClientsVisible = static_cast<short>(buffer.ReadShort());
 
 	return !buffer.IsOverflowed();
 }

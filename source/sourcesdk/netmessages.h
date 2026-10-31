@@ -13,6 +13,7 @@
 #endif
 
 #include <inetmessage.h>
+#include <stddef.h>
 #include <checksum_crc.h>
 #include <checksum_md5.h>
 #include <const.h>
@@ -404,9 +405,6 @@ public:	// member vars are public for faster handling
 	int			m_nServerCount;	// number of changelevels since server start
 	bool		m_bIsDedicated;  // dedicated server ?	
 	bool		m_bIsHLTV;		// HLTV server ?
-#if defined( REPLAY_ENABLED )
-	bool		m_bIsReplay;	// Replay server ?
-#endif
 	char		m_cOS;			// L = linux, W = Win32
 	CRC32_t		m_nMapCRC;		// server map CRC (only used by older demos)
 	MD5Value_t	m_nMapMD5;		// server map MD5
@@ -418,13 +416,32 @@ public:	// member vars are public for faster handling
 	const char	*m_szMapName;	// name of current map 
 	const char	*m_szSkyName;	// name of current skybox 
 	const char	*m_szHostName;	// server name
+	const char	*m_szLoadingURL;
+	const char	*m_szGameMode;
+	short		m_nMaxClientsVisible;
 
 private:
 	char		m_szGameDirBuffer[MAX_OSPATH];// game directory eg "tf2"
 	char		m_szMapNameBuffer[MAX_OSPATH];// name of current map 
 	char		m_szSkyNameBuffer[MAX_OSPATH];// name of current skybox 
 	char		m_szHostNameBuffer[MAX_OSPATH];// name of current skybox 
+	char		m_szLoadingURLBuffer[MAX_OSPATH];
+	char		m_szGameModeBuffer[MAX_OSPATH];
 };
+
+// GMod fills this object in the engine, including when the module supplies
+// the writer. The reader's six 260-byte buffers start immediately after the short.
+#if defined(__linux__) && defined(__i386__)
+#error "Verify the GMod Linux i386 ServerInfo ABI against its engine before building this serializer"
+#endif
+static_assert(MAX_OSPATH == 260, "Unexpected GMod ServerInfo string storage");
+static_assert(sizeof(void*) == 4 || sizeof(void*) == 8, "Unsupported ServerInfo ABI");
+static_assert(offsetof(SVC_ServerInfo, m_cOS) == (sizeof(void*) == 8 ? 0x2a : 0x1a), "GMod ServerInfo OS");
+static_assert(offsetof(SVC_ServerInfo, m_szHostName) == (sizeof(void*) == 8 ? 0x68 : 0x4c), "GMod ServerInfo hostname");
+static_assert(offsetof(SVC_ServerInfo, m_szLoadingURL) == (sizeof(void*) == 8 ? 0x70 : 0x50), "GMod ServerInfo loading URL");
+static_assert(offsetof(SVC_ServerInfo, m_szGameMode) == (sizeof(void*) == 8 ? 0x78 : 0x54), "GMod ServerInfo gamemode");
+static_assert(offsetof(SVC_ServerInfo, m_nMaxClientsVisible) == (sizeof(void*) == 8 ? 0x80 : 0x58), "GMod ServerInfo visible limit");
+static_assert(sizeof(SVC_ServerInfo) == (sizeof(void*) == 8 ? 0x6a0 : 0x674), "GMod ServerInfo size");
 
 class SVC_SendTable : public CNetMessage
 {

@@ -652,8 +652,8 @@ LUA_FUNCTION_STATIC(CBaseClient_FillServerInfo)
 	CBaseServer* pServer = (CBaseServer*)pClient->GetServer();
 	pServer->FillServerInfo(info);
 
-	if (clientIndex != -1)
-		info.m_nPlayerSlot = clientIndex;
+	// FillServerInfo writes server-wide fields. Its caller supplies the recipient slot.
+	info.m_nPlayerSlot = clientIndex == -1 ? pClient->GetPlayerSlot() : clientIndex;
 
 	pClient->SendNetMsg(info, true);
 	return 0;
