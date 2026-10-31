@@ -84,7 +84,7 @@ static std::vector<CGameClient*> g_pQueueClients;
 extern CGlobalVars* gpGlobals;
 static Symbols::CNetChan_SendNetMsg g_pEngineCNetChanSendNetMsg = nullptr;
 
-// GetEventDescriptor walks the engine's vector to recover the registered wire ID.
+// FindNetworkedEventDescriptor walks the engine's vector to recover the registered wire ID.
 static_assert(GMOD_LAYOUT_OFFSETOF(CGameEventDescriptor, eventid) == 0x20, "GMod event ID offset");
 static_assert(GMOD_LAYOUT_OFFSETOF(CGameEventDescriptor, local) == (sizeof(void*) == 8 ? 0x30 : 0x28), "GMod local event flag");
 static_assert(sizeof(CGameEventDescriptor) == (sizeof(void*) == 8 ? 0x58 : 0x40), "GMod event descriptor stride");
@@ -3862,6 +3862,19 @@ private:
 	SVC_GameEvent m_Event;
 };
 
+// The SDK's CGameEventManager::GetEventDescriptor is only built with the gameevent
+// module, so builds that strip it would not link. Read the registry directly.
+static const CGameEventDescriptor* FindNetworkedEventDescriptor(CGameEventManager* manager, const char* name)
+{
+	for (int i = 0; i < manager->m_GameEvents.Count(); ++i)
+	{
+		const CGameEventDescriptor& descriptor = manager->m_GameEvents[i];
+		if (Q_strcmp(descriptor.name, name) == 0)
+			return &descriptor;
+	}
+	return nullptr;
+}
+
 static void SendParkedQueueLoadingPage(const QueuePageConnection& connection)
 {
 	if (!gameserver_queue_loadingpage.GetBool() || !connection.channel ||
@@ -3875,7 +3888,7 @@ static void SendParkedQueueLoadingPage(const QueuePageConnection& connection)
 	attempted = connection; // Claim before native calls, including a failed send.
 
 	auto* manager = static_cast<CGameEventManager*>(Util::gameeventmanager);
-	const auto* event = manager ? manager->GetEventDescriptor("server_spawn") : nullptr;
+	const auto* event = manager ? FindNetworkedEventDescriptor(manager, "server_spawn") : nullptr;
 	const char* failure = "server_spawn has no network ID";
 	// The listen host's in-process client parses into the server's own event manager.
 	if (!Util::server->IsDedicated() && connection.channel->IsLoopback())

@@ -211,10 +211,8 @@ struct CGameEventManager
 		m_GameEvents.data = m_GameEvents.elements = descriptors;
 		m_GameEvents.count = 2;
 	}
-	CGameEventDescriptor* GetEventDescriptor(const char* name);
 };
 #define Q_strcmp std::strcmp
-// PRODUCTION LOOKUP
 CBaseServer server;
 CGameEventManager fixtureEvents;
 namespace Util { IServer* server = &::server; CGameEventManager* gameeventmanager = &fixtureEvents; }

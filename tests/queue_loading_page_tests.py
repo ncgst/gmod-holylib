@@ -24,7 +24,6 @@ def production_fixture():
     header = (SDK / "netmessages.h").read_text(encoding="utf-8")
     codecs = (SDK / "netmessages.cpp").read_text(encoding="utf-8")
     registry = (SDK / "GameEventManager.h").read_text(encoding="utf-8")
-    lookup = (SDK / "gameeventmanager.cpp").read_text(encoding="utf-8")
     game = (ROOT / "source/modules/gameserver.cpp").read_text(encoding="utf-8")
     messages = [segment(header, "#define DECLARE_BASE_MESSAGE", "// bidirectional net messages:"),
                 segment(header, "class SVC_ServerInfo :", "class SVC_SendTable :")]
@@ -56,9 +55,8 @@ def production_fixture():
     assert sender.splitlines()[1].strip().startswith('Symbol::FromName("_ZN8CNetChan10SendNetMsgER11INetMessagebb")')
     fixture = (ROOT / "tests/queue_loading_page_fixture.cpp").read_text(encoding="utf-8")
     descriptor = segment(registry, "class CGameEventDescriptor\n", "class CGameEvent :")
-    descriptor += segment(game, "// GetEventDescriptor walks", "struct QueuePageConnection")
+    descriptor += segment(game, "// FindNetworkedEventDescriptor walks", "struct QueuePageConnection")
     fixture = fixture.replace("// PRODUCTION DESCRIPTOR", descriptor)
-    fixture = fixture.replace("// PRODUCTION LOOKUP", body(lookup, "CGameEventDescriptor *CGameEventManager::GetEventDescriptor(const char * name)"))
     return fixture.replace("// PRODUCTION MESSAGES", "\n".join(messages)).replace("// PRODUCTION PARKING", "\n".join(parking))
 
 
