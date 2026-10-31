@@ -431,17 +431,19 @@ private:
 
 // GMod fills this object in the engine, including when the module supplies
 // the writer. The reader's six 260-byte buffers start immediately after the short.
-#if defined(__linux__) && defined(__i386__)
-#error "Verify the GMod Linux i386 ServerInfo ABI against its engine before building this serializer"
+// The Linux i386 and Win32 engines both allocate 0x674 bytes for type 8.
+#if defined(__i386__) || defined(_M_IX86)
+static_assert(sizeof(void*) == 4 && sizeof(SVC_ServerInfo) == 0x674, "GMod x86 ServerInfo size");
+#else
+static_assert(sizeof(void*) == 8 && sizeof(SVC_ServerInfo) == 0x6a0, "GMod 64-bit ServerInfo size");
 #endif
 static_assert(MAX_OSPATH == 260, "Unexpected GMod ServerInfo string storage");
-static_assert(sizeof(void*) == 4 || sizeof(void*) == 8, "Unsupported ServerInfo ABI");
 static_assert(offsetof(SVC_ServerInfo, m_cOS) == (sizeof(void*) == 8 ? 0x2a : 0x1a), "GMod ServerInfo OS");
+static_assert(offsetof(SVC_ServerInfo, m_szGameDir) == (sizeof(void*) == 8 ? 0x50 : 0x40), "GMod ServerInfo game directory");
 static_assert(offsetof(SVC_ServerInfo, m_szHostName) == (sizeof(void*) == 8 ? 0x68 : 0x4c), "GMod ServerInfo hostname");
 static_assert(offsetof(SVC_ServerInfo, m_szLoadingURL) == (sizeof(void*) == 8 ? 0x70 : 0x50), "GMod ServerInfo loading URL");
 static_assert(offsetof(SVC_ServerInfo, m_szGameMode) == (sizeof(void*) == 8 ? 0x78 : 0x54), "GMod ServerInfo gamemode");
 static_assert(offsetof(SVC_ServerInfo, m_nMaxClientsVisible) == (sizeof(void*) == 8 ? 0x80 : 0x58), "GMod ServerInfo visible limit");
-static_assert(sizeof(SVC_ServerInfo) == (sizeof(void*) == 8 ? 0x6a0 : 0x674), "GMod ServerInfo size");
 
 class SVC_SendTable : public CNetMessage
 {

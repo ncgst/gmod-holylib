@@ -49,6 +49,11 @@ def production_fixture():
     ]:
         assert "ResetQueuePageConnection(" in segment(game, start, end)
     assert 'gameserver_queue_loadingpage("holylib_gameserver_queue_loadingpage", "0"' in game
+    # The Linux sender fixture supplies a function pointer. Also check that
+    # the engine resolver which populates it has the i386 entry in slot zero.
+    symbols = (ROOT / "source/symbols.cpp").read_text(encoding="utf-8")
+    sender = segment(symbols, "const std::vector<Symbol> CNetChan_SendNetMsgSym = {", "\n\t};")
+    assert sender.splitlines()[1].strip().startswith('Symbol::FromName("_ZN8CNetChan10SendNetMsgER11INetMessagebb")')
     fixture = (ROOT / "tests/queue_loading_page_fixture.cpp").read_text(encoding="utf-8")
     descriptor = segment(registry, "class CGameEventDescriptor\n", "class CGameEvent :")
     descriptor += segment(game, "// GetEventDescriptor walks", "struct QueuePageConnection")
@@ -189,19 +194,19 @@ def main():
         work = Path(directory)
         cpp = work / "fixture.cpp"
         cpp.write_text(production_fixture(), encoding="utf-8")
-        binary = work / ("fixture.exe" if options.msvc else "fixture")
         if options.msvc:
-            command = ["cl", "/nologo", "/std:c++17", "/EHsc", "/utf-8", "/W4", "/WX", "/wd4100",
-                       str(cpp), "/Fe" + str(binary)]
+            command = ["cl", "/nologo", "/std:c++17", "/EHsc", "/utf-8", "/W4", "/WX", "/wd4100", str(cpp)]
             if options.sanitize:
                 command += ["/fsanitize=address", "/Zi"]
         else:
-            command = ["c++", "-std=c++17", "-O1", "-Wno-invalid-offsetof", str(cpp), "-o", str(binary)]
+            command = ["c++", "-std=c++17", "-O1", "-Wno-invalid-offsetof", str(cpp)]
             if options.sanitize:
                 command += ["-fsanitize=address", "-fno-omit-frame-pointer"]
         define = "/D" if options.msvc else "-D"
-        for sender in ([], [define + "SYSTEM_LINUX=1", define + "REPLAY_ENABLED=1"]):
-            subprocess.run(command + sender, cwd=work, check=True)
+        for name, sender in (("virtual", []), ("resolved", [define + "SYSTEM_LINUX=1", define + "REPLAY_ENABLED=1"])):
+            binary = work / (name + (".exe" if options.msvc else ""))
+            output = ["/Fe" + str(binary)] if options.msvc else ["-o", str(binary)]
+            subprocess.run(command + sender + output, cwd=work, check=True)
             result = subprocess.run([str(binary)], cwd=work, text=True, capture_output=True)
             if result.returncode:
                 raise RuntimeError(result.stderr or f"fixture exited {result.returncode}")
