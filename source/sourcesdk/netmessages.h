@@ -692,6 +692,7 @@ class SVC_GameEvent : public CNetMessage
 	int	GetGroup() const { return INetChannelInfo::EVENTS; }
 	
 public:
+	static constexpr int PayloadLengthBits = 11; // GMod type 25, measured in bits
 	int			m_nLength;	// data length in bits
 	bf_read		m_DataIn;
 	bf_write	m_DataOut;

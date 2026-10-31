@@ -1008,12 +1008,12 @@ const char *SVC_SpawnBaseline::ToString(void) const
 bool SVC_GameEvent::WriteToBuffer( bf_write &buffer )
 {
 	m_nLength = m_DataOut.GetNumBitsWritten();
-	Assert( m_nLength < (1 << NETMSG_LENGTH_BITS) );
-	if ( m_nLength >= (1 << NETMSG_LENGTH_BITS) )
+	Assert( m_nLength < (1 << PayloadLengthBits) );
+	if ( m_nLength >= (1 << PayloadLengthBits) )
 		return false;
 
 	buffer.WriteUBitLong( GetType(), NETMSG_TYPE_BITS );
-	buffer.WriteUBitLong( m_nLength, NETMSG_LENGTH_BITS );  // max 8 * 256 bits
+	buffer.WriteUBitLong( m_nLength, PayloadLengthBits );
 	return buffer.WriteBits( m_DataOut.GetData(), m_nLength );
 	
 }
@@ -1022,7 +1022,7 @@ bool SVC_GameEvent::ReadFromBuffer( bf_read &buffer )
 {
 	VPROF( "SVC_GameEvent::ReadFromBuffer" );
 
-	m_nLength = buffer.ReadUBitLong( NETMSG_LENGTH_BITS ); // max 8 * 256 bits
+	m_nLength = buffer.ReadUBitLong( PayloadLengthBits );
 	m_DataIn = buffer;
 	return buffer.SeekRelative( m_nLength );
 }

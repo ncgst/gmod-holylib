@@ -8,6 +8,7 @@
 #include "eiface.h"
 #include "tier0/etwprof.h"
 #include "sourcesdk/baseserver.h"
+#include "sourcesdk/GameEventManager.h"
 #include "sourcesdk/net_chan.h"
 #include "netchannel_bindings.h"
 #include "custom_netchannel_owner.h"
@@ -40,6 +41,7 @@ static ConVar gameserver_disablespawnsafety("holylib_gameserver_disablespawnsafe
 static ConVar gameserver_connectionlesspackethook("holylib_gameserver_connectionlesspackethook", "1", 0, "If enabled, the HolyLib:ProcessConnectionlessPacket hook is active and will be called.");
 ConVar sv_filter_nobanresponse("sv_filter_nobanresponse", "0", 0, "If enabled, a blocked ip won't be informed that its even blocked.");
 static ConVar gameserver_rawclients("holylib_gameserver_rawclients", "0", 0, "Experimental - Exposes the CBaseClient's even when their empty/have no clients connected");
+static ConVar gameserver_queue_loadingpage("holylib_gameserver_queue_loadingpage", "0", 0, "Show the server loading page once to a parked client at CONNECTED.");
 
 // NotifyClientDisconnect can reach the module after IsConnected() has already
 // flipped to false, while the CBaseClient object is still alive on the native
@@ -81,6 +83,51 @@ IModule* pGameServerModule = &g_pGameServerModule;
 static std::vector<CGameClient*> g_pQueueClients;
 extern CGlobalVars* gpGlobals;
 static Symbols::CNetChan_SendNetMsg g_pEngineCNetChanSendNetMsg = nullptr;
+
+// GetEventDescriptor walks the engine's vector to recover the registered wire ID.
+static_assert(offsetof(CGameEventDescriptor, eventid) == 0x20, "GMod event ID offset");
+static_assert(offsetof(CGameEventDescriptor, local) == (sizeof(void*) == 8 ? 0x30 : 0x28), "GMod local event flag");
+static_assert(sizeof(CGameEventDescriptor) == (sizeof(void*) == 8 ? 0x58 : 0x40), "GMod event descriptor stride");
+
+struct QueuePageConnection
+{
+	CBaseClient* client = nullptr;
+	INetChannel* channel = nullptr;
+	int userID = 0, challenge = 0, slot = -1;
+	unsigned generation = 0;
+
+	bool operator==(const QueuePageConnection& other) const
+	{
+		return client == other.client && channel == other.channel && userID == other.userID &&
+			challenge == other.challenge && slot == other.slot && generation == other.generation;
+	}
+};
+
+struct QueuePageSlot
+{
+	unsigned generation = 0;
+	QueuePageConnection attempted;
+};
+static QueuePageSlot g_QueuePageSlots[ABSOLUTE_PLAYER_LIMIT];
+
+static QueuePageConnection GetQueuePageConnection(CBaseClient* client)
+{
+	const int slot = client->GetPlayerSlot();
+	if (slot < 0 || slot >= ABSOLUTE_PLAYER_LIMIT)
+		return {};
+	return {client, client->GetNetChannel(), client->GetUserID(), client->GetClientChallenge(),
+		slot, g_QueuePageSlots[slot].generation};
+}
+
+static void ResetQueuePageConnection(CBaseClient* client)
+{
+	const int slot = client->GetPlayerSlot();
+	if (slot >= 0 && slot < ABSOLUTE_PLAYER_LIMIT)
+	{
+		++g_QueuePageSlots[slot].generation;
+		g_QueuePageSlots[slot].attempted = {};
+	}
+}
 
 // Queue clients live outside CBaseServer's physical client array. LuaPack still
 // handles their engine-owned Lua requests synchronously, so callers need a
@@ -3162,6 +3209,9 @@ void CGameServerModule::LuaShutdown(GarrysMod::Lua::ILuaInterface* pLua)
 
 void CGameServerModule::Shutdown()
 {
+	for (auto& slot : g_QueuePageSlots)
+		slot = {};
+
 	// Normally LuaShutdown already detached each owner. Also cover module
 	// teardown without a current Lua interface, before its detours are removed.
 	for (const auto& entry : SnapshotNetChannelOwners())
@@ -3234,6 +3284,7 @@ static CBaseClient* GetFreeQueueClient(CBaseServer* _this, netadr_t& adr)
 		{
 			if (pClient->m_NetChannel && adr.CompareAdr(pClient->m_NetChannel->GetRemoteAddress()))
 			{
+				ResetQueuePageConnection(pClient);
 				pClient->m_NetChannel->Shutdown( NULL );
 				pClient->m_NetChannel = NULL;
 		
@@ -3263,6 +3314,7 @@ static CBaseClient* GetFreeQueueClient(CBaseServer* _this, netadr_t& adr)
 	}
 	// We do not register it to m_Clients of the CBaseServer
 
+	ResetQueuePageConnection(freeclient);
 	return freeclient;
 }
 
@@ -3331,7 +3383,12 @@ static void hook_CGameServer_RemoveClientFromGame(CBaseServer* _this, CBaseClien
 	// from receiving it. The engine itself must retain the edict for later
 	// sign-on-state transitions.
 	if (IsParkedQueueClient(pClient))
+	{
+		// CGameClient::Reconnect passes here before clearing even a reused
+		// channel and sending CONNECTED again with the same userid/challenge.
+		ResetQueuePageConnection(pClient);
 		return;
+	}
 
 	detour_CGameServer_RemoveClientFromGame.GetTrampoline<Symbols::CGameServer_RemoveClientFromGame>()(_this, pClient);
 }
@@ -3371,6 +3428,17 @@ static void hook_CServerPlugin_ClientSettingsChanged(void* _this, edict_t* pEdic
 }
 
 static Detouring::Hook detour_CVEngineServer_GMOD_SendToClient;
+static bool SendReliableToEngineChannel(INetChannel* channel, INetMessage& msg)
+{
+	// The local INetChannel vtable does not match the engine on Linux x64.
+#if defined(SYSTEM_LINUX)
+	return g_pEngineCNetChanSendNetMsg &&
+		g_pEngineCNetChanSendNetMsg(static_cast<CNetChan*>(channel), msg, true, false);
+#else
+	return channel->SendNetMsg(msg, true, false);
+#endif
+}
+
 static void hook_CVEngineServer_GMOD_SendToClient(void* _this, int client, void *data, int dataSize)
 {
 	if (client < gpGlobals->maxClients)
@@ -3419,16 +3487,7 @@ static void hook_CVEngineServer_GMOD_SendToClient(void* _this, int client, void 
 	msg.m_iLengthBits = 20;
 	msg.m_iType = svc_GMod_ServerToClient;
 
-	// Queue clients are outside CVEngineServer::GMOD_SendToClient's physical
-	// array. Use the resolved engine implementation here: the locally mirrored
-	// INetChannel vtable is not ABI-stable on current Linux x64 builds.
-#if defined(SYSTEM_LINUX)
-	if (!g_pEngineCNetChanSendNetMsg)
-		return;
-	g_pEngineCNetChanSendNetMsg(static_cast<CNetChan*>(channel), msg, true, false);
-#else
-	channel->SendNetMsg(msg, true, false);
-#endif
+	SendReliableToEngineChannel(channel, msg);
 }
 
 bool Gameserver_HasExactGModSender()
@@ -3729,6 +3788,120 @@ static bool IsKnownClient(CBaseClient* pClient)
 }
 
 static Detouring::Hook detour_CBaseClient_SetSignonState;
+static bool IsRegisteredQueueClient(CGameClient* candidate);
+
+static bool IsCurrentParkedReply(const QueuePageConnection& connection)
+{
+	auto* client = connection.client;
+	return connection.channel && IsKnownClient(client) && IsParkedQueueClient(client) &&
+		client->m_nSignonState == SIGNONSTATE_CONNECTED && connection == GetQueuePageConnection(client);
+}
+
+// Append two ordinary messages to the same reliable stream. If the complete
+// pair will not fit, leave the cursor and the channel overflow flag untouched.
+class QueueLoadingPageMessage final : public SVC_GameEventList
+{
+public:
+	bool Prepare(int eventID, const SVC_ServerInfo& info)
+	{
+		static_assert(MAX_EVENT_BITS == 9 && NETMSG_TYPE_BITS == 6, "Unexpected GMod event framing");
+		if (eventID < 0 || eventID >= (1 << MAX_EVENT_BITS))
+			return false;
+
+		// Type 25 has an 11-bit length. Reserve the event ID and two integers,
+		// then check that all four terminated strings fit without truncation.
+		size_t remaining = ((1 << SVC_GameEvent::PayloadLengthBits) - 1 - MAX_EVENT_BITS - 32 - 16) / 8;
+		for (const char* value : {info.m_szHostName, info.m_szMapName, info.m_szLoadingURL, info.m_szGameMode})
+		{
+			if (!value)
+				return false;
+			const size_t length = strlen(value);
+			if (length >= remaining)
+				return false;
+			remaining -= length + 1;
+		}
+
+		m_nNumEvents = 1;
+		m_DataOut.StartWriting(m_Descriptor, sizeof(m_Descriptor));
+		m_Event.m_DataOut.StartWriting(m_Values, sizeof(m_Values));
+		m_DataOut.WriteUBitLong(eventID, MAX_EVENT_BITS);
+		m_DataOut.WriteString("server_spawn");
+		m_Event.m_DataOut.WriteUBitLong(eventID, MAX_EVENT_BITS);
+
+		auto key = [&](const char* name, int type) {
+			m_DataOut.WriteUBitLong(type, 3);
+			m_DataOut.WriteString(name);
+		};
+		auto stringKey = [&](const char* name, const char* value) {
+			key(name, CGameEventManager::TYPE_STRING);
+			m_Event.m_DataOut.WriteString(value);
+		};
+		stringKey("hostname", info.m_szHostName);
+		stringKey("mapname", info.m_szMapName);
+		key("maxplayers", CGameEventManager::TYPE_LONG);
+		m_Event.m_DataOut.WriteLong(info.m_nMaxClients);
+		stringKey("loadurl", info.m_szLoadingURL);
+		stringKey("gamemode", info.m_szGameMode);
+		key("maxplayers_visible", CGameEventManager::TYPE_SHORT);
+		m_Event.m_DataOut.WriteShort(info.m_nMaxClientsVisible);
+		m_DataOut.WriteUBitLong(0, 3);
+		return !m_DataOut.IsOverflowed() && !m_Event.m_DataOut.IsOverflowed();
+	}
+
+	bool WriteToBuffer(bf_write& out) override
+	{
+		const int bits = 2 * NETMSG_TYPE_BITS + MAX_EVENT_BITS + 20 + SVC_GameEvent::PayloadLengthBits +
+			m_DataOut.GetNumBitsWritten() + m_Event.m_DataOut.GetNumBitsWritten();
+		return !out.IsOverflowed() && out.GetNumBitsLeft() >= bits &&
+			SVC_GameEventList::WriteToBuffer(out) && m_Event.WriteToBuffer(out);
+	}
+
+private:
+	unsigned int m_Descriptor[32] = {};
+	unsigned int m_Values[(1 << SVC_GameEvent::PayloadLengthBits) / 32] = {};
+	SVC_GameEvent m_Event;
+};
+
+static void SendParkedQueueLoadingPage(const QueuePageConnection& connection)
+{
+	if (!gameserver_queue_loadingpage.GetBool() || !connection.channel ||
+		!IsRegisteredQueueClient(static_cast<CGameClient*>(connection.client)) ||
+		connection.client->IsFakeClient() || connection.client->GetServer() != Util::server)
+		return;
+
+	auto& attempted = g_QueuePageSlots[connection.slot].attempted;
+	if (attempted == connection)
+		return;
+	attempted = connection; // Claim before native calls, including a failed send.
+
+	auto* manager = static_cast<CGameEventManager*>(Util::gameeventmanager);
+	const auto* event = manager ? manager->GetEventDescriptor("server_spawn") : nullptr;
+	const char* failure = "server_spawn has no network ID";
+	// The listen host's in-process client parses into the server's own event manager.
+	if (!Util::server->IsDedicated() && connection.channel->IsLoopback())
+		failure = "listen host shares the server event registry";
+	else if (!detour_CGameServer_RemoveClientFromGame.IsEnabled())
+		failure = "parked reconnect guard is unavailable";
+	else if (event && !event->local && event->eventid >= 0 && event->eventid < (1 << MAX_EVENT_BITS))
+	{
+		SVC_ServerInfo info{};
+		const int eventID = event->eventid;
+		static_cast<CBaseServer*>(Util::server)->FillServerInfo(info);
+		if (!IsCurrentParkedReply(connection) || !gameserver_queue_loadingpage.GetBool() ||
+			!IsRegisteredQueueClient(static_cast<CGameClient*>(connection.client)))
+			return;
+		QueueLoadingPageMessage message;
+		failure = "loading metadata does not fit the event";
+		if (message.Prepare(eventID, info))
+		{
+			if (SendReliableToEngineChannel(connection.channel, message))
+				return;
+			failure = "could not queue the reliable event pair";
+		}
+	}
+	Warning(PROJECT_NAME " - gameserver: skipped loading page for queue slot %i (%s)\n", connection.slot, failure);
+}
+
 static bool hook_CBaseClient_SetSignonState(CBaseClient* cl, int state, int spawncount)
 {
 	// NCG: UAF guard (see IsKnownClient above). An unknown pointer is handed
@@ -3738,6 +3911,8 @@ static bool hook_CBaseClient_SetSignonState(CBaseClient* cl, int state, int spaw
 	if (!IsKnownClient(cl))
 		return detour_CBaseClient_SetSignonState.GetTrampoline<Symbols::CBaseClient_SetSignonState>()(cl, state, spawncount);
 
+	const bool parkedReply = state == SIGNONSTATE_CONNECTED && IsParkedQueueClient(cl);
+	const QueuePageConnection connection = parkedReply ? GetQueuePageConnection(cl) : QueuePageConnection{};
 	if (Lua::PushHook("HolyLib:OnSetSignonState"))
 	{
 		Push_CBaseClient(g_Lua, cl);
@@ -3753,21 +3928,30 @@ static bool hook_CBaseClient_SetSignonState(CBaseClient* cl, int state, int spaw
 		}
 	}
 
-#if MODULE_EXISTS_GMODDATAPACK
-	if (GMODDataPack_SetSignOnState(cl, state))
-		return false;
-#endif
-
 	// Connect() already stores SIGNONSTATE_CONNECTED. The engine function then
 	// only sets m_bSendServerInfo, which queues native GModDataPack SendServerInfo
 	// against a parked slot. That path smashes GModDataPack's file tree; promotion
 	// already restarts the handshake on a real slot via Reconnect().
-	if (IsParkedQueueClient(cl) && state == SIGNONSTATE_CONNECTED)
+	if (state == SIGNONSTATE_CONNECTED)
 	{
-		cl->m_nSignonState = SIGNONSTATE_CONNECTED;
-		cl->m_bSendServerInfo = false;
-		return true;
+		// Lua can synchronously disconnect, recycle or promote the source.
+		const bool stillLive = parkedReply ? IsCurrentParkedReply(connection) : IsKnownClient(cl);
+		if (!stillLive)
+			return false;
+		if (IsParkedQueueClient(cl))
+		{
+			cl->m_nSignonState = SIGNONSTATE_CONNECTED;
+			cl->m_bSendServerInfo = false;
+			if (parkedReply)
+				SendParkedQueueLoadingPage(connection);
+			return true;
+		}
 	}
+
+#if MODULE_EXISTS_GMODDATAPACK
+	if (GMODDataPack_SetSignOnState(cl, state))
+		return false;
+#endif
 
 	return detour_CBaseClient_SetSignonState.GetTrampoline<Symbols::CBaseClient_SetSignonState>()(cl, state, spawncount);
 }
@@ -4776,6 +4960,9 @@ void CGameServerModule::OnClientDisconnect(CBaseClient* pClient)
 
 	if (pClient->GetServer() != Util::server) // Not our main server
 		return;
+
+	if (IsParkedQueueClient(pClient))
+		ResetQueuePageConnection(pClient);
 
 	if (g_Lua)
 	{

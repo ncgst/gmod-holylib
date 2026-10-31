@@ -5222,6 +5222,10 @@ The total number of real and parked `CGameClient` objects the server accepts (ma
 This does **not** change `gpGlobals->maxClients`, the game DLL's real-player limit, or the player-edict range. Values above the engine limit create queue-only client slots from `gpGlobals->maxClients` through `holylib_gameserver_maxplayers - 1` (for example, `128..254` when set to `255`).<br>
 Queue clients are network connections, not players. They cannot spawn or enter fixed `MAX_PLAYERS` game/voice tables until they are promoted into a free real slot; voice packets sent while parked are discarded.<br>
 
+#### holylib_gameserver_queue_loadingpage (default `0`)
+When enabled, a parked client receives a reliable event definition and a `server_spawn` event with the server's loading URL, gamemode, map, hostname and player limits. The stock menu can open the page while the connection is still at `SIGNONSTATE_CONNECTED`. Its usual loading URL preference applies.<br>
+This also runs the client's usual `server_spawn` listeners. The physical slot's normal signon reinstalls the full event definitions before PRESPAWN. Each parked connection gets one attempt. If the metadata exceeds the game-event size limit or the channel cannot accept the whole pair, HolyLib logs the skip and the client keeps its place in the queue. A listen server's in-process host is skipped because its client shares the server's event registry.<br>
+
 ### sv_filter_nobanresponse (default `0`)
 If enabled, a blocked ip won't be informed that its even blocked.
 
@@ -5232,7 +5236,7 @@ Why? I don't know, but you can.<br>
 ### 128+ Players
 Yes, with this module you can go above 128 Players **BUT** it will currently crash.<br>
 This is useful when you make a queue, players **can** connect and use all slots above 128 **but** they **can't** spawn when 128 players are already playing.<br>
-Use the `HolyLib:OnSetSignonState` to keep players at the `SIGNONSTATE_NEW` until a slot is freed/one of the 128 disconnects.<br>
+Parked clients wait at `SIGNONSTATE_CONNECTED` until a physical slot is free. `HolyLib:OnSetSignonState` observes that reply before HolyLib suppresses native ServerInfo for the parked slot.<br>
 
 ### Player Queue System
 Using this module's functionality you can implement a player queue were players wait in the loading screen until they spawn when a slot gets free.
