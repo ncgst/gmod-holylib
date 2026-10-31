@@ -85,8 +85,8 @@ extern CGlobalVars* gpGlobals;
 static Symbols::CNetChan_SendNetMsg g_pEngineCNetChanSendNetMsg = nullptr;
 
 // GetEventDescriptor walks the engine's vector to recover the registered wire ID.
-static_assert(offsetof(CGameEventDescriptor, eventid) == 0x20, "GMod event ID offset");
-static_assert(offsetof(CGameEventDescriptor, local) == (sizeof(void*) == 8 ? 0x30 : 0x28), "GMod local event flag");
+static_assert(GMOD_LAYOUT_OFFSETOF(CGameEventDescriptor, eventid) == 0x20, "GMod event ID offset");
+static_assert(GMOD_LAYOUT_OFFSETOF(CGameEventDescriptor, local) == (sizeof(void*) == 8 ? 0x30 : 0x28), "GMod local event flag");
 static_assert(sizeof(CGameEventDescriptor) == (sizeof(void*) == 8 ? 0x58 : 0x40), "GMod event descriptor stride");
 
 struct QueuePageConnection
