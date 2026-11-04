@@ -1,6 +1,7 @@
 #include "detours.h"
 #include <convar.h>
 #include "tier0/dbg.h"
+#include "tier0/threadtools.h"
 
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
@@ -43,6 +44,14 @@ static unordered_set<std::string> pFailedDetours;
 static unordered_map<std::string, unsigned int> pLoadedDetours;
 static unordered_map<Detouring::Hook*, DetourEntry> pDetourInfo;
 static unordered_map<unsigned int, unordered_set<Detouring::Hook*>> g_pDetours = {};
+static unsigned int g_nStateGeneration = 1; // Detour::StateCache starts at 0, so the first Get runs its check.
+unsigned int Detour::GetStateGeneration()
+{
+	// Detours change on the main thread. Lua running on other threads (luathreads) can still
+	// reach cached checks, e.g. through gmoddatapack.RefreshExistingLuaFile.
+	return ThreadInMainThread() ? g_nStateGeneration : 0;
+}
+
 void Detour::Create(Detouring::Hook* pHook, const char* strName, void* pModule, Symbol pSymbol, void* pHookFunc, unsigned int category, bool bEnable)
 {
 	void* func = Detour::GetFunction(pModule, pSymbol);
@@ -85,6 +94,8 @@ void Detour::CreateAtAddress(Detouring::Hook* pHook, const char* strName, void* 
 		Detour::EnableHook(pHook);
 	else
 		pHook->Destroy(); // We create dit just to verify.
+
+	++g_nStateGeneration;
 }
 
 void Detour::EnableHook(Detouring::Hook* pHook)
@@ -98,6 +109,7 @@ void Detour::EnableHook(Detouring::Hook* pHook)
 
 	pHook->Create(it->second.pTargetFunc, it->second.pHookFunc);
 	pHook->Enable();
+	++g_nStateGeneration;
 
 	if (pLoadedDetours.find(it->second.detourName) == pLoadedDetours.end())
 		pLoadedDetours[it->second.detourName] = it->second.nCategory;
@@ -116,6 +128,7 @@ void Detour::DisableHook(Detouring::Hook* pHook)
 
 	pHook->Disable();
 	pHook->Destroy();
+	++g_nStateGeneration;
 
 	auto loadedIT = pLoadedDetours.find(it->second.detourName);
 	if (loadedIT != pLoadedDetours.end())
@@ -138,6 +151,7 @@ void Detour::Remove(unsigned int category) // NOTE: Do we need to check if the p
 			pDetourInfo.erase(it);
 	}
 	g_pDetours[category].clear();
+	++g_nStateGeneration;
 
 	// Remove them from our loaded list.
 	for (auto it = pLoadedDetours.begin(); it != pLoadedDetours.end(); )

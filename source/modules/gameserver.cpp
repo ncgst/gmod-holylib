@@ -3492,9 +3492,12 @@ static void hook_CVEngineServer_GMOD_SendToClient(void* _this, int client, void 
 
 bool Gameserver_HasExactGModSender()
 {
-	return g_pEngineCNetChanSendNetMsg &&
-		DETOUR_ISVALID(detour_CVEngineServer_GMOD_SendToClient) &&
-		DETOUR_ISENABLED(detour_CVEngineServer_GMOD_SendToClient);
+	// Part of LuaPack's per-request check, so the hook state is cached (see Detour::StateCache).
+	static Detour::StateCache pSenderHooked;
+	return g_pEngineCNetChanSendNetMsg && pSenderHooked.Get([]() {
+		return DETOUR_ISVALID(detour_CVEngineServer_GMOD_SendToClient) &&
+			DETOUR_ISENABLED(detour_CVEngineServer_GMOD_SendToClient);
+	});
 }
 
 #if defined(SYSTEM_LINUX) && defined(ARCHITECTURE_X86_64)

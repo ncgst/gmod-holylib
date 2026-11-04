@@ -28,6 +28,17 @@ runtimes. The pinned 64x image is the Debian 11 / GCC 10.2 one used before.
 Check the `GLIBC_`/`GLIBCXX_` version needs of a build (`objdump -T`) before
 moving a pin.
 
+`premake5.lua` also fixes two MinHook lock bugs in
+`garrysmod_common/detouring/minhook/src/hook.c` while it generates the projects:
+`EnterSpinLock` compares the previous value with `true` instead of `false` on
+non-Windows platforms, so a free lock always sleeps once and a held lock is not
+waited for; and `MH_Uninitialize` returns `MH_ERROR_NOT_INITIALIZED` without
+releasing the lock. The detouring revision CI checks out (`3e0b0388`, MinHook
+`e2a49551`) still has both. The step matches the whole broken statements, so
+code that is already fixed (here or upstream, in any layout) is left alone; it
+warns about a function it does not recognize, and generation stops if the file
+cannot be written.
+
 # How to build HolyLib
 
 1. Clone garrysmod_common & its submodules into the `development` folder.<br>
