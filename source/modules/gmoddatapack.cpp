@@ -2728,18 +2728,23 @@ bool HolyLib::LuaPack::SupportsCanonicalRegistration()
 	// exact queue-client sender. Platform support alone is not enough; any disabled,
 	// unresolved, or failed detour must keep required admission closed.
 #if defined(SYSTEM_LINUX) && MODULE_EXISTS_GAMESERVER
-	return DETOUR_ISVALID(detour_CBaseClient_SendServerInfo) &&
-		DETOUR_ISENABLED(detour_CBaseClient_SendServerInfo) &&
-		DETOUR_ISVALID(detour_GModDataPack_OnFilesRequested) &&
-		DETOUR_ISENABLED(detour_GModDataPack_OnFilesRequested) &&
-		DETOUR_ISVALID(detour_GModDataPack_AddOrUpdateFile) &&
-		DETOUR_ISENABLED(detour_GModDataPack_AddOrUpdateFile) &&
-		DETOUR_ISVALID(detour_GModDataPack_SendFileToClient) &&
-		DETOUR_ISENABLED(detour_GModDataPack_SendFileToClient) &&
-		DETOUR_ISVALID(detour_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack) &&
-		DETOUR_ISENABLED(detour_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack) &&
-		DETOUR_ISVALID(detour_CVEngineServer_GMOD_SendToClientFilter) &&
-		DETOUR_ISENABLED(detour_CVEngineServer_GMOD_SendToClientFilter) &&
+	// This runs for every LuaPack file request and queued stub. Each IsEnabled() takes
+	// MinHook's global lock, so the hook checks are cached until a detour changes.
+	static Detour::StateCache pHooksReady;
+	return pHooksReady.Get([]() {
+			return DETOUR_ISVALID(detour_CBaseClient_SendServerInfo) &&
+				DETOUR_ISENABLED(detour_CBaseClient_SendServerInfo) &&
+				DETOUR_ISVALID(detour_GModDataPack_OnFilesRequested) &&
+				DETOUR_ISENABLED(detour_GModDataPack_OnFilesRequested) &&
+				DETOUR_ISVALID(detour_GModDataPack_AddOrUpdateFile) &&
+				DETOUR_ISENABLED(detour_GModDataPack_AddOrUpdateFile) &&
+				DETOUR_ISVALID(detour_GModDataPack_SendFileToClient) &&
+				DETOUR_ISENABLED(detour_GModDataPack_SendFileToClient) &&
+				DETOUR_ISVALID(detour_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack) &&
+				DETOUR_ISENABLED(detour_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack) &&
+				DETOUR_ISVALID(detour_CVEngineServer_GMOD_SendToClientFilter) &&
+				DETOUR_ISENABLED(detour_CVEngineServer_GMOD_SendToClientFilter);
+		}) &&
 		g_nativeLuaBuffer.Ready() &&
 		Gameserver_HasExactGModSender();
 #else
