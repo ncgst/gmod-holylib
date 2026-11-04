@@ -32,13 +32,16 @@ local gmcommon = assert(_OPTIONS.gmcommon or os.getenv("GARRYSMOD_COMMON"),
 --   lock that would block every later MinHook call.
 do
 	local minhookSource = gmcommon .. "/detouring/minhook/src/hook.c"
-	local fixes = { -- function, broken text, fixed text
+	-- Function, Lua pattern of the broken code, replacement, and a pattern that matches the code
+	-- once it is fixed (here or upstream). The broken patterns match whole statements, so a fix
+	-- written differently upstream is recognized and left alone.
+	local fixes = {
 		{"static void EnterSpinLock(void)",
-			"__sync_val_compare_and_swap(&g_isLocked, false, true) != true",
-			"__sync_val_compare_and_swap(&g_isLocked, false, true) != false"},
+			"(__sync_val_compare_and_swap%(&g_isLocked, false, true%) != )true", "%1false",
+			"__sync_val_compare_and_swap%(&g_isLocked, false, true%) != false"},
 		{"MH_STATUS MH_API MH_Uninitialize(void)",
-			"return MH_ERROR_NOT_INITIALIZED;",
-			"LeaveSpinLock(); return MH_ERROR_NOT_INITIALIZED;"},
+			"(if %(g_initCounter == 0%)%s*{%s*)(return MH_ERROR_NOT_INITIALIZED;)", "%1LeaveSpinLock(); %2",
+			"if %(g_initCounter == 0%)%s*{%s*LeaveSpinLock%(%);%s*return MH_ERROR_NOT_INITIALIZED;"},
 	}
 
 	local source = io.readfile(minhookSource)
@@ -49,11 +52,15 @@ do
 		for _, fix in ipairs(fixes) do
 			local funcStart = fixed:find(fix[1], 1, true)
 			local funcEnd = funcStart and fixed:find("\n}", funcStart, true)
-			if funcEnd and not fixed:sub(funcStart, funcEnd):find(fix[3], 1, true) then
-				local first, last = fixed:find(fix[2], funcStart, true)
-				if first and last < funcEnd then
-					fixed = fixed:sub(1, first - 1) .. fix[3] .. fixed:sub(last + 1)
-				end
+			local body = funcEnd and fixed:sub(funcStart, funcEnd)
+			local newBody, count = nil, 0
+			if body then
+				newBody, count = body:gsub(fix[2], fix[3], 1)
+			end
+			if count == 1 then
+				fixed = fixed:sub(1, funcStart - 1) .. newBody .. fixed:sub(funcEnd + 1)
+			elseif not (body and body:find(fix[4])) then
+				print("WARNING: unrecognized " .. fix[1] .. " in " .. minhookSource .. ", MinHook lock fix not applied")
 			end
 		end
 

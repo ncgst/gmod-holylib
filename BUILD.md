@@ -26,8 +26,10 @@ the pins consistent across plugin, custom, release, and GhostInj workflows.
 non-Windows platforms, so a free lock always sleeps once and a held lock is not
 waited for; and `MH_Uninitialize` returns `MH_ERROR_NOT_INITIALIZED` without
 releasing the lock. The detouring revision CI checks out (`3e0b0388`, MinHook
-`e2a49551`) still has both. Each fix is skipped once its function is fixed
-upstream, and generation stops if the file cannot be written.
+`e2a49551`) still has both. The step matches the whole broken statements, so
+code that is already fixed (here or upstream, in any layout) is left alone; it
+warns about a function it does not recognize, and generation stops if the file
+cannot be written.
 
 # How to build HolyLib
 
