@@ -20,6 +20,14 @@ Updating the SDK requires reviewing the matching engine ABI and local channel
 implementation, then validating the supported build and runtime matrix. Keep
 the pins consistent across plugin, custom, release, and GhostInj workflows.
 
+The Linux builder images are pinned by digest as well (`BUILDER_IMAGE_32X` and
+`BUILDER_IMAGE_64X`). `raphaelit7/gmod-builder:latest_64x` moved to GCC 14 on
+2026-11-02; builds from it need glibc 2.38 and libstdc++ 6.0.32
+(`GLIBCXX_3.4.32`), and fail to load in game-server images with older
+runtimes. The pinned 64x image is the Debian 11 / GCC 10.2 one used before.
+Check the `GLIBC_`/`GLIBCXX_` version needs of a build (`objdump -T`) before
+moving a pin.
+
 `premake5.lua` also fixes two MinHook lock bugs in
 `garrysmod_common/detouring/minhook/src/hook.c` while it generates the projects:
 `EnterSpinLock` compares the previous value with `true` instead of `false` on
