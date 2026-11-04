@@ -24,25 +24,46 @@ end
 local gmcommon = assert(_OPTIONS.gmcommon or os.getenv("GARRYSMOD_COMMON"),
 	"you didn't provide a path to your garrysmod_common (https://github.com/danielga/garrysmod_common) directory")
 
--- MinHook's non-Windows EnterSpinLock (detouring/minhook) compares the old lock value with
--- true instead of false: every free lock costs one usleep(0) (~50 us on Linux) and a held
--- lock is not waited for. The Windows branch compares with FALSE. Fix the checkout until
--- upstream does.
+-- MinHook (detouring/minhook) lock bugs, fixed in the checkout until upstream fixes them:
+-- * EnterSpinLock's non-Windows branch compares the old lock value with true instead of false:
+--   every free lock costs one usleep(0) (~50 us on Linux) and a held lock is not waited for.
+--   The Windows branch compares with FALSE.
+-- * MH_Uninitialize returns MH_ERROR_NOT_INITIALIZED without releasing the lock. With a working
+--   lock that would block every later MinHook call.
 do
 	local minhookSource = gmcommon .. "/detouring/minhook/src/hook.c"
+	local fixes = { -- function, broken text, fixed text
+		{"static void EnterSpinLock(void)",
+			"__sync_val_compare_and_swap(&g_isLocked, false, true) != true",
+			"__sync_val_compare_and_swap(&g_isLocked, false, true) != false"},
+		{"MH_STATUS MH_API MH_Uninitialize(void)",
+			"return MH_ERROR_NOT_INITIALIZED;",
+			"LeaveSpinLock(); return MH_ERROR_NOT_INITIALIZED;"},
+	}
+
 	local source = io.readfile(minhookSource)
-	local broken = "__sync_val_compare_and_swap(&g_isLocked, false, true) != true"
-	local first, last = nil, nil
-	if source then
-		first, last = source:find(broken, 1, true)
-	end
-	if first then
-		local fixed = source:sub(1, first - 1) ..
-			"__sync_val_compare_and_swap(&g_isLocked, false, true) != false" .. source:sub(last + 1)
-		if io.writefile(minhookSource, fixed) then
-			print("Fixed the MinHook spin lock comparison in " .. minhookSource)
-		else
-			print("WARNING: could not fix the MinHook spin lock comparison in " .. minhookSource)
+	if not source then
+		print("WARNING: " .. minhookSource .. " not found, MinHook lock fixes not applied")
+	else
+		local fixed = source
+		for _, fix in ipairs(fixes) do
+			local funcStart = fixed:find(fix[1], 1, true)
+			local funcEnd = funcStart and fixed:find("\n}", funcStart, true)
+			if funcEnd and not fixed:sub(funcStart, funcEnd):find(fix[3], 1, true) then
+				local first, last = fixed:find(fix[2], funcStart, true)
+				if first and last < funcEnd then
+					fixed = fixed:sub(1, first - 1) .. fix[3] .. fixed:sub(last + 1)
+				end
+			end
+		end
+
+		if fixed ~= source then
+			-- io.writefile only reports whether the file could be opened, so read the result back.
+			io.writefile(minhookSource, fixed)
+			if io.readfile(minhookSource) ~= fixed then
+				error("could not write the MinHook lock fixes to " .. minhookSource)
+			end
+			print("Fixed the MinHook spin lock in " .. minhookSource)
 		end
 	end
 end
