@@ -23,6 +23,30 @@ end
 
 local gmcommon = assert(_OPTIONS.gmcommon or os.getenv("GARRYSMOD_COMMON"),
 	"you didn't provide a path to your garrysmod_common (https://github.com/danielga/garrysmod_common) directory")
+
+-- MinHook's non-Windows EnterSpinLock (detouring/minhook) compares the old lock value with
+-- true instead of false: every free lock costs one usleep(0) (~50 us on Linux) and a held
+-- lock is not waited for. The Windows branch compares with FALSE. Fix the checkout until
+-- upstream does.
+do
+	local minhookSource = gmcommon .. "/detouring/minhook/src/hook.c"
+	local source = io.readfile(minhookSource)
+	local broken = "__sync_val_compare_and_swap(&g_isLocked, false, true) != true"
+	local first, last = nil, nil
+	if source then
+		first, last = source:find(broken, 1, true)
+	end
+	if first then
+		local fixed = source:sub(1, first - 1) ..
+			"__sync_val_compare_and_swap(&g_isLocked, false, true) != false" .. source:sub(last + 1)
+		if io.writefile(minhookSource, fixed) then
+			print("Fixed the MinHook spin lock comparison in " .. minhookSource)
+		else
+			print("WARNING: could not fix the MinHook spin lock comparison in " .. minhookSource)
+		end
+	end
+end
+
 include(gmcommon)
 
 local rootDir = ""

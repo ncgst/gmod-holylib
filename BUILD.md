@@ -20,6 +20,13 @@ Updating the SDK requires reviewing the matching engine ABI and local channel
 implementation, then validating the supported build and runtime matrix. Keep
 the pins consistent across plugin, custom, release, and GhostInj workflows.
 
+`premake5.lua` also fixes MinHook's non-Windows spin lock in
+`garrysmod_common/detouring/minhook/src/hook.c` while it generates the projects:
+`EnterSpinLock` compares the previous value with `true` instead of `false`, so a
+free lock always sleeps once and a held lock is not waited for. The detouring
+revision CI checks out (`3e0b0388`, MinHook `e2a49551`) still has this. The step
+does nothing once the comparison is fixed upstream.
+
 # How to build HolyLib
 
 1. Clone garrysmod_common & its submodules into the `development` folder.<br>
