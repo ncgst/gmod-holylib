@@ -1,6 +1,7 @@
 #include "detours.h"
 #include <convar.h>
 #include "tier0/dbg.h"
+#include "tier0/threadtools.h"
 
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
@@ -46,7 +47,9 @@ static unordered_map<unsigned int, unordered_set<Detouring::Hook*>> g_pDetours =
 static unsigned int g_nStateGeneration = 1; // Detour::StateCache starts at 0, so the first Get runs its check.
 unsigned int Detour::GetStateGeneration()
 {
-	return g_nStateGeneration;
+	// Detours change on the main thread. Lua running on other threads (luathreads) can still
+	// reach cached checks, e.g. through gmoddatapack.RefreshExistingLuaFile.
+	return ThreadInMainThread() ? g_nStateGeneration : 0;
 }
 
 void Detour::Create(Detouring::Hook* pHook, const char* strName, void* pModule, Symbol pSymbol, void* pHookFunc, unsigned int category, bool bEnable)

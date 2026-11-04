@@ -200,11 +200,13 @@ byte m_##name = 0;
 	extern const unordered_set<std::string>& GetFailedDetours();
 	extern const unordered_map<std::string, unsigned int>& GetLoadedDetours();
 	// Changes whenever CreateAtAddress, EnableHook, DisableHook or Remove change a hook.
+	// Returns 0 off the main thread.
 	extern unsigned int GetStateGeneration();
 
 	// Hook::IsEnabled() goes through MinHook's global lock. Hot paths can cache a check
 	// over hooks that only change through the functions above; the check runs again
-	// after the next change. Main thread only.
+	// after the next change. The cache is only used on the main thread; other threads
+	// run the check every time.
 	class StateCache
 	{
 	public:
@@ -212,6 +214,9 @@ byte m_##name = 0;
 		bool Get(Check pCheck)
 		{
 			const unsigned int nGeneration = GetStateGeneration();
+			if (nGeneration == 0)
+				return pCheck();
+
 			if (m_nGeneration != nGeneration)
 			{
 				m_bResult = pCheck();
