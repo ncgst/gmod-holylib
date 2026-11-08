@@ -45,6 +45,18 @@ jobs:
       - name: Check borrowed VProf node ownership under sanitizers
         run: python3 tests/vprof_node_ownership_tests.py
 
+  upstream_backport_tests:
+    name: "Stable upstream regressions"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check player, transmit, buffer, callback and shutdown regressions
+        run: python3 tests/stable_upstream_regression_tests.py
+      - name: Check runtime guards under sanitizers
+        run: python3 tests/upstream_runtime_guard_tests.py --sanitize
+      - name: Check timer timing and callback lifetimes under sanitizers
+        run: python3 tests/systimer_regression_tests.py
+
   teleport_guard_tests:
     name: "Teleport recursion guard tests"
     runs-on: ubuntu-latest
