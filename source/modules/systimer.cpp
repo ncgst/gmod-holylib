@@ -54,6 +54,7 @@ class LuaSysTimerModuleData : public Lua::ModuleData
 {
 public:
 	CUtlVector<ILuaTimer*> pLuaTimers;
+	bool bThinking = false;
 };
 
 LUA_GetModuleData(LuaSysTimerModuleData, g_pSysTimerModule, SysTimer)
@@ -77,6 +78,10 @@ static ILuaTimer* FindTimer(GarrysMod::Lua::ILuaInterface* pLua, const char* nam
 static void RemoveTimers(GarrysMod::Lua::ILuaInterface* pLua)
 {
 	auto pData = GetSysTimerLuaData(pLua);
+	// Callbacks may remove timers, but must not move or destroy the entries
+	// still being dispatched by LuaThink.
+	if (pData->bThinking)
+		return;
 
 	bool bDeleted = false;
 	int nTimer = pData->pLuaTimers.Count();
@@ -86,7 +91,7 @@ static void RemoveTimers(GarrysMod::Lua::ILuaInterface* pLua)
 		if (!timer->markDelete)
 			continue;
 
-		pData->pLuaTimers.FastRemove(nTimer);
+		pData->pLuaTimers.FastRemove(i);
 		bDeleted = true;
 		delete timer;
 	}
@@ -103,6 +108,8 @@ LUA_FUNCTION_STATIC(timer_Adjust)
 	ILuaTimer* timer = FindTimer(LUA, name);
 	if (timer) {
 		timer->delay = (float)delay;
+		// Paused timers store a duration; active timers store a deadline.
+		timer->nextRunTime = timer->active ? GetTime() + delay : delay;
 		if (LUA->IsType(3, GarrysMod::Lua::Type::Number))
 			timer->repetitions = (int)LUA->GetNumber(3);
 
@@ -140,6 +147,8 @@ LUA_FUNCTION_STATIC(timer_Create)
 	} else {
 		Util::ReferenceFree(timer->pLua, timer->function, "timer.Create - old function");
 		Util::ReferenceFree(timer->pLua, timer->identifierReference, "timer.Create - old identifyer");
+		timer->markDelete = false;
+		timer->active = true;
 	}
 
 	LUA->Push(4);
@@ -173,12 +182,10 @@ LUA_FUNCTION_STATIC(timer_Pause)
 	const char* name = LUA->CheckString(1);
 
 	ILuaTimer* timer = FindTimer(LUA, name);
-	if (timer) {
-		if (timer->active) {
-			timer->active = false;
-			LUA->PushBool(true);
-		} else
-			LUA->PushBool(false);
+	if (timer && timer->active) {
+		timer->active = false;
+		timer->nextRunTime = timer->nextRunTime - GetTime();
+		LUA->PushBool(true);
 	} else
 		LUA->PushBool(false);
 
@@ -192,6 +199,10 @@ LUA_FUNCTION_STATIC(timer_Remove)
 	ILuaTimer* timer = FindTimer(LUA, name);
 	if (timer) {
 		timer->markDelete = true;
+		timer->active = false;
+		// Remove is visible to lookups immediately, including a Create of the
+		// same name, even when deletion is deferred until dispatch completes.
+		timer->identifier = nullptr;
 		RemoveTimers(LUA);
 	}
 
@@ -276,9 +287,9 @@ LUA_FUNCTION_STATIC(timer_TimeLeft)
 	ILuaTimer* timer = FindTimer(LUA, name);
 	if (timer)
 		if (timer->active)
-			LUA->PushNumber(timer->nextRunTime - GetTime());
+			LUA->PushNumber((timer->nextRunTime - GetTime()) / (1000.0 * 1000.0));
 		else
-			LUA->PushNumber(timer->nextRunTime);
+			LUA->PushNumber(timer->nextRunTime / (1000.0 * 1000.0));
 	else
 		LUA->PushNumber(0);
 
@@ -292,7 +303,10 @@ LUA_FUNCTION_STATIC(timer_Toggle)
 	ILuaTimer* timer = FindTimer(LUA, name);
 	if (timer) {
 		timer->active = !timer->active;
-		timer->nextRunTime = GetTime() + timer->nextRunTime;
+		if (timer->active)
+			timer->nextRunTime = GetTime() + timer->nextRunTime;
+		else
+			timer->nextRunTime = timer->nextRunTime - GetTime();
 		LUA->PushBool(timer->active);
 	} else
 		LUA->PushBool(false);
@@ -305,9 +319,9 @@ LUA_FUNCTION_STATIC(timer_UnPause)
 	const char* name = LUA->CheckString(1);
 
 	ILuaTimer* timer = FindTimer(LUA, name);
-	if (timer) {
+	if (timer && !timer->active) {
 		timer->active = true;
-		timer->nextRunTime = GetTime() + timer->delay;
+		timer->nextRunTime = GetTime() + timer->nextRunTime;
 		LUA->PushBool(true);
 	} else
 		LUA->PushBool(false);
@@ -357,12 +371,17 @@ void CSysTimerModule::LuaThink(GarrysMod::Lua::ILuaInterface* pLua)
 
 	double time = GetTime();
 	auto pData = GetSysTimerLuaData(pLua);
-	if (!pData)
+	if (!pData || pData->bThinking)
 		return;
 
-	for (ILuaTimer* timer : pData->pLuaTimers)
+	pData->bThinking = true;
+	// Keep existing entries stable until the pass finishes. Newly created
+	// timers run on the next pass, including zero-delay callback chains.
+	const int nTimers = pData->pLuaTimers.Count();
+	for (int i = 0; i < nTimers; ++i)
 	{
-		if (!timer->active)
+		ILuaTimer* timer = pData->pLuaTimers[i];
+		if (!timer->active || timer->markDelete)
 			continue;
 
 		if (g_pSysTimerModule.InDebug())
@@ -372,15 +391,16 @@ void CSysTimerModule::LuaThink(GarrysMod::Lua::ILuaInterface* pLua)
 		{
 			timer->nextRunTime = time + timer->delay;
 
-			Util::ReferencePush(pLua, timer->function);
-			pLua->CallFunctionProtected(0, 0, true); // We should add a custom error handler to not have errors with no stack (Which somehow can happen but only observed in gmod clients)
-
 			if (timer->repetitions == 1)
 				timer->markDelete = true;
-			else
+			else if (timer->repetitions > 0)
 				timer->repetitions--;
+
+			Util::ReferencePush(pLua, timer->function);
+			pLua->CallFunctionProtected(0, 0, true); // We should add a custom error handler to not have errors with no stack (Which somehow can happen but only observed in gmod clients)
 		}
 	}
 
+	pData->bThinking = false;
 	RemoveTimers(pLua);
 }
