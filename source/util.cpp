@@ -1357,7 +1357,10 @@ DLL_EXPORT void hook_Sys_Error_Internal_ignore_this_function_in_crashes_check_yo
 		}
 	}
 
-	vsnprintf(g_pCurrentSysError, sizeof(g_pCurrentSysError), error, argsList);
+	va_list argsCopy;
+	va_copy(argsCopy, argsList);
+	vsnprintf(g_pCurrentSysError, sizeof(g_pCurrentSysError), error, argsCopy);
+	va_end(argsCopy);
 	detour_Sys_Error_Internal.GetTrampoline<Symbols::Sys_Error_Internal>()(bMinidump, error, argsList);
 	memset(g_pCurrentSysError, 0, sizeof(g_pCurrentSysError));
 }
