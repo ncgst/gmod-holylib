@@ -271,7 +271,7 @@ CLuaInterface::~CLuaInterface()
 	}
 
 	// This is just for safety to ensure no memory leaks.
-	for (int i=0; i<255; ++i) {
+	for (int i=0; i<MAX_METATABLES; ++i) {
 		if (m_pMetaTables[i])
 		{
 			DestroyObject(m_pMetaTables[i]);
@@ -610,7 +610,7 @@ const char* CLuaInterface::GetTypeName(int iType)
 		return "none";
 
 	constexpr int typeCount = sizeof(GarrysMod::Lua::Type::Name) / sizeof(const char*);
-	if (iType <= typeCount)
+	if (iType < typeCount)
 		return GarrysMod::Lua::Type::Name[iType];
 
 	return "unknown";
@@ -620,7 +620,7 @@ void CLuaInterface::CreateMetaTableType(const char* strName, int iType)
 {
 	LuaDebugPrint(1, "CLuaInterface::CreateMetaTableType(%s, %i)\n", strName, iType);
 	int ret = luaL_newmetatable_type(state, strName, iType);
-	if (ret && iType <= 254)
+	if (ret && iType >= 0 && iType < MAX_METATABLES)
 	{
 		GarrysMod::Lua::ILuaObject* pObject = m_pMetaTables[iType];
 		if (!pObject)
@@ -745,7 +745,7 @@ int CLuaInterface::CreateMetaTable(const char* strName) // Return value is proba
 bool CLuaInterface::PushMetaTable(int iType)
 {
 	LuaDebugPrint(2, "CLuaInterface::PushMetaTable %i\n", iType);
-	if (iType <= 254)
+	if (iType >= 0 && iType < MAX_METATABLES)
 	{
 		GarrysMod::Lua::ILuaObject* pMetaObject = m_pMetaTables[iType];
 		if (pMetaObject)
@@ -803,7 +803,7 @@ bool CLuaInterface::Init( GarrysMod::Lua::ILuaGameCallback* callback, bool bIsSe
 	}
 
 	m_iMetaTableIDCounter = GarrysMod::Lua::Type::Type_Count;
-	for (int i=0; i<=254; ++i)
+	for (int i=0; i<MAX_METATABLES; ++i)
 		m_pMetaTables[i] = nullptr;
 
 	m_iCurrentTempObject = 0;
@@ -905,7 +905,7 @@ void CLuaInterface::Shutdown()
 	lua_close(state);
 	state = nullptr;
 
-	for (int i=0; i<255; ++i) {
+	for (int i=0; i<MAX_METATABLES; ++i) {
 		if (m_pMetaTables[i])
 		{
 			DestroyObject(m_pMetaTables[i]);
@@ -1534,25 +1534,30 @@ void CLuaInterface::ErrorNoHalt( const char* fmt, ... )
 	GarrysMod::Lua::ILuaGameCallback::CLuaError* error = ReadStackIntoError(state);
 
 	va_list args;
+	va_list argsCopy;
 	va_start(args, fmt);
+	va_copy(argsCopy, args);
 
 	int size = vsnprintf(nullptr, 0, fmt, args);
 	if (size < 0) {
 		va_end(args);
+		va_end(argsCopy);
+		delete error;
 		return;
 	}
 
 	char* buffer = new char[size + 1];
-	vsnprintf(buffer, size + 1, fmt, args);
+	vsnprintf(buffer, size + 1, fmt, argsCopy);
 	buffer[size] = '\0';
 
 	error->message = buffer;
 	va_end(args);
+	va_end(argsCopy);
 
 	m_pGameCallback->LuaError(error);
 
-	delete error; // Deconstuctor will delete our buffer.
-	delete buffer; // Update: I'm a idiot, it won't since a std::string copies it
+	delete error;
+	delete[] buffer; // CLuaError::message owns a copy of the formatted string.
 }
 
 void CLuaInterface::Msg( const char* fmt, ... )
@@ -1700,20 +1705,25 @@ void CLuaInterface::ErrorFromLua(const char *fmt, ...)
 	GarrysMod::Lua::ILuaGameCallback::CLuaError* error = ReadStackIntoError(state);
 
 	va_list args;
+	va_list argsCopy;
 	va_start(args, fmt);
+	va_copy(argsCopy, args);
 
 	int size = vsnprintf(nullptr, 0, fmt, args);
 	if (size < 0) {
 		va_end(args);
+		va_end(argsCopy);
+		delete error;
 		return;
 	}
 
 	char* buffer = new char[size + 1];
-	vsnprintf(buffer, size + 1, fmt, args);
+	vsnprintf(buffer, size + 1, fmt, argsCopy);
 	buffer[size] = '\0';
 
 	error->message = buffer;
 	va_end(args);
+	va_end(argsCopy);
 	
 	/* NOTE: This is already done in ReadStackIntoError
 	
@@ -1737,7 +1747,8 @@ void CLuaInterface::ErrorFromLua(const char *fmt, ...)
 
 	m_pGameCallback->LuaError(error);
 
-	delete error; // Deconstuctor will delete our buffer
+	delete error;
+	delete[] buffer; // CLuaError::message owns a copy of the formatted string.
 }
 
 const char* CLuaInterface::GetCurrentLocation()

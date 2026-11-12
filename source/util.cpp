@@ -83,8 +83,21 @@ CBasePlayer* Util::Get_Player(GarrysMod::Lua::ILuaInterface* LUA, int iStackPos,
 		pObj->SetFromStack(iStackPos);
 		CBaseEntity* pEntity = pObj->GetEntity();
 
-		if (!pEntity && bError)
-			LUA->ArgError(iStackPos, "Tried to use a NULL Entity!");
+		if (!pEntity)
+		{
+			if (bError)
+				LUA->ArgError(iStackPos, "Tried to use a NULL Entity!");
+
+			return nullptr;
+		}
+
+		if (!pEntity->IsPlayer())
+		{
+			if (bError)
+				LUA->ArgError(iStackPos, "Entity is not a player!");
+
+			return nullptr;
+		}
 
 		return (CBasePlayer*)pEntity;
 	}
@@ -99,10 +112,18 @@ CBasePlayer* Util::Get_Player(GarrysMod::Lua::ILuaInterface* LUA, int iStackPos,
 	}
 	
 	CBaseEntity* pEntity = Util::entitylist->GetBaseEntity(*pEntHandle);
+	if (!pEntity)
+	{
+		if (bError)
+			LUA->ArgError(iStackPos, "Tried to use a NULL Entity!");
+
+		return nullptr;
+	}
+
 	if (!pEntity->IsPlayer())
 	{
 		if (bError)
-			LUA->ArgError(iStackPos, "Player entity is NULL or not a player (!?)");
+			LUA->ArgError(iStackPos, "Entity is not a player!");
 
 		return nullptr;
 	}
@@ -210,6 +231,7 @@ CBaseEntity* Util::Get_Entity(GarrysMod::Lua::ILuaInterface* LUA, int iStackPos,
 	CBaseEntity* pEntity = Util::entitylist->GetBaseEntity(*pEntHandle);
 	if (!pEntity && bError)
 	{
+		// In this case- the Lua userdata held a valid EHANDLE but the EHANDLE refered to a nonexistent Entity
 		Warning(PROJECT_NAME ": EHANDLE Index %i - %i\n", pEntHandle->GetEntryIndex(), pEntHandle->GetSerialNumber());
 		LUA->ArgError(iStackPos, "Tried to use a NULL Entity! (The weird case?)");
 	}
@@ -1335,7 +1357,10 @@ DLL_EXPORT void hook_Sys_Error_Internal_ignore_this_function_in_crashes_check_yo
 		}
 	}
 
-	vsnprintf(g_pCurrentSysError, sizeof(g_pCurrentSysError), error, argsList);
+	va_list argsCopy;
+	va_copy(argsCopy, argsList);
+	vsnprintf(g_pCurrentSysError, sizeof(g_pCurrentSysError), error, argsCopy);
+	va_end(argsCopy);
 	detour_Sys_Error_Internal.GetTrampoline<Symbols::Sys_Error_Internal>()(bMinidump, error, argsList);
 	memset(g_pCurrentSysError, 0, sizeof(g_pCurrentSysError));
 }
@@ -1650,7 +1675,7 @@ void Util::CheckVersion(bool bAutoUpdate) // This is called only when holylib is
 	};
 
 	auto res = pClient.Get("/api/check_version");
-	if (res->status != 200)
+	if (!res || res->status != 200)
 		return;
 
 	Bootil::Data::Tree pTree;
@@ -1697,7 +1722,7 @@ void Util::CheckVersion(bool bAutoUpdate) // This is called only when holylib is
 
 		if (!pReleaseDownload || pReleaseDownload->status != 200)
 		{
-			Msg(PROJECT_NAME " - versioncheck: Autoupdate failed to download new version! (%i)\n", pReleaseDownload->status);
+			Msg(PROJECT_NAME " - versioncheck: Autoupdate failed to download new version! (%i)\n", pReleaseDownload ? pReleaseDownload->status : -1);
 			return;
 		}
 

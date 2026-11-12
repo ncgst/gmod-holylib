@@ -198,16 +198,13 @@ static void CleanupSetPreventTransmit(const CBaseEntity* ent)
 		return;
 
 	const int entIndex = pEdict->m_EdictIndex;
-	if (!ent->IsPlayer())
+	for (int i=0; i<MAX_PLAYERS; ++i)
 	{
-		for (int i=0; i<MAX_PLAYERS; ++i)
-		{
-			g_pShouldPrevent[i].Clear(entIndex);
-		}
-		return;
+		g_pShouldPrevent[i].Clear(entIndex);
 	}
 
-	g_pShouldPrevent[entIndex-1].ClearAll();
+	if (ent->IsPlayer())
+		g_pShouldPrevent[entIndex-1].ClearAll();
 }
 
 static Detouring::Hook detour_CBaseEntity_GMOD_SetShouldPreventTransmitToPlayer;
@@ -766,14 +763,14 @@ struct EntityTransmitCache // Well.... Still kinda acts as a tick-based cache, t
 				Msg("    %i: %s[%i]\n", i, pPVSEntityList[i]->GetClassname(), pPVSEntityList[i]->edict()->m_EdictIndex);
 
 			Msg("Never:\n");
-			for (int i=0; i<=pNeverTransmitBits.GetNumBits(); ++i)
+			for (int i=0; i<pNeverTransmitBits.GetNumBits(); ++i)
 			{
 				if (pNeverTransmitBits.IsBitSet(i))
 					Msg("    %i\n", i);
 			}
 
 			Msg("Always:\n");
-			for (int i=0; i<=pAlwaysTransmitBits.GetNumBits(); ++i)
+			for (int i=0; i<pAlwaysTransmitBits.GetNumBits(); ++i)
 			{
 				if (pAlwaysTransmitBits.IsBitSet(i))
 					Msg("    %i\n", i);

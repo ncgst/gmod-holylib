@@ -397,6 +397,11 @@ void Lua::ServerInit()
 
 void Lua::Shutdown()
 {
+	// Binary modules do not receive the server plugin's LevelShutdown callback.
+	// Run it before LuaShutdown while the main Lua state is still valid.
+	if (g_pModuleManager.IsMarkedAsBinaryModule())
+		g_pModuleManager.LevelShutdown();
+
 	g_pModuleManager.LuaShutdown(g_Lua);
 
 	g_Lua->PushNil();
@@ -418,6 +423,11 @@ void Lua::FinalShutdown()
 			Msg(PROJECT_NAME ": This should NEVER happen! Discarding of old reference %i\n", ref);
 	}
 	Util::g_pReference.clear();
+
+	// Lua shutdown/GC may have repopulated module state. The engine also sends
+	// LevelShutdown more than once, so repeat the cleanup after finalisation.
+	if (g_pModuleManager.IsMarkedAsBinaryModule())
+		g_pModuleManager.LevelShutdown();
 }
 
 void Lua::ManualShutdown()
