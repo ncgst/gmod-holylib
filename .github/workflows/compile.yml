@@ -90,6 +90,8 @@ jobs:
         run: python3 tests/luapack_worker_lifecycle_tests.py
       - name: Run production auto-refresh read regressions
         run: python3 tests/luapack_autorefresh_read_tests.py --sanitize
+      - name: Check native data-pack allowance guards under sanitizers
+        run: python3 tests/datapack_allowance_tests.py --sanitize
       - name: Run embedded LuaPack bootstrap tests
         run: |
           chmod +x source/_prebuildtools/luajit_64
@@ -100,6 +102,8 @@ jobs:
     needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
+      BUILDER_IMAGE_32X: "raphaelit7/gmod-builder@sha256:10ffd1cc385c803831521822a463d40c6e1a544d0c7c6d0e2489560f60343f1a" # latest_32x before 2026-11-02
+      BUILDER_IMAGE_64X: "raphaelit7/gmod-builder@sha256:ad67a67b9ffb3e8fe1b20f5a15ce044297c51b3a6c6c9ad00cac9d252fa9255d" # Debian 11, GCC 10.2 (latest_64x before 2026-11-02)
       PROJECT_NAME: "holylib"
       BUILD_64x: "true"
       REALM: "sv"
@@ -120,6 +124,8 @@ jobs:
     needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
+      BUILDER_IMAGE_32X: "raphaelit7/gmod-builder@sha256:10ffd1cc385c803831521822a463d40c6e1a544d0c7c6d0e2489560f60343f1a" # latest_32x before 2026-11-02
+      BUILDER_IMAGE_64X: "raphaelit7/gmod-builder@sha256:ad67a67b9ffb3e8fe1b20f5a15ce044297c51b3a6c6c9ad00cac9d252fa9255d" # Debian 11, GCC 10.2 (latest_64x before 2026-11-02)
       PROJECT_NAME: "holylib"
       BUILD_64x: "true"
       REALM: "sv"
@@ -141,6 +147,8 @@ jobs:
     needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
+      BUILDER_IMAGE_32X: "raphaelit7/gmod-builder@sha256:10ffd1cc385c803831521822a463d40c6e1a544d0c7c6d0e2489560f60343f1a" # latest_32x before 2026-11-02
+      BUILDER_IMAGE_64X: "raphaelit7/gmod-builder@sha256:ad67a67b9ffb3e8fe1b20f5a15ce044297c51b3a6c6c9ad00cac9d252fa9255d" # Debian 11, GCC 10.2 (latest_64x before 2026-11-02)
       PROJECT_NAME: "holylib"
       BUILD_64x: "true"
       BUILD_32x: "false"
@@ -162,6 +170,8 @@ jobs:
     needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
+      BUILDER_IMAGE_32X: "raphaelit7/gmod-builder@sha256:10ffd1cc385c803831521822a463d40c6e1a544d0c7c6d0e2489560f60343f1a" # latest_32x before 2026-11-02
+      BUILDER_IMAGE_64X: "raphaelit7/gmod-builder@sha256:ad67a67b9ffb3e8fe1b20f5a15ce044297c51b3a6c6c9ad00cac9d252fa9255d" # Debian 11, GCC 10.2 (latest_64x before 2026-11-02)
       PROJECT_NAME: "holylib"
       BUILD_64x: "true"
       REALM: "sv"
@@ -185,6 +195,8 @@ jobs:
       PTERODACTYL_SERVER: ${{ secrets.PTERODACTYL_SERVER }}
       PTERODACTYL_URL: ${{ secrets.PTERODACTYL_URL }}
     with:
+      BUILDER_IMAGE_32X: "raphaelit7/gmod-builder@sha256:10ffd1cc385c803831521822a463d40c6e1a544d0c7c6d0e2489560f60343f1a" # latest_32x before 2026-11-02
+      BUILDER_IMAGE_64X: "raphaelit7/gmod-builder@sha256:ad67a67b9ffb3e8fe1b20f5a15ce044297c51b3a6c6c9ad00cac9d252fa9255d" # Debian 11, GCC 10.2 (latest_64x before 2026-11-02)
       PROJECT_NAME: "holylib"
       BUILD_64x: "false"
       REALM: "sv"
@@ -211,6 +223,8 @@ jobs:
       PTERODACTYL_SERVER: ${{ secrets.PTERODACTYL_SERVER_PUBLIC }}
       PTERODACTYL_URL: ${{ secrets.PTERODACTYL_URL }}
     with:
+      BUILDER_IMAGE_32X: "raphaelit7/gmod-builder@sha256:10ffd1cc385c803831521822a463d40c6e1a544d0c7c6d0e2489560f60343f1a" # latest_32x before 2026-11-02
+      BUILDER_IMAGE_64X: "raphaelit7/gmod-builder@sha256:ad67a67b9ffb3e8fe1b20f5a15ce044297c51b3a6c6c9ad00cac9d252fa9255d" # Debian 11, GCC 10.2 (latest_64x before 2026-11-02)
       PROJECT_NAME: "holylib"
       BUILD_64x: "false"
       REALM: "sv"
@@ -237,6 +251,8 @@ jobs:
       PTERODACTYL_SERVER: ${{ secrets.PTERODACTYL_SERVER_X64 }}
       PTERODACTYL_URL: ${{ secrets.PTERODACTYL_URL }}
     with:
+      BUILDER_IMAGE_32X: "raphaelit7/gmod-builder@sha256:10ffd1cc385c803831521822a463d40c6e1a544d0c7c6d0e2489560f60343f1a" # latest_32x before 2026-11-02
+      BUILDER_IMAGE_64X: "raphaelit7/gmod-builder@sha256:ad67a67b9ffb3e8fe1b20f5a15ce044297c51b3a6c6c9ad00cac9d252fa9255d" # Debian 11, GCC 10.2 (latest_64x before 2026-11-02)
       PROJECT_NAME: "holylib"
       BUILD_64x: "true"
       BUILD_32x: "false"
@@ -259,6 +275,8 @@ jobs:
     needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
+      BUILDER_IMAGE_32X: "raphaelit7/gmod-builder@sha256:10ffd1cc385c803831521822a463d40c6e1a544d0c7c6d0e2489560f60343f1a" # latest_32x before 2026-11-02
+      BUILDER_IMAGE_64X: "raphaelit7/gmod-builder@sha256:ad67a67b9ffb3e8fe1b20f5a15ce044297c51b3a6c6c9ad00cac9d252fa9255d" # Debian 11, GCC 10.2 (latest_64x before 2026-11-02)
       PROJECT_PATH: "ghostinj-dll/"
       PROJECT_NAME: "ghostinj"
       BUILD_64x: "true"
@@ -314,6 +332,8 @@ jobs:
           - holylua
           - networkdebugging
     with:
+      BUILDER_IMAGE_32X: "raphaelit7/gmod-builder@sha256:10ffd1cc385c803831521822a463d40c6e1a544d0c7c6d0e2489560f60343f1a" # latest_32x before 2026-11-02
+      BUILDER_IMAGE_64X: "raphaelit7/gmod-builder@sha256:ad67a67b9ffb3e8fe1b20f5a15ce044297c51b3a6c6c9ad00cac9d252fa9255d" # Debian 11, GCC 10.2 (latest_64x before 2026-11-02)
       PROJECT_NAME: "holylib"
       BUILD_64x: "true"
       REALM: "sv"
@@ -831,6 +851,8 @@ jobs:
     needs: gluatest_syntax
     uses: ncgst/gmod-common-module-base/.github/workflows/compile.yml@workflow
     with:
+      BUILDER_IMAGE_32X: "raphaelit7/gmod-builder@sha256:10ffd1cc385c803831521822a463d40c6e1a544d0c7c6d0e2489560f60343f1a" # latest_32x before 2026-11-02
+      BUILDER_IMAGE_64X: "raphaelit7/gmod-builder@sha256:ad67a67b9ffb3e8fe1b20f5a15ce044297c51b3a6c6c9ad00cac9d252fa9255d" # Debian 11, GCC 10.2 (latest_64x before 2026-11-02)
       PROJECT_PATH: "example-module-dll/"
       PROJECT_NAME: "exampledll"
       BUILD_64x: "true"
