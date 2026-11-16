@@ -2355,6 +2355,10 @@ static Detouring::Hook detour_GModDataPack_SendFileToClient;
 static Detouring::Hook detour_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack;
 #if defined(SYSTEM_LINUX)
 static Detouring::Hook detour_GModDataPack_OnFilesRequested;
+#if defined(ARCHITECTURE_X86_64)
+static Detouring::Hook detour_CServerGameClients_GMOD_ClientConnected;
+static Detouring::Hook detour_CServerGameClients_GMOD_SentClientStringTables;
+#endif
 static thread_local int g_requiredRequestProbeSlot = -1;
 static thread_local bool g_requiredRequestProbeAccepted = false;
 #endif
@@ -3785,13 +3789,55 @@ static void hook_GModDataPack_SendFileToClient(GModDataPack* pDataPack, int clie
 }
 
 #if defined(SYSTEM_LINUX)
+extern CGlobalVars* gpGlobals;
+
+static bool AllowNativeDataPackClient(int clientIdx, const char* path, bool& warned)
+{
+	// Native GModDataPack has int[128], independent of HolyLib's extended limit.
+	// Both game-client callbacks and OnFilesRequested receive zero-based slots.
+	// Use the physical limit: the advertised server capacity can include the queue.
+	if (gpGlobals && clientIdx >= 0 && clientIdx < 128 &&
+		clientIdx < gpGlobals->maxClients && Util::server &&
+		Util::GetClientBySlot(clientIdx))
+		return true;
+
+	if (!warned)
+	{
+		warned = true;
+		Warning(PROJECT_NAME " - gmoddatapack: dropped %s for non-player or out-of-range slot %i\n",
+			path, clientIdx);
+	}
+	return false;
+}
+
+#if defined(ARCHITECTURE_X86_64)
+using NativeDataPackClientCallback = void (*)(IServerGameClients*, int);
+
+static void hook_CServerGameClients_GMOD_ClientConnected(IServerGameClients* clients, int clientIdx)
+{
+	static bool warned = false;
+	if (AllowNativeDataPackClient(clientIdx, "GMOD_ClientConnected", warned))
+		detour_CServerGameClients_GMOD_ClientConnected.GetTrampoline<NativeDataPackClientCallback>()(clients, clientIdx);
+}
+
+static void hook_CServerGameClients_GMOD_SentClientStringTables(IServerGameClients* clients, int clientIdx)
+{
+	static bool warned = false;
+	if (AllowNativeDataPackClient(clientIdx, "GMOD_SentClientStringTables", warned))
+		detour_CServerGameClients_GMOD_SentClientStringTables.GetTrampoline<NativeDataPackClientCallback>()(clients, clientIdx);
+}
+#endif
+
 static void hook_GModDataPack_OnFilesRequested(GModDataPack* pDataPack,
 	int clientIdx, bf_read* message, int bits)
 {
+	static bool warned = false;
+	if (!AllowNativeDataPackClient(clientIdx, "OnFilesRequested", warned))
+		return;
+
 	auto original = detour_GModDataPack_OnFilesRequested.GetTrampoline<
 		Symbols::GModDataPack_OnFilesRequested>();
-	if (!pDataPack || !pDataPack->m_pClientLuaFiles || !message ||
-		clientIdx < 0 || clientIdx >= ABSOLUTE_PLAYER_LIMIT)
+	if (!pDataPack || !pDataPack->m_pClientLuaFiles || !message)
 	{
 		original(pDataPack, clientIdx, message, bits);
 		return;
@@ -4510,6 +4556,22 @@ void CGModDataPackModule::InitDetour(bool bPreServer)
 	);
 
 #if defined(SYSTEM_LINUX)
+#if defined(ARCHITECTURE_X86_64)
+	// Linux x64 ServerGameClients004 slots 19/20 reset/grant the native allowance.
+	// Resolve through the interface so these hooks also cover indirect engine calls.
+	void** clientsVTable = Util::servergameclients
+		? *reinterpret_cast<void***>(Util::servergameclients) : nullptr;
+	Detour::CreateAtAddress(
+		&detour_CServerGameClients_GMOD_ClientConnected, "CServerGameClients::GMOD_ClientConnected",
+		clientsVTable ? clientsVTable[19] : nullptr,
+		(void*)hook_CServerGameClients_GMOD_ClientConnected, m_pID
+	);
+	Detour::CreateAtAddress(
+		&detour_CServerGameClients_GMOD_SentClientStringTables, "CServerGameClients::GMOD_SentClientStringTables",
+		clientsVTable ? clientsVTable[20] : nullptr,
+		(void*)hook_CServerGameClients_GMOD_SentClientStringTables, m_pID
+	);
+#endif
 	Detour::Create(
 		&detour_GModDataPack_OnFilesRequested, "GModDataPack::OnFilesRequested",
 		server_loader.GetModule(), Symbols::GModDataPack_OnFilesRequestedSym,

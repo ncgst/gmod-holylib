@@ -90,6 +90,8 @@ jobs:
         run: python3 tests/luapack_worker_lifecycle_tests.py
       - name: Run production auto-refresh read regressions
         run: python3 tests/luapack_autorefresh_read_tests.py --sanitize
+      - name: Check native data-pack allowance guards under sanitizers
+        run: python3 tests/datapack_allowance_tests.py --sanitize
       - name: Run embedded LuaPack bootstrap tests
         run: |
           chmod +x source/_prebuildtools/luajit_64
