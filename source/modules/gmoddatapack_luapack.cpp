@@ -177,11 +177,12 @@ namespace HolyLib::LuaPack
 -- This chunk is prepended to lua/includes/init.lua, so it runs before ANY pure-Lua base
 -- library exists (util.lua, extensions/*.lua, modules/*.lua are included later by this
 -- very file). Only engine-registered C functions may be used here: Msg, CreateConVar,
--- GetConVar_Internal, file.Open, util.MD5/Decompress, CompileString, RunConsoleCommand,
+-- GetConVar_Internal, file.Open, HTTP, util.MD5/Decompress, CompileString, RunConsoleCommand,
 -- string.*, debug.*. In particular GetConVar, Color, file.Read (an extensions/file.lua
 -- wrapper) and net.Receive do NOT exist yet.
 do
 	local getConVar = GetConVar_Internal or GetConVar
+	local httpRequest = HTTP
 	local mirrorFlags = (FCVAR_REPLICATED or 0) + (FCVAR_PROTECTED or 0) +
 		(FCVAR_DONTRECORD or 0) + (FCVAR_UNLOGGED or 0) + (FCVAR_UNREGISTERED or 0)
 	local function mirroredConVar(name, default)
@@ -200,12 +201,16 @@ do
 	end
 
 	-- file.Read is defined later by extensions/file.lua; only file.Open exists here.
-	local function readFile(path)
-		local handle = file.Open(path, "rb", "GAME")
+	local function readFile(path, searchPath, maximumBytes)
+		local handle = file.Open(path, "rb", searchPath)
 		if not handle then return nil end
-		local contents = handle:Read(handle:Size())
+		local size = handle:Size()
+		local contents
+		if not maximumBytes or size <= maximumBytes then
+			contents = handle:Read(size)
+		end
 		handle:Close()
-		return contents or ""
+		return contents, true
 	end
 
 	-- Safety preamble. The server may speculatively deliver generation stubs before this
@@ -216,9 +221,7 @@ do
 	-- on the wire before the reconnect tears the channel down, hence the timer; the server
 	-- also latches on its own when a speculated connection dies unacknowledged, so a lost
 	-- unready command still converges.
-	-- Required stubs pass a second true argument. They never switch this connection
-	-- or execute retry locally. The exact failure command lets the authenticated server
-	-- queue at most one engine-level reconnect whose new ServerInfo baseline is native.
+	-- Required stubs never switch this connection or execute retry locally.
 	local recoveryTaint = false
 	local recoverySignaled = false
 	local requiredFailureSignaled = false
@@ -236,7 +239,7 @@ do
 			timer.Simple(1, issueRetry)
 		end
 	end
-	local function stubRecovery(generation, required)
+	local function stubRecovery(generation, required, recoverCorruptPack)
 		-- A cached pre-required stub has no second argument. Fall back to replicated lane
 		-- policy so enabling required mode cannot resurrect the old automatic retry loop.
 		if required == nil then required = requiredMode end
@@ -244,10 +247,12 @@ do
 		if required then
 			if not requiredFailureSignaled then
 				requiredFailureSignaled = true
-				warn("required pack " .. tostring(generation) ..
-					" could not resolve this Lua file; requesting one authenticated engine reconnect" ..
-					" (manual opt out: +tv_nochat no_gluapack)")
-				RunConsoleCommand("holylib_luapack_failed", tostring(generation or ""))
+				if recoverCorruptPack then
+					recoverCorruptPack(generation)
+				else
+					warn("required pack " .. tostring(generation) .. " could not resolve this Lua file")
+					RunConsoleCommand("holylib_luapack_failed", tostring(generation or ""))
+				end
 			end
 			return function() end
 		end
@@ -350,20 +355,110 @@ do
 
 		local packs = {}
 		local lazyMountAttempted = {}
+		local corruptPacks = {}
+		local repairFile = "holylib_luapack_repair.dat"
+		local repairMaxBytes = 32 * 1024 * 1024
+		local repairMaxUncompressed = 256 * 1024 * 1024
+		local downloadFilter = getConVar("cl_downloadfilter")
+		local downloadsDisabled = downloadFilter and downloadFilter:GetString() == "none"
+
+		local function verifyPack(compressed, manifest, repair)
+			local contents
+			if repair then
+				if #compressed > repairMaxBytes then return nil, "exceeds the repair size limit" end
+				contents = util.Decompress(compressed, repairMaxUncompressed)
+			else
+				contents = util.Decompress(compressed)
+			end
+			if not contents then return nil, "could not be decompressed" end
+			if string.lower(util.MD5(contents)) ~= manifest.md5 then return nil, "failed its generation MD5 check" end
+			local pack, parseError = parsePack(contents, manifest)
+			if not pack then return nil, "is invalid (" .. tostring(parseError) .. ")" end
+			return pack
+		end
+
+		local function readRepair(manifest)
+			-- One slot per installation. The digest prefix avoids decompressing an
+			-- unrelated generation; the body still has to pass its own MD5 check.
+			local stored = readFile(repairFile, "DATA", 32 + repairMaxBytes)
+			if stored and stored:sub(1, 32) == manifest.md5 then
+				return verifyPack(stored:sub(33), manifest, true)
+			end
+		end
+
+		local function recoverCorruptPack(generation)
+			local function report(saved)
+				RunConsoleCommand("holylib_luapack_corrupt", generation, saved and "saved" or "failed")
+			end
+
+			local manifest = manifests[generation]
+			local downloadURL = getConVar("sv_downloadurl")
+			local base = downloadURL and downloadURL:GetString() or ""
+			local authority = base:lower():match("^https?://([^/?]+)")
+			if not manifest or downloadsDisabled or type(httpRequest) ~= "function" or
+				not authority or authority:find("@", 1, true) or base:find("[#%s]") then
+				report(false)
+				return
+			end
+
+			-- The engine appends a slash before the resource even when the
+			-- base ends in a query parameter such as ?asset=.
+			local url = base:gsub("/+$", "") .. "/" .. manifest.resource:gsub("([^%w_.~/%-])", function(byte)
+				return string.format("%%%02X", string.byte(byte))
+			end)
+			local complete = false
+			local function finish(saved)
+				if complete then return end
+				complete = true
+				report(saved)
+			end
+
+			-- Use the engine binding directly. The Lua HTTP wrapper can itself be
+			-- a placeholder. The failed join stays tainted and sends no READY;
+			-- the normal READY deadline remains the server-side upper bound.
+			local ok, queued = pcall(httpRequest, {
+				url = url, method = "GET", timeout = 30,
+				failed = function() finish(false) end,
+				success = function(code, compressed)
+					if complete then return end
+					local saved, stored = pcall(function()
+						if code ~= 200 or type(compressed) ~= "string" or
+							not verifyPack(compressed, manifest, true) then return false end
+						local handle = file.Open(repairFile, "wb", "DATA")
+						if not handle then return false end
+						local bytes = manifest.md5 .. compressed
+						local written = pcall(handle.Write, handle, bytes)
+						handle:Close()
+						return written and readFile(repairFile, "DATA", 32 + repairMaxBytes) == bytes
+					end)
+					finish(saved and stored)
+				end,
+			})
+			if not ok or not queued then finish(false) end
+		end
+
 		-- The engine can fetch FastDL downloadables in the background of the join instead of
 		-- blocking the loading screen, so a generation missing right now may simply not have
 		-- finished downloading. tryMount() reports failures without warning; the boot pass
 		-- warns once, then a timer retries for five minutes and acknowledges late arrivals
 		-- (the server accepts a matching late READY).
 		local function tryMount(manifest)
-			local compressed = readFile("download/" .. manifest.resource)
-			if not compressed then return false, "is unavailable" end
-			local contents = util.Decompress(compressed)
-			if not contents then return false, "could not be decompressed" end
-			if string.lower(util.MD5(contents)) ~= manifest.md5 then return false, "failed its generation MD5 check" end
-			local pack, parseError = parsePack(contents, manifest)
-			if not pack then return false, "is invalid (" .. tostring(parseError) .. ")" end
+			local compressed, exists = readFile("download/" .. manifest.resource, "GAME")
+			local pack, failure
+			if exists then
+				if compressed then
+					pack, failure = verifyPack(compressed, manifest)
+				else
+					failure = "could not be read"
+				end
+				if not pack then corruptPacks[manifest.generation] = true end
+			end
+			if not pack and requiredMode and corruptPacks[manifest.generation] then
+				pack = readRepair(manifest)
+			end
+			if not pack then return false, failure or "is unavailable" end
 			packs[manifest.generation] = pack
+			corruptPacks[manifest.generation] = nil
 			return true
 		end
 
@@ -429,6 +524,9 @@ do
 				-- SHA256 can be registered once in client_lua_files. The replicated manifest
 				-- selects the immutable map-base generation for this level.
 				if generation == nil then generation = selectedGeneration or currentGeneration end
+				if recoveryTaint and (required == true or (required == nil and requiredMode)) then
+					return function() end
+				end
 				local pack = packs[generation]
 				if not pack and not recoveryTaint and not lazyMountAttempted[generation] then
 					-- A speculative stub can arrive while the pack's FastDL download is still
@@ -442,7 +540,9 @@ do
 						RunConsoleCommand("holylib_luapack_ready", generation, manifest.md5)
 					end
 				end
-				if not pack then return stubRecovery(generation, required) end
+				if not pack then
+					return stubRecovery(generation, required, corruptPacks[generation] and recoverCorruptPack)
+				end
 				selectedGeneration = generation
 				local info = debug.getinfo(2, "S")
 				local sourcePath = info and info.source or ""
@@ -469,8 +569,6 @@ do
 		-- Map-base mode publishes one generation per level. Keep the table loop for manifest
 		-- parser compatibility, but only the current base is expected.
 		local pendingManifests = {}
-		local downloadFilter = getConVar("cl_downloadfilter")
-		local downloadsDisabled = downloadFilter and downloadFilter:GetString() == "none"
 		for generation, manifest in pairs(manifests) do
 			local mountedNow, failure = tryMount(manifest)
 			if not mountedNow and not downloadsDisabled then
@@ -478,7 +576,7 @@ do
 			end
 			if not mountedNow and generation == currentGeneration then
 				if downloadsDisabled then
-					warn("pack " .. generation .. " is missing and downloads are disabled; set cl_downloadfilter to mapsonly or all. Required delivery will disconnect; fail-open delivery can use native Lua")
+					warn("pack " .. generation .. " " .. failure .. "; set cl_downloadfilter to mapsonly or all to allow downloads")
 				else
 					warn("pack " .. generation .. " " .. failure .. "; waiting for the background FastDL download before it can be acknowledged")
 				end
@@ -498,6 +596,10 @@ do
 			local attempts = 0
 			local lastFailure = {}
 			timer.Create("HolyLibLuaPackMount", 5, 60, function()
+				if recoveryTaint and requiredMode then
+					timer.Remove("HolyLibLuaPackMount")
+					return
+				end
 				attempts = attempts + 1
 				for generation, manifest in pairs(pendingManifests) do
 					local mountedNow, failure = tryMount(manifest)
@@ -1671,7 +1773,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		"Allow a client whose tv_nochat userinfo is exactly no_gluapack to use native Lua for its entire connection");
 	static ConVar luapack_required_recovery(
 		"holylib_gmoddatapack_luapack_required_recovery", "1", FCVAR_ARCHIVE,
-		"Allow one authenticated engine reconnect whose next ServerInfo baseline is wholly native after a required map-base failure");
+		"Allow one authenticated native reconnect for other required placeholder failures; cache repair uses FastDL");
 	static ConVar luapack_required_recovery_ttl(
 		"holylib_gmoddatapack_luapack_required_recovery_ttl", "120", FCVAR_ARCHIVE,
 		"Seconds an authenticated one-shot required recovery latch remains valid",
@@ -2108,11 +2210,9 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			pLua->RunString("HolyLib luapack server bridge", "", serverBridge, true, true);
 	}
 
-	void CaptureFile(const GarrysMod::Lua::LuaFile* file)
+	bool HasMapBaseSnapshot()
 	{
-		if (!file)
-			return;
-		CaptureFileContents(file->name, file->contents);
+		return state.activeBuild || !state.currentGeneration.empty();
 	}
 
 	void CaptureFileContents(const std::string& inputPath, const std::string& contents)
@@ -2397,7 +2497,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		return {DeliveryAction::Stub, generation->second.compressedRequiredStub.get(), nullptr};
 	}
 
-	void DisconnectRequiredClient(int slot, const char* failure)
+	void DisconnectRequiredClient(int slot, const char* failure, bool cacheSaved)
 	{
 		if (!IsValidSlot(slot))
 			return;
@@ -2410,11 +2510,21 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		Warning(PROJECT_NAME " - luapack: disconnecting required-pack client slot %i: %s\n",
 			slot, failure ? failure : "unspecified required-pack failure");
 		CBaseClient* baseClient = Util::GetClientBySlot(slot);
-		if (baseClient)
+		if (!baseClient)
+			return;
+		if (cacheSaved)
 		{
-			baseClient->Disconnect("%s",
-				"Required LuaPack failed. Automatic native recovery was unavailable or exhausted. Manual opt out: set launch option +tv_nochat no_gluapack, restart Garry's Mod, then reconnect.");
+			baseClient->Disconnect("%s", "Required LuaPack saved a verified copy. Rejoin to load it.");
+			return;
 		}
+		if (!client.generation.empty())
+		{
+			baseClient->Disconnect("Required LuaPack failed. For a cache error, close the game, remove garrysmod/download/data/%s/%s.bsp, then rejoin with downloads enabled.",
+				GetConfig().packDirectory.c_str(), client.generation.c_str());
+			return;
+		}
+		baseClient->Disconnect("Required LuaPack failed. For a cache error, close the game, clear this server's .bsp files from garrysmod/download/data/%s, then rejoin with downloads enabled.",
+			GetConfig().packDirectory.c_str());
 	}
 
 	bool ClientConnect(int slot)
@@ -2476,9 +2586,8 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 				client.fallback ? "yes" : "no");
 		}
 
-		// The required map base is admitted only through Source's pre-spawn resource
-		// phase. A missing/corrupt base must fail closed in the bootstrap; it is never
-		// repaired after spawn by switching the whole join to native or HTTP delivery.
+		// A corrupt-cache fetch uses this same deadline. The tainted join never
+		// acknowledges the pack or switches its Lua delivery lane.
 	}
 
 	bool ClientDisconnect(int slot, bool gameLayerCallback)
@@ -2548,6 +2657,24 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 	{
 		if (!args || args->ArgC() < 1)
 			return MODULE_RESULT::CONTINUE;
+
+		if (V_stricmp(args->Arg(0), "holylib_luapack_corrupt") == 0)
+		{
+			if (!IsEnabled() || !IsValidSlot(slot))
+				return MODULE_RESULT::STOP;
+			const ClientPin& client = state.clients[slot];
+			if (!client.requiredLane || client.nativeLane || client.disconnectIssued)
+				return MODULE_RESULT::STOP;
+			// The report can only select the sender's disconnect message. It has
+			// no authority to change the pack, manifest, or delivery lane.
+			const bool cacheSaved = !client.everReady && args->ArgC() == 3 &&
+				!client.generation.empty() && client.generation == args->Arg(1) &&
+				std::strcmp(args->Arg(2), "saved") == 0;
+			DisconnectRequiredClient(slot, cacheSaved
+				? "the client reported saving a verified cache copy"
+				: "the client could not mount or repair its required cache", cacheSaved);
+			return MODULE_RESULT::STOP;
+		}
 
 		if (V_stricmp(args->Arg(0), "holylib_luapack_failed") == 0)
 		{
