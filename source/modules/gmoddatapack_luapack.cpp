@@ -394,13 +394,15 @@ do
 			local manifest = manifests[generation]
 			local downloadURL = getConVar("sv_downloadurl")
 			local base = downloadURL and downloadURL:GetString() or ""
-			local authority = base:lower():match("^https?://([^/]+)")
+			local authority = base:lower():match("^https?://([^/?]+)")
 			if not manifest or downloadsDisabled or type(httpRequest) ~= "function" or
-				not authority or authority:find("@", 1, true) or base:find("[?#%s]") then
+				not authority or authority:find("@", 1, true) or base:find("[#%s]") then
 				report(false)
 				return
 			end
 
+			-- The engine appends a slash before the resource even when the
+			-- base ends in a query parameter such as ?asset=.
 			local url = base:gsub("/+$", "") .. "/" .. manifest.resource:gsub("([^%w_.~/%-])", function(byte)
 				return string.format("%%%02X", string.byte(byte))
 			end)

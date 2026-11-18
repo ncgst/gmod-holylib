@@ -488,17 +488,31 @@ do
 		equal(command[3], status, "report the cache result")
 	end
 	local url = "https://example.invalid/fastdl/"
-	for _, bad in ipairs({brokenLZMA, wrongMD5}) do
-		local disk = {[primaryPath] = bad}
+	local queryURL = "http://example.invalid/?proxy=test&asset="
+	for _, case in ipairs({
+		{bad = brokenLZMA, base = url},
+		{bad = wrongMD5, base = url},
+		{
+			bad = wrongMD5,
+			base = queryURL,
+			snapshot = "1|" .. generation .. "|746573742f7375622b26|73|" .. generation,
+			primaryPath = "download/data/test/sub+&/" .. generation .. ".bsp",
+			requestURL = queryURL .. "/data/test/sub%2B%26/" .. generation .. ".bsp",
+		},
+	}) do
+		local cachePath = case.primaryPath or primaryPath
+		local disk = {[cachePath] = case.bad}
 		local data = {[dataPath] = string.rep("b", 32) .. "stale"}
-		local runtime = fixture({disk = disk, data = data, url = url, http = true})
+		local runtime = fixture({disk = disk, data = data, url = case.base,
+			snapshot = case.snapshot, http = true})
 		equal(#runtime.requests, 0, "bootstrap has not used a required placeholder yet")
 		equal(runtime:runStub(path), nil, "unverified source never executes")
 		equal(runtime:runStub(path), nil, "later placeholders also fail closed")
 		equal(#runtime.commands, 0, "request gets time without sending READY or disconnecting")
 		equal(#runtime.requests, 1, "one HTTP request per affected join")
 		local request = runtime.requests[1]
-		equal(request.url, url .. "data/test/" .. generation .. ".bsp", "request the existing FastDL object")
+		equal(request.url, case.requestURL or url .. "data/test/" .. generation .. ".bsp",
+			"request the existing FastDL object with literal path separators")
 		equal(request.method, "GET", "read FastDL object")
 		equal(request.timeout, 30, "native HTTP timeout")
 		request.success(200, binary)
@@ -506,19 +520,22 @@ do
 		expectCorrupt(runtime, "saved")
 		equal(data[dataPath], generation .. binary, "binary file overwrites the stale slot")
 		equal(runtime:runStub(path), nil, "successful fetch cannot repair the tainted join in place")
-		local rejoined = fixture({disk = disk, data = data, url = url, http = true})
+		local rejoined = fixture({disk = disk, data = data, url = case.base,
+			snapshot = case.snapshot, http = true})
 		equal(rejoined:runStub(path), "verified repair", "rejoin mounts verified FastDL repair")
 		equal(#rejoined.requests, 0, "verified DATA copy needs no further download")
 		equal(#rejoined.commands, 1, "repaired join only sends READY")
 		equal(rejoined.commands[1][1], "holylib_luapack_ready", "repair acknowledges the base")
 		equal(rejoined.commands[1][2], generation, "READY keeps pinned generation")
 		equal(rejoined.commands[1][3], generation, "READY keeps pinned MD5")
-		equal(disk[primaryPath], bad, "the engine cache was left intact")
+		equal(disk[cachePath], case.bad, "the engine cache was left intact")
 	end
 
 	for _, options in ipairs({
 		{http = "disabled", url = url},
-		{http = true, url = "https://example.invalid/query?k=v"},
+		{http = true, url = queryURL .. "#fragment"},
+		{http = true, url = queryURL .. " "},
+		{http = true, url = "http://user@example.invalid/?proxy=test&asset="},
 		{http = true, url = url, downloadFilter = "none"},
 		{url = url},
 		{http = true},
@@ -531,7 +548,7 @@ do
 
 	for _, response in ipairs({{404, pack}, {200, wrongMD5}, {200, pack, true}}) do
 		local data = {[dataPath] = generation .. wrongMD5}
-		local runtime = fixture({disk = {[primaryPath] = brokenLZMA}, data = data, url = url,
+		local runtime = fixture({disk = {[primaryPath] = brokenLZMA}, data = data, url = queryURL,
 			http = true, shortWrite = response[3]})
 		equal(runtime:runStub(path), nil, "bad DATA copy is rejected on rejoin")
 		equal(#runtime.requests, 1, "invalid DATA does not bypass verified recovery")
