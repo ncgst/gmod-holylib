@@ -34,6 +34,7 @@ local function newRuntime(nativeFiles, fixture)
 	fixture = fixture or {}
 	local runtime = {
 		commands = {},
+		requests = {},
 		compileCalls = {},
 		nativeCompileCalls = {},
 		nativeIncludeCalls = {},
@@ -56,7 +57,8 @@ local function newRuntime(nativeFiles, fixture)
 	convars.holylib_gmoddatapack_luapack_required = convar("1")
 	convars.holylib_gmoddatapack_luapack_allow_optout = convar("1")
 	convars.tv_nochat = convar("")
-	convars.cl_downloadfilter = convar(fixture.disk and "all" or "none")
+	convars.cl_downloadfilter = convar(fixture.downloadFilter or (fixture.disk and "all" or "none"))
+	if fixture.url then convars.sv_downloadurl = convar(fixture.url) end
 	runtime.convars = convars
 
 	environment.FCVAR_REPLICATED = 0
@@ -77,13 +79,33 @@ local function newRuntime(nativeFiles, fixture)
 		allCommands[#allCommands + 1] = command
 	end
 	environment.file = {Open = function(path, mode, pathID)
-		equal(mode, "rb", "pack file mode")
-		equal(pathID, "GAME", "pack search path")
-		local bytes = fixture.disk and fixture.disk[path]
+		if mode == "wb" then
+			equal(pathID, "DATA", "repair stays in DATA")
+			if not fixture.data or fixture.writeDenied then return nil end
+			return {
+				Write = function(_, bytes)
+					fixture.data[path] = fixture.shortWrite and bytes:sub(1, -2) or bytes
+				end,
+				Close = function() end,
+			}
+		end
+		equal(mode, "rb", "pack read is binary")
+		local disk = pathID == "GAME" and fixture.disk or pathID == "DATA" and fixture.data
+		local bytes = disk and disk[path]
 		if bytes then
 			return {Size = function() return #bytes end, Read = function() return bytes end, Close = function() end}
 		end
 	end}
+	if fixture.http then
+		environment.HTTP = function(request)
+			runtime.requests[#runtime.requests + 1] = request
+			if fixture.http == "disabled" then
+				request.failed("disabled")
+				return false
+			end
+			return true
+		end
+	end
 
 	local hashes = fixture.hashes or {}
 	local hashIndex = 0
@@ -97,7 +119,11 @@ local function newRuntime(nativeFiles, fixture)
 	end
 	environment.util = {
 		MD5 = fakeMD5,
-		Decompress = function(value)
+		Decompress = function(value, maxBytes)
+			if value == fixture.binaryResponse then
+				equal(maxBytes, 256 * 1024 * 1024, "bounded repair decompression")
+				return fixture.decodedResponse
+			end
 			if value ~= fixture.brokenLZMA then return value end
 		end,
 	}
@@ -435,47 +461,86 @@ for _, command in ipairs(allCommands) do
 	end
 end
 
--- First join reports a corrupt cache once. The next engine download uses a
--- different path while the READY identity remains the pinned base.
+-- Only a corrupt join requests the original object. The asynchronous callback
+-- can save a binary repair for the next join without acknowledging this one.
 do
-	local repair = string.rep("b", 32)
 	local path = "lua/repair_fixture.lua"
 	local primaryPath = "download/data/test/" .. generation .. ".bsp"
-	local repairPath = "download/data/test/" .. repair .. ".bsp"
+	local dataPath = "holylib_luapack_repair.dat"
 	local verifiedSource = [[return "verified repair"]]
 	local key = string.rep("\1", 16)
 	local pack = "\1" .. key .. key .. key .. "\0\0\0" .. string.char(#verifiedSource) .. verifiedSource
 	local wrongMD5 = pack:sub(1, -2) .. "x"
 	local brokenLZMA = string.rep("\255", #pack)
-	local repairSnapshot = "2|" .. generation .. "|74657374|73|" .. repair
-	local function fixture(disk, manifest)
-		return newRuntime(nil, {
-			disk = disk, snapshot = manifest, brokenLZMA = brokenLZMA,
-			hashes = {[pack] = repair, [salt .. ":repair" .. path] = string.rep("01", 16)},
-		})
+	local binary = ("\0b"):rep(9 * 1024 * 512)
+	local function fixture(options)
+		options.brokenLZMA = brokenLZMA
+		options.hashes = {[pack] = generation, [salt .. path] = string.rep("01", 16)}
+		options.binaryResponse = binary
+		options.decodedResponse = pack
+		return newRuntime(nil, options)
 	end
-	local function expectCorrupt(runtime)
-		equal(runtime:runStub(path), nil, "unverified source never executes")
-		equal(runtime:runStub(path), nil, "later placeholders also fail closed")
-		equal(#runtime.commands, 1, "one corruption report and no client retry")
-		equal(runtime.commands[1][1], "holylib_luapack_corrupt", "dedicated cache recovery command")
-		equal(runtime.commands[1][2], generation, "report the pinned generation")
+	local function expectCorrupt(runtime, status)
+		equal(#runtime.commands, 1, "one corruption report and no retry or READY")
+		local command = runtime.commands[1]
+		equal(command[1], "holylib_luapack_corrupt", "dedicated cache recovery command")
+		equal(command[2], generation, "report the pinned generation")
+		equal(command[3], status, "report the cache result")
 	end
+	local url = "https://example.invalid/fastdl/"
 	for _, bad in ipairs({brokenLZMA, wrongMD5}) do
 		local disk = {[primaryPath] = bad}
-		expectCorrupt(fixture(disk, snapshot))
-		disk[repairPath] = pack
-		local rejoined = fixture(disk, repairSnapshot)
+		local data = {[dataPath] = string.rep("b", 32) .. "stale"}
+		local runtime = fixture({disk = disk, data = data, url = url, http = true})
+		equal(#runtime.requests, 0, "bootstrap has not used a required placeholder yet")
+		equal(runtime:runStub(path), nil, "unverified source never executes")
+		equal(runtime:runStub(path), nil, "later placeholders also fail closed")
+		equal(#runtime.commands, 0, "request gets time without sending READY or disconnecting")
+		equal(#runtime.requests, 1, "one HTTP request per affected join")
+		local request = runtime.requests[1]
+		equal(request.url, url .. "data/test/" .. generation .. ".bsp", "request the existing FastDL object")
+		equal(request.method, "GET", "read FastDL object")
+		equal(request.timeout, 30, "native HTTP timeout")
+		request.success(200, binary)
+		request.failed("late duplicate callback")
+		expectCorrupt(runtime, "saved")
+		equal(data[dataPath], generation .. binary, "binary file overwrites the stale slot")
+		equal(runtime:runStub(path), nil, "successful fetch cannot repair the tainted join in place")
+		local rejoined = fixture({disk = disk, data = data, url = url, http = true})
 		equal(rejoined:runStub(path), "verified repair", "rejoin mounts verified FastDL repair")
+		equal(#rejoined.requests, 0, "verified DATA copy needs no further download")
 		equal(#rejoined.commands, 1, "repaired join only sends READY")
 		equal(rejoined.commands[1][1], "holylib_luapack_ready", "repair acknowledges the base")
 		equal(rejoined.commands[1][2], generation, "READY keeps pinned generation")
 		equal(rejoined.commands[1][3], generation, "READY keeps pinned MD5")
 		equal(disk[primaryPath], bad, "the engine cache was left intact")
-		disk[repairPath] = wrongMD5
-		expectCorrupt(fixture(disk, repairSnapshot))
 	end
-	expectCorrupt(fixture({}, repairSnapshot))
+
+	for _, options in ipairs({
+		{http = "disabled", url = url},
+		{http = true, url = "https://example.invalid/query?k=v"},
+		{http = true, url = url, downloadFilter = "none"},
+		{url = url},
+		{http = true},
+	}) do
+		options.disk = {[primaryPath] = brokenLZMA}
+		local runtime = fixture(options)
+		equal(runtime:runStub(path), nil, "disabled or unavailable repair fails closed")
+		expectCorrupt(runtime, "failed")
+	end
+
+	for _, response in ipairs({{404, pack}, {200, wrongMD5}, {200, pack, true}}) do
+		local data = {[dataPath] = generation .. wrongMD5}
+		local runtime = fixture({disk = {[primaryPath] = brokenLZMA}, data = data, url = url,
+			http = true, shortWrite = response[3]})
+		equal(runtime:runStub(path), nil, "bad DATA copy is rejected on rejoin")
+		equal(#runtime.requests, 1, "invalid DATA does not bypass verified recovery")
+		runtime.requests[1].success(response[1], response[2])
+		expectCorrupt(runtime, "failed")
+	end
+	local healthy = fixture({disk = {[primaryPath] = pack}, url = url, http = true})
+	equal(healthy:runStub(path), "verified repair", "healthy primary cache still mounts")
+	equal(#healthy.requests, 0, "healthy primary cache pays no HTTP cost")
 end
 
 print("luapack bootstrap include tests passed")

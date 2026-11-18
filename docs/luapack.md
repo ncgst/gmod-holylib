@@ -6,7 +6,7 @@ The feature is experimental and defaults off. The `gmoddatapack` module itself m
 
 ## Map-base and native-delta model
 
-- After the map's registered client Lua reaches the build quiescence window, HolyLib publishes one immutable base for that level lifecycle. Required mode can also publish one FastDL cache repair copy of those same files.
+- After the map's registered client Lua reaches the build quiescence window, HolyLib publishes exactly one immutable base object for that level lifecycle.
 - That base must be in Source's engine download queue. LuaPack refuses to publish an HTTP-only replacement after the level's `downloadables` budget is exhausted.
 - Every base file stores a SHA-256 content identity. Files still identical to the base use the canonical placeholder `return __holypack()()`; files changed since the base and files registered after the base are delivered natively with their current per-client hashes.
 - A second or later hotfix changes only the current native delta. It does not create G2/G3 pack objects, rotate the manifest, or consume another `downloadables` entry.
@@ -41,13 +41,13 @@ The full base intentionally contains every captured `client_lua_files` registrat
 | `holylib_gmoddatapack_luapack_downloadurl_policy` | `respect` | `respect`, `require`, or `lock` as described below. |
 | `holylib_gmoddatapack_luapack_ingest_url` | empty | Optional HTTP endpoint receiving the compressed base object. |
 | `holylib_gmoddatapack_luapack_ingest_method` | `PUT` | Method used by the optional ingest request. |
-| `holylib_gmoddatapack_luapack_downloadable_limit` | `2` | Maximum LuaPack objects allowed in Source's level-lifetime table. The base uses one and a cache repair copy needs a second. `0` prevents base publication. |
+| `holylib_gmoddatapack_luapack_downloadable_limit` | `1` | Maximum LuaPack objects allowed in Source's level-lifetime table. Map-base mode uses one. `0`, a pre-exhausted budget, or registration failure leaves required joins fail-closed until a level lifecycle boundary. |
 | `holylib_gmoddatapack_luapack_retention_ttl` | `300` | Compatibility floor for object retention; map-base mode does not rotate superseded generations during a level. |
 | `holylib_gmoddatapack_luapack_object_retention_ttl` | `604800` | Minimum age before an unreferenced local object may be removed. `0` disables housekeeping. Active `downloadables` remain protected. |
 | `holylib_gmoddatapack_luapack_ready_deadline` | `180` | Seconds a silent spawned required slot may remain unacknowledged. The clock starts at client activation, not connect. |
 | `holylib_gmoddatapack_luapack_required` | `0` | Fail-closed map-base admission for non-opt-out clients. |
 | `holylib_gmoddatapack_luapack_allow_optout` | `1` | Honor exact `tv_nochat=no_gluapack` as a per-connection native opt-out. |
-| `holylib_gmoddatapack_luapack_required_recovery` | `1` | Permit one authenticated server-driven engine reconnect whose next initial Lua baseline is wholly native after an exact required-generation failure. It never switches the failed join in progress. |
+| `holylib_gmoddatapack_luapack_required_recovery` | `1` | Permit one authenticated server-driven engine reconnect into a native baseline for other exact required-placeholder failures. Corrupt-cache repair uses FastDL independently of this setting. |
 | `holylib_gmoddatapack_luapack_required_recovery_ttl` | `120` | Seconds the account-owned one-shot recovery latch remains eligible to be claimed. |
 | `holylib_gmoddatapack_luapack_required_stub_budget` | `32` | Global maximum canonical required placeholders staged into reliable netchannels per server frame. Required batches use the bounded bitset decoder and fair queue so a cold request cannot monopolize `CNetChan::ProcessMessages`. |
 | `holylib_gmoddatapack_luapack_serverinfo_budget` | `1` | Global maximum pending LuaPack `SendServerInfo` baselines executed per server frame, across physical and parked clients. Values are clamped to `1..16`; raise only from concurrent-join timing evidence. |
@@ -57,7 +57,7 @@ The full base intentionally contains every captured `client_lua_files` registrat
 
 The legacy optimistic-prefix cvars remain accepted for configuration compatibility. Required map-base delivery does not use speculative whole-join fallback.
 
-The client engine truncates replicated convar values to 255 characters. The manifest carries the base MD5, pack directory, salt, and, once registered, the repair object's MD5. Each object uses `data/<packdir>/<md5>.bsp`.
+The client engine truncates replicated convar values to 255 characters, so the manifest carries only the base id (also its content MD5 and object basename), pack directory, and salt. The client derives `data/<packdir>/<id>.bsp`.
 
 While LuaPack is enabled, `holylib_gmoddatapack_removeserverif` and `holylib_gmoddatapack_removecomments` are ignored with a one-time warning. Pack capture, native delivery, and the string-table identity must refer to one byte stream.
 
@@ -85,11 +85,11 @@ The client may request every cold canonical ID in one network message. For a pin
 
 Canonical registration, the per-client `SendServerInfo` baseline hook, required request-batch hook, and body-selection hook are currently supported as a required-delivery set only on Linux. If any required hook is disabled, unresolved, or fails to install, `required=1` rejects every connection at `ClientConnect` before a cached native baseline can bypass policy. Restore the hooks or set `required=0`; the exact opt-out exception is deliberately not evaluated while this server capability gate is closed. With the hooks active, exact opt-out and `required=0` remain wholly native. Windows x64 checks prove build compatibility, not required-mode runtime support.
 
-If a cached pack cannot decompress, fails its MD5 check, or cannot be parsed, the client reports the pinned generation once. It can rejoin to fetch the repair copy from a fresh cache path. Both copies must pass their own generation MD5 check before use. READY still acknowledges the pinned base. A repair failure closes the join and directs the player to clear the relevant cached `.bsp` files with the game closed. Set `cl_downloadfilter` to `mapsonly` or `all` so the engine can fetch them again.
+If a required placeholder encounters a corrupt cached pack, the bootstrap can make one HTTP request for the existing raw FastDL object at `sv_downloadurl/data/<packdir>/<md5>.bsp`. It uses the engine HTTP API, with a 30-second request timeout and the existing server READY deadline. The failed join stays unacknowledged and the player rejoins after the verified copy is saved. Healthy joins use the engine cache without a repair request. The level still publishes one object and uses one `downloadables` slot.
 
-Enable `required` and leave `downloadable_limit` at two or higher before the level builds its base to prepare this repair copy. The first valid report can register the prebuilt copy once for the whole level, subject to space in Source's global 8,192-entry `downloadables` table. Later joins receive both resource paths and prefer the primary cached object when it verifies. Cache repair carries the pack through FastDL.
+The bootstrap keeps one binary `holylib_luapack_repair.dat` in the player's `DATA` directory and replaces it after a successful verified fetch. The compressed repair limit is 32 MiB and the decompressed limit is 256 MiB. On the next required join it checks the cached generation and verifies the MD5 again before using the data. The original engine cache is left intact. A failed or unavailable repair leaves the join fail-closed and gives cache-clearing instructions.
 
-For other required-placeholder failures, `required_recovery` still permits one authenticated native recovery. The server revalidates authenticated SteamID64 ownership, arms one account-owned latch, and queues one engine `Reconnect()`. The replacement connection claims the latch before `SendServerInfo` and receives a wholly native initial baseline.
+For other exact required-placeholder failures, `required_recovery` can still arm one authenticated engine `Reconnect()`. The replacement connection claims that latch before its first `SendServerInfo` and receives a native Lua baseline.
 
 A queued connection may reach its first `SendServerInfo` before Source exposes its SteamID64, or may have connected before the immutable map base finished publishing. The first baseline pins the current base when one is now available and proceeds in the required lane without consuming recovery state. Missing identity never rejects an otherwise usable required base; recovery remains unavailable until authenticated ownership can be established.
 
@@ -117,7 +117,7 @@ downloadables entry: data/<packdir>/abc....bsp
 client cache: download/data/<packdir>/abc....bsp
 ```
 
-Mirror `garrysmod/data/<packdir>/` into the same relative path below the configured FastDL origin. The repair copy uses the same MD5-named `.bsp` layout and ingest headers. `HolyLib:OnLuaPackBuilt` runs for each prepared object, so uploaders must mirror both. CDN replication, overseas routing, cache invalidation, and `.bz2` generation are operator responsibilities. Local housekeeping protects the level's base and its prepared repair copy.
+Mirror `garrysmod/data/<packdir>/` into the same relative path below the configured FastDL origin. Client-side repair requires the existing raw `.bsp` to be reachable by an ordinary HTTP or HTTPS GET. CDN replication, overseas routing, cache invalidation, and `.bz2` generation are operator responsibilities. Local housekeeping never removes an object that remains registered in the current level's `downloadables` table.
 
 ## Rollout and verification
 
@@ -131,7 +131,7 @@ The earlier September 10 client test established that opcode 3 is ignored. Activ
 6. Enable `required=1`. Purge only the isolated test client's relevant cache, then confirm cold entry, Requesting Lua completion, READY, and reconnect. On a registration-heavy server, include a concurrent cold-join burst and confirm each connection reserves sufficient placeholder capacity, no reliable overflow buffer is discarded, every client eventually leaves Requesting Lua, and the `HolyLib - GModDataPack Lua request` VProf branch has no frame-scale `ProcessMessages` spike. Its baseline-preparation, delivery-selection, and canonical-append children are separate scopes.
 7. Apply two successive hotfixes without changing the map. Confirm no new pack object/manifest generation appears, then confirm a new required JIP receives both current files natively and all unchanged base files canonically.
 8. For an active required client, change one base path and confirm its native hash/body executes. Restore the exact base bytes and confirm the canonical hash/stub executes base content again.
-9. With recovery enabled, block, corrupt, and separately remove only the isolated test client's base after Source admission. Each case must produce exactly one server-driven reconnect and one wholly native next baseline in the same client process, with no client `retry`, mid-join lane switch, second recovery, or cross-slot consumption. Then set recovery to `0` and confirm the same failure kicks fail-closed.
+9. With native recovery disabled, corrupt only the isolated client's cached base. Confirm one GET of the current FastDL object, no READY on that join, and a verified `DATA` copy that mounts after one rejoin. Repeat with an unavailable or invalid HTTP response and confirm a cache-clearing kick. Separately remove the engine cache with native recovery enabled and verify the existing authenticated one-reconnect policy for a missing required base.
 10. Restart the isolated client with `+tv_nochat no_gluapack`. Confirm native Lua for the whole connection and rejection of late lane changes. For a changed existing fixture, block only its ordinary watcher and call `gmoddatapack.RefreshExistingLuaFile("path/to/file.lua")`. Require `true, "captured"`, then a matching client cache body and exactly one automatic execution of the new source. Unchanged explicit recovery returns `true, "refresh_queued"`. Follow a native H1 -> H2 -> H1 restoration without forced recovery, then repeat on a required connection and verify canonical restoration. Unblock the watcher and require exactly one execution for an ordinary edit as well. Prime a real nonempty engine compression allocation through the original native sender before another explicit change; verify retained pointer/capacity, zero written length/cursor, correct native recompression, and unchanged reuse. A staged-transaction log alone is insufficient.
 
 The slow-baseline telemetry separates `published`, `cached`, and `computed` identities. `published` is the cheapest successful path: the desired hash already equals the global string-table value and needs no per-client override. Therefore a line such as `3931 published + 0 cached + 0 computed ... 0 overrides` describes a full reuse hit, not a near-zero cache hit.
