@@ -107,7 +107,7 @@ namespace HolyLib::LuaPack
 	bool RecordPinnedRequiredStubForClient(int slot);
 	bool NeedsNativeHashUpdate(int slot);
 	DeliveryDecision DecideDeliveryForClient(int slot, const std::string& virtualPath, size_t nativeSourceBytes);
-	void DisconnectRequiredClient(int slot, const char* failure);
+	void DisconnectRequiredClient(int slot, const char* failure, bool rejoinForRepair = false);
 	bool ClientConnect(int slot);
 	void ClientActive(int slot);
 	bool ClientDisconnect(int slot, bool gameLayerCallback = true);
