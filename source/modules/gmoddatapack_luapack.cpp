@@ -62,6 +62,10 @@ namespace HolyLib::LuaPack
 		std::string md5;
 		std::string salt;
 		std::string resourcePath;
+		std::string repairMD5;
+		std::string repairPath;
+		bool repairRegistrationAttempted = false;
+		bool repairRegistered = false;
 		unsigned long long sourceRevision = 0;
 		double publishedAt = 0.0;
 		bool engineDownloadable = false;
@@ -95,6 +99,7 @@ namespace HolyLib::LuaPack
 		bool authenticatedIdentity = false;
 		bool recoveryStateCleared = false;
 		bool disconnectIssued = false;
+		bool repairInBaseline = false;
 		std::uint64_t steamID64 = 0;
 		std::uint64_t connectionSerial = 0;
 
@@ -109,15 +114,20 @@ namespace HolyLib::LuaPack
 		unsigned long long joinNativeBytes = 0;
 	};
 
-	struct BuildTask
+	struct PackObject
+	{
+		Bootil::AutoBuffer compressed;
+		std::string md5;
+	};
+
+	struct BuildTask : PackObject
 	{
 		std::vector<FileRecord> files;
 		std::string packDirectory;
 		std::string salt;
 		unsigned long long sourceRevision = 0;
-		Bootil::AutoBuffer uncompressed;
-		Bootil::AutoBuffer compressed;
-		std::string md5;
+		bool buildRepair = false;
+		PackObject repair;
 		std::string error;
 		std::atomic<bool> complete{false};
 		bool success = false;
@@ -236,7 +246,7 @@ do
 			timer.Simple(1, issueRetry)
 		end
 	end
-	local function stubRecovery(generation, required)
+	local function stubRecovery(generation, required, corrupt)
 		-- A cached pre-required stub has no second argument. Fall back to replicated lane
 		-- policy so enabling required mode cannot resurrect the old automatic retry loop.
 		if required == nil then required = requiredMode end
@@ -244,10 +254,13 @@ do
 		if required then
 			if not requiredFailureSignaled then
 				requiredFailureSignaled = true
-				warn("required pack " .. tostring(generation) ..
-					" could not resolve this Lua file; requesting one authenticated engine reconnect" ..
-					" (manual opt out: +tv_nochat no_gluapack)")
-				RunConsoleCommand("holylib_luapack_failed", tostring(generation or ""))
+				if corrupt then
+					warn("required pack " .. tostring(generation) .. " has an invalid cached object")
+					RunConsoleCommand("holylib_luapack_corrupt", tostring(generation or ""))
+				else
+					warn("required pack " .. tostring(generation) .. " could not resolve this Lua file")
+					RunConsoleCommand("holylib_luapack_failed", tostring(generation or ""))
+				end
 			end
 			return function() end
 		end
@@ -299,13 +312,23 @@ do
 				value:match("^(%d+)|([^|]+)|([^|]*)|([^|]*)|(.*)$")
 			local packDirectory = packDirectoryHex and fromHex(packDirectoryHex)
 			local salt = saltHex and fromHex(saltHex)
-			if version ~= "1" or not currentGeneration or not packDirectory or not salt then return nil end
+			if (version ~= "1" and version ~= "2") or #currentGeneration ~= 32 or
+				currentGeneration:find("[^0-9a-fA-F]") or not packDirectory or not salt then return nil end
 
 			local manifests = {}
+			local function objectPath(id) return "data/" .. packDirectory .. "/" .. id .. ".bsp" end
+			if version == "2" then
+				if #generationList ~= 32 or generationList:find("[^0-9a-fA-F]") or
+					generationList == currentGeneration then return nil end
+				manifests[currentGeneration] = {generation = currentGeneration,
+					md5 = string.lower(currentGeneration), salt = salt, resource = objectPath(currentGeneration),
+					repairMD5 = string.lower(generationList), repair = objectPath(generationList)}
+				return currentGeneration, manifests
+			end
 			for entry in string.gmatch(generationList or "", "[^;]+") do
 				if #entry == 32 and not entry:find("[^0-9a-fA-F]") then
 					manifests[entry] = {generation = entry, md5 = string.lower(entry), salt = salt,
-						resource = "data/" .. packDirectory .. "/" .. entry .. ".bsp"}
+						resource = objectPath(entry)}
 				end
 			end
 			return currentGeneration, manifests
@@ -317,9 +340,9 @@ do
 			return
 		end
 
-		local function parsePack(contents, manifest)
+		local function parsePack(contents, salt)
 			if #contents < 1 or string.byte(contents, 1) ~= 1 then return nil, "unsupported pack version" end
-			local pack = {vfs = {}, vfsLCL = {}, salt = manifest.salt, manifest = manifest}
+			local pack = {vfs = {}, vfsLCL = {}, salt = salt}
 			local function registerLocal(key, source)
 				local existing = pack.vfsLCL[key]
 				if existing == nil then
@@ -350,19 +373,41 @@ do
 
 		local packs = {}
 		local lazyMountAttempted = {}
+		local corruptPacks = {}
 		-- The engine can fetch FastDL downloadables in the background of the join instead of
 		-- blocking the loading screen, so a generation missing right now may simply not have
 		-- finished downloading. tryMount() reports failures without warning; the boot pass
 		-- warns once, then a timer retries for five minutes and acknowledges late arrivals
 		-- (the server accepts a matching late READY).
-		local function tryMount(manifest)
-			local compressed = readFile("download/" .. manifest.resource)
-			if not compressed then return false, "is unavailable" end
+		local function readPack(path, md5, salt)
+			local compressed = readFile("download/" .. path)
+			if not compressed then return nil, "is unavailable" end
 			local contents = util.Decompress(compressed)
-			if not contents then return false, "could not be decompressed" end
-			if string.lower(util.MD5(contents)) ~= manifest.md5 then return false, "failed its generation MD5 check" end
-			local pack, parseError = parsePack(contents, manifest)
-			if not pack then return false, "is invalid (" .. tostring(parseError) .. ")" end
+			if not contents then return nil, "could not be decompressed", true end
+			if string.lower(util.MD5(contents)) ~= md5 then return nil, "failed its generation MD5 check", true end
+			local pack, errorText = parsePack(contents, salt)
+			if not pack then return nil, "is invalid (" .. tostring(errorText) .. ")", true end
+			return pack
+		end
+
+		local function tryMount(manifest)
+			local pack, reason, corrupt = readPack(manifest.resource, manifest.md5, manifest.salt)
+			local repaired = false
+			if not pack and manifest.repair then
+				local repairReason, repairCorrupt
+				pack, repairReason, repairCorrupt =
+					readPack(manifest.repair, manifest.repairMD5, manifest.salt .. ":repair")
+				repaired = pack ~= nil
+				if not pack then
+					reason = reason .. "; repair copy " .. repairReason
+					corrupt = corrupt or repairCorrupt
+				end
+			end
+			corruptPacks[manifest.generation] = not pack and
+				(corrupt or corruptPacks[manifest.generation]) or nil
+			if not pack then return false, reason end
+			pack.manifest = manifest
+			pack.repaired = repaired
 			packs[manifest.generation] = pack
 			return true
 		end
@@ -442,7 +487,12 @@ do
 						RunConsoleCommand("holylib_luapack_ready", generation, manifest.md5)
 					end
 				end
-				if not pack then return stubRecovery(generation, required) end
+				if not pack then
+					local manifest = manifests[generation]
+					-- An unavailable repair copy also stays on the fail-closed lane.
+					return stubRecovery(generation, required, corruptPacks[generation] or
+						(manifest and manifest.repair ~= nil))
+				end
 				selectedGeneration = generation
 				local info = debug.getinfo(2, "S")
 				local sourcePath = info and info.source or ""
@@ -452,7 +502,7 @@ do
 					-- file cannot be produced in place either way, so recover like an
 					-- unmounted generation instead of erroring the boot.
 					warn("pack " .. tostring(generation) .. " has no usable entry for " .. tostring(sourcePath))
-					return stubRecovery(generation, required)
+					return stubRecovery(generation, required, pack.repaired)
 				end
 				return compiled
 			end
@@ -478,7 +528,7 @@ do
 			end
 			if not mountedNow and generation == currentGeneration then
 				if downloadsDisabled then
-					warn("pack " .. generation .. " is missing and downloads are disabled; set cl_downloadfilter to mapsonly or all. Required delivery will disconnect; fail-open delivery can use native Lua")
+					warn("pack " .. generation .. " " .. failure .. "; set cl_downloadfilter to mapsonly or all to allow downloads")
 				else
 					warn("pack " .. generation .. " " .. failure .. "; waiting for the background FastDL download before it can be acknowledged")
 				end
@@ -637,13 +687,13 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		return true;
 	}
 
-	static bool ValidatePack(const BuildTask* task)
+	static bool ValidatePack(const std::vector<FileRecord>& files, const Bootil::AutoBuffer& uncompressed)
 	{
-		if (!task || task->uncompressed.GetWritten() < 1)
+		if (uncompressed.GetWritten() < 1)
 			return false;
 
-		const unsigned char* data = static_cast<const unsigned char*>(task->uncompressed.GetBase());
-		const size_t dataLength = task->uncompressed.GetWritten();
+		const unsigned char* data = static_cast<const unsigned char*>(uncompressed.GetBase());
+		const size_t dataLength = uncompressed.GetWritten();
 		if (data[0] != 1)
 			return false;
 
@@ -652,7 +702,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		std::unordered_set<std::string> sourceKeys;
 		while (offset < dataLength)
 		{
-			if (dataLength - offset < (16 * 3) + 4 || fileIndex >= task->files.size())
+			if (dataLength - offset < (16 * 3) + 4 || fileIndex >= files.size())
 				return false;
 
 			const std::string sourceKey(reinterpret_cast<const char*>(data + offset), 16);
@@ -666,42 +716,33 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 				static_cast<unsigned int>(data[offset + 3]);
 			offset += 4;
 
-			if (contentLength > dataLength - offset || contentLength != task->files[fileIndex].contents.length())
+			if (contentLength > dataLength - offset || contentLength != files[fileIndex].contents.length())
 				return false;
-			if (memcmp(data + offset, task->files[fileIndex].contents.data(), contentLength) != 0)
+			if (memcmp(data + offset, files[fileIndex].contents.data(), contentLength) != 0)
 				return false;
 
 			offset += contentLength;
 			++fileIndex;
 		}
 
-		return offset == dataLength && fileIndex == task->files.size();
+		return offset == dataLength && fileIndex == files.size();
 	}
 
-	static void BuildPack(BuildTask*& task)
+	static const char* BuildPackObject(const std::vector<FileRecord>& files,
+		const std::string& salt, PackObject& object)
 	{
-		if (!task)
-			return;
-
+		Bootil::AutoBuffer uncompressed;
 		const unsigned char version = 1;
-		task->uncompressed.Write(&version, sizeof(version));
-		for (const FileRecord& file : task->files)
+		uncompressed.Write(&version, sizeof(version));
+		for (const FileRecord& file : files)
 		{
 			if (file.contents.length() > std::numeric_limits<unsigned int>::max())
-			{
-				task->error = "a Lua source file exceeds the pack format's u32 length";
-				task->complete.store(true);
-				return;
-			}
+				return "a Lua source file exceeds the pack format's u32 length";
 
-			if (!WritePackKey(task->uncompressed, task->salt, file.sourcePath) ||
-				!WritePackKey(task->uncompressed, task->salt, LocalKeyFormOne(file.virtualPath)) ||
-				!WritePackKey(task->uncompressed, task->salt, LocalKeyFormTwo(file.virtualPath)))
-			{
-				task->error = "failed to encode an MD5 index key";
-				task->complete.store(true);
-				return;
-			}
+			if (!WritePackKey(uncompressed, salt, file.sourcePath) ||
+				!WritePackKey(uncompressed, salt, LocalKeyFormOne(file.virtualPath)) ||
+				!WritePackKey(uncompressed, salt, LocalKeyFormTwo(file.virtualPath)))
+				return "failed to encode an MD5 index key";
 
 			const unsigned int contentLength = static_cast<unsigned int>(file.contents.length());
 			const unsigned char length[4] = {
@@ -710,30 +751,39 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 				static_cast<unsigned char>((contentLength >> 8) & 0xff),
 				static_cast<unsigned char>(contentLength & 0xff),
 			};
-			task->uncompressed.Write(length, sizeof(length));
-			task->uncompressed.Write(file.contents.data(), file.contents.length());
+			uncompressed.Write(length, sizeof(length));
+			uncompressed.Write(file.contents.data(), file.contents.length());
 		}
 
-		if (!ValidatePack(task))
-		{
-			task->error = "internal build-to-parse validation failed";
-			task->complete.store(true);
-			return;
-		}
+		if (!ValidatePack(files, uncompressed))
+			return "internal build-to-parse validation failed";
 
-		task->md5 = Bootil::Hasher::MD5::Easy(task->uncompressed.GetBase(), task->uncompressed.GetWritten());
-		std::transform(task->md5.begin(), task->md5.end(), task->md5.begin(), [](unsigned char value) {
+		object.md5 = Bootil::Hasher::MD5::Easy(uncompressed.GetBase(), uncompressed.GetWritten());
+		std::transform(object.md5.begin(), object.md5.end(), object.md5.begin(), [](unsigned char value) {
 			return static_cast<char>(std::tolower(value));
 		});
 		if (!Bootil::Compression::LZMA::Compress(
-			task->uncompressed.GetBase(), task->uncompressed.GetWritten(), task->compressed, 9))
-		{
-			task->error = "LZMA compression failed";
-			task->complete.store(true);
-			return;
-		}
+			uncompressed.GetBase(), uncompressed.GetWritten(), object.compressed, 9))
+			return "LZMA compression failed";
+		return nullptr;
+	}
 
-		task->success = true;
+	static void BuildPack(BuildTask*& task)
+	{
+		if (!task)
+			return;
+		const char* error = BuildPackObject(task->files, task->salt, *task);
+		task->success = error == nullptr;
+		if (error)
+			task->error = error;
+		else if (task->buildRepair && !task->files.empty())
+		{
+			// The same sources under a different index salt produce another standard
+			// MD5-named FastDL object, with no change to the mirror or ingest protocol.
+			error = BuildPackObject(task->files, task->salt + ":repair", task->repair);
+			if (error || task->repair.md5 == task->md5)
+				task->repair.md5.clear();
+		}
 		task->complete.store(true);
 	}
 
@@ -1247,10 +1297,11 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		return salt;
 	}
 
-	static bool WriteImmutableObject(const BuildTask* task, std::string& resourcePath)
+	static bool WriteImmutableObject(const BuildTask* task, const PackObject& object,
+		std::string& resourcePath)
 	{
 		const std::string directory = DataDirectory(task->packDirectory);
-		resourcePath = directory + "/" + task->md5 + ".bsp";
+		resourcePath = directory + "/" + object.md5 + ".bsp";
 		if (g_pFullFileSystem->FileExists(resourcePath.c_str(), "MOD"))
 			return true;
 
@@ -1260,8 +1311,8 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		if (output == FILESYSTEM_INVALID_HANDLE)
 			return false;
 
-		const int expected = static_cast<int>(task->compressed.GetWritten());
-		const int written = g_pFullFileSystem->Write(task->compressed.GetBase(), expected, output);
+		const int expected = static_cast<int>(object.compressed.GetWritten());
+		const int written = g_pFullFileSystem->Write(object.compressed.GetBase(), expected, output);
 		g_pFullFileSystem->Close(output);
 		if (written != expected)
 		{
@@ -1349,7 +1400,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		task->complete.store(true);
 	}
 
-	static void QueueIngest(const BuildTask* build, const Generation& generation)
+	static void QueueIngest(const PackObject& object, const std::string& resourcePath)
 	{
 		const Config& currentConfig = GetConfig();
 		if (currentConfig.ingestUrl.empty())
@@ -1368,26 +1419,26 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		UploadTask* upload = new UploadTask;
 		upload->url = currentConfig.ingestUrl;
 		upload->method = method;
-		upload->md5 = generation.md5;
-		upload->resourcePath = generation.resourcePath;
-		upload->body.assign(static_cast<const char*>(build->compressed.GetBase()), build->compressed.GetWritten());
+		upload->md5 = object.md5;
+		upload->resourcePath = resourcePath;
+		upload->body.assign(static_cast<const char*>(object.compressed.GetBase()), object.compressed.GetWritten());
 		upload->objectRetentionSeconds = currentConfig.objectRetentionSeconds;
 		EnsureUploadPool();
 		state.uploads.push_back(upload);
 		state.uploadPool->QueueCall(&UploadPack, upload);
 	}
 
-	static void NotifyPackBuilt(const BuildTask* build, const Generation& generation)
+	static void NotifyPackBuilt(const PackObject& object, const std::string& resourcePath)
 	{
 		if (g_Lua && Lua::PushHook("HolyLib:OnLuaPackBuilt"))
 		{
-			g_Lua->PushString(generation.id.c_str());
-			g_Lua->PushString(generation.resourcePath.c_str());
-			g_Lua->PushString(generation.md5.c_str());
-			g_Lua->PushNumber(build->compressed.GetWritten());
+			g_Lua->PushString(object.md5.c_str());
+			g_Lua->PushString(resourcePath.c_str());
+			g_Lua->PushString(object.md5.c_str());
+			g_Lua->PushNumber(object.compressed.GetWritten());
 			g_Lua->CallFunctionProtected(5, 0, true);
 		}
-		QueueIngest(build, generation);
+		QueueIngest(object, resourcePath);
 	}
 
 	static ConVar* DownloadUrlConVar()
@@ -1504,7 +1555,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			return DownloadableRegistration::Registered;
 
 		const unsigned int registered = RegisteredPackObjectCount(downloadables, packDirectory);
-		if (registered >= limit)
+		if (registered >= limit || downloadables->GetNumStrings() >= downloadables->GetMaxStrings())
 		{
 			Msg(PROJECT_NAME " - luapack: downloadables budget exhausted (%u/%u); map base '%s' cannot be engine-downloadable in this level lifecycle\n",
 				registered, limit, resourcePath.c_str());
@@ -1526,7 +1577,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 	{
 		for (const auto& pair : state.generations)
 		{
-			if (pair.second.resourcePath == resourcePath)
+			if (pair.second.resourcePath == resourcePath || pair.second.repairPath == resourcePath)
 				return true;
 		}
 
@@ -1623,6 +1674,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			return left.virtualPath < right.virtualPath;
 		});
 		task->packDirectory = GetConfig().packDirectory;
+		task->buildRepair = GetConfig().requiredStubbing && GetConfig().downloadableLimit >= 2;
 		if (state.salt.empty())
 			state.salt = ReadOrCreateSalt(task->packDirectory);
 		task->salt = state.salt;
@@ -1648,8 +1700,8 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		"holylib_gmoddatapack_luapack_ingest_method", "PUT", FCVAR_ARCHIVE,
 		"HTTP method for the optional pack ingest hook");
 	static ConVar luapack_downloadable_limit(
-		"holylib_gmoddatapack_luapack_downloadable_limit", "1", FCVAR_ARCHIVE,
-		"Maximum immutable pack objects appended to the level-lifetime downloadables table; LuaPack publishes only one map base and sends later changes natively",
+		"holylib_gmoddatapack_luapack_downloadable_limit", "2", FCVAR_ARCHIVE,
+		"Maximum immutable LuaPack objects in the level-lifetime downloadables table: one map base and at most one required-cache repair copy",
 		true, 0.0f, true, 64.0f);
 	static ConVar luapack_retention_ttl(
 		"holylib_gmoddatapack_luapack_retention_ttl", "300", FCVAR_ARCHIVE,
@@ -1744,8 +1796,9 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		}
 
 		std::ostringstream manifest;
-		manifest << "1|" << state.currentGeneration << '|' << HexEncode(packDirectory)
-			<< '|' << HexEncode(current->second.salt) << '|' << state.currentGeneration;
+		const Generation& base = current->second;
+		manifest << (base.repairRegistered ? "2|" : "1|") << base.id << '|' << HexEncode(packDirectory)
+			<< '|' << HexEncode(base.salt) << '|' << (base.repairRegistered ? base.repairMD5 : base.id);
 		const std::string serialized = manifest.str();
 		if (serialized.length() > MAXIMUM_MANIFEST_LENGTH)
 		{
@@ -1942,7 +1995,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 						state.currentGeneration.c_str());
 				} else {
 					std::string resourcePath;
-					if (!WriteImmutableObject(task, resourcePath))
+					if (!WriteImmutableObject(task, *task, resourcePath))
 					{
 						Warning(PROJECT_NAME " - luapack: Failed to atomically write map-base pack %s\n", task->md5.c_str());
 						retryBaseBuild(15.0);
@@ -2002,6 +2055,17 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 							}
 							else
 							{
+								if (task->buildRepair && !task->files.empty())
+								{
+									std::string repairPath;
+									if (!task->repair.md5.empty() && WriteImmutableObject(task, task->repair, repairPath))
+									{
+										generation.repairMD5 = task->repair.md5;
+										generation.repairPath = std::move(repairPath);
+									}
+									else
+										Warning(PROJECT_NAME " - luapack: could not prepare a FastDL cache repair copy\n");
+								}
 								state.generations[generation.id] = generation;
 								state.currentGeneration = generation.id;
 								{
@@ -2011,7 +2075,11 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 									state.buildRequested = false;
 								}
 								PublishManifest();
-								NotifyPackBuilt(task, generation);
+								// Prepare the repair copy through the same origin before the
+								// primary upload. It enters downloadables only after a report.
+								if (!generation.repairPath.empty())
+									NotifyPackBuilt(task->repair, generation.repairPath);
+								NotifyPackBuilt(*task, generation.resourcePath);
 								HousekeepObjects();
 								Msg(PROJECT_NAME " - luapack: Published immutable map base %s (%u compressed bytes, %u files); subsequent changes use per-client native deltas\n",
 									generation.id.c_str(), task->compressed.GetWritten(), static_cast<unsigned int>(task->files.size()));
@@ -2108,11 +2176,9 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			pLua->RunString("HolyLib luapack server bridge", "", serverBridge, true, true);
 	}
 
-	void CaptureFile(const GarrysMod::Lua::LuaFile* file)
+	bool HasMapBaseSnapshot()
 	{
-		if (!file)
-			return;
-		CaptureFileContents(file->name, file->contents);
+		return state.activeBuild || !state.currentGeneration.empty();
 	}
 
 	void CaptureFileContents(const std::string& inputPath, const std::string& contents)
@@ -2233,6 +2299,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			case Policy::Action::Native:
 				return {BaselineAction::NativeSource, nullptr};
 			case Policy::Action::CanonicalStub:
+				client.repairInBaseline = state.generations.at(client.generation).repairRegistered;
 				return {BaselineAction::BasePlusDelta, nullptr};
 			case Policy::Action::Reject:
 				if (!SupportsCanonicalRegistration())
@@ -2397,7 +2464,7 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		return {DeliveryAction::Stub, generation->second.compressedRequiredStub.get(), nullptr};
 	}
 
-	void DisconnectRequiredClient(int slot, const char* failure)
+	void DisconnectRequiredClient(int slot, const char* failure, bool rejoinForRepair)
 	{
 		if (!IsValidSlot(slot))
 			return;
@@ -2410,11 +2477,15 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 		Warning(PROJECT_NAME " - luapack: disconnecting required-pack client slot %i: %s\n",
 			slot, failure ? failure : "unspecified required-pack failure");
 		CBaseClient* baseClient = Util::GetClientBySlot(slot);
-		if (baseClient)
+		if (!baseClient)
+			return;
+		if (rejoinForRepair)
 		{
-			baseClient->Disconnect("%s",
-				"Required LuaPack failed. Automatic native recovery was unavailable or exhausted. Manual opt out: set launch option +tv_nochat no_gluapack, restart Garry's Mod, then reconnect.");
+			baseClient->Disconnect("%s", "Required LuaPack could not read its cache. Rejoin once to download a repair copy. Enable server downloads.");
+			return;
 		}
+		baseClient->Disconnect("Required LuaPack failed. For a cache error, close Garry's Mod, remove the cached .bsp files in garrysmod/download/data/%s, and rejoin with server downloads enabled.",
+			GetConfig().packDirectory.c_str());
 	}
 
 	bool ClientConnect(int slot)
@@ -2548,6 +2619,46 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 	{
 		if (!args || args->ArgC() < 1)
 			return MODULE_RESULT::CONTINUE;
+
+		if (V_stricmp(args->Arg(0), "holylib_luapack_corrupt") == 0)
+		{
+			if (!IsEnabled() || !IsValidSlot(slot))
+				return MODULE_RESULT::STOP;
+			ClientPin& client = state.clients[slot];
+			if (!client.requiredLane || client.nativeLane || client.disconnectIssued)
+				return MODULE_RESULT::STOP;
+
+			// A report never supplies an object name or creates work per player.
+			// At most one prebuilt object can be registered in the whole level.
+			bool offerRepair = false;
+			if (args->ArgC() == 2 && client.holdsPin && !client.everReady &&
+				!client.repairInBaseline && !client.generation.empty() &&
+				client.generation == args->Arg(1) && client.generation == state.currentGeneration)
+			{
+				auto current = state.generations.find(client.generation);
+				if (current != state.generations.end())
+				{
+					Generation& base = current->second;
+					const Config& config = GetConfig();
+					if (!base.repairRegistrationAttempted && !base.repairPath.empty())
+					{
+						base.repairRegistrationAttempted = true;
+						base.repairRegistered =
+							base.repairPath == DataDirectory(config.packDirectory) + "/" + base.repairMD5 + ".bsp" &&
+							g_pFullFileSystem && g_pFullFileSystem->FileExists(base.repairPath.c_str(), "MOD") &&
+							RegisterDownloadable(base.repairPath, config.packDirectory, config.downloadableLimit) ==
+								DownloadableRegistration::Registered;
+						if (base.repairRegistered)
+							PublishManifest();
+					}
+					offerRepair = base.repairRegistered;
+				}
+			}
+			DisconnectRequiredClient(slot, offerRepair
+				? "the required cache could not be mounted; a FastDL repair copy is registered"
+				: "the required cache could not be mounted and no further repair is available", offerRepair);
+			return MODULE_RESULT::STOP;
+		}
 
 		if (V_stricmp(args->Arg(0), "holylib_luapack_failed") == 0)
 		{

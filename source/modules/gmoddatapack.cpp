@@ -23,6 +23,7 @@
 #include <limits>
 #include <deque>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 
 // memdbgon must be the last include file in a .cpp file!!!
@@ -103,6 +104,7 @@ static unsigned int g_activeHashRefreshCanonicalAcknowledgements = 0;
 #if defined(SYSTEM_LINUX)
 static Detouring::Hook detour_CVEngineServer_GMOD_SendToClientFilter;
 static thread_local const std::string* g_engineLuaRefreshName = nullptr;
+static thread_local bool g_engineLuaRefreshRejected = false;
 // Engine Linux x64 Bootil uses size_t metadata, unlike our bundled uint32_t
 // Buffer. Never call bundled accessors or destructors on the engine allocation.
 struct NativeLuaBufferAccess
@@ -1120,6 +1122,52 @@ static inline void CallLuaTokenizeContent(GarrysMod::Lua::ILuaInterface* LUA, st
 	and GMod "conveniently" does it only when the player requests them when joining, so it normally would add up to the loading times
 */
 static GModDataPack* g_pDataPack;
+
+// A late revision with no preceding client identity stays out of the string
+// table. Remember its path so the watcher can admit it when the file is fixed.
+static std::unordered_set<std::string> g_rejectedLateLuaFiles;
+static std::uint64_t g_clientLuaRegistrationEpoch = 1;
+
+static void UpdateNativeLuaSource(GarrysMod::Lua::LuaFile* file, const std::string& source)
+{
+	if (!file || file->contents == source)
+		return;
+	file->SetContents(source);
+#if defined(SYSTEM_LINUX)
+	// Retain the engine's allocation and invalidate its cached body.
+	if (g_nativeLuaBuffer.Ready())
+	{
+		g_nativeLuaBuffer.setWritten(&file->compressed, 0);
+		g_nativeLuaBuffer.setPosition(&file->compressed, 0);
+	}
+#endif
+}
+
+static bool PrepareLuaPackNativePayload(const std::string& fileName, const std::string& source,
+	bool initFile, const ClientLuaHash& hash, Bootil::AutoBuffer& payload)
+{
+	using namespace HolyLib::LuaPack::Policy;
+	payload.Write(hash.data(), hash.size());
+	// GMod's native sender compresses the NUL-terminated source at level 5.
+	// Measure the entire SHA-256-prefixed LZMA buffer, as the engine does.
+	if (source.size() >= (std::numeric_limits<unsigned int>::max)() ||
+		!Bootil::Compression::LZMA::Compress(source.c_str(), source.size() + 1, payload, 5))
+	{
+		Warning(PROJECT_NAME " - luapack: refusing client Lua revision \"%s\": LZMA compression failed\n",
+			fileName.c_str());
+		return false;
+	}
+
+	const std::size_t bytes = payload.GetWritten();
+	const std::size_t limit = initFile ? NativeLuaMaximumBodyBytes - 3u :
+		ActiveLuaRefreshMaximumBodyBytes(fileName.size());
+	if (bytes <= limit)
+		return true;
+	Warning(PROJECT_NAME " - luapack: refusing client Lua revision \"%s\": SHA-256 + LZMA body is %zu bytes, limit is %zu bytes for this message (engine body limit %zu bytes)\n",
+		fileName.c_str(), bytes, limit, NativeLuaMaximumBodyBytes);
+	return false;
+}
+
 class LuaDataPack
 {
 public:
@@ -1151,6 +1199,8 @@ public:
 
 		inline void Clear()
 		{
+			registrationName.clear();
+			registrationEpoch = 0;
 			hasSourceContent = false;
 			sourceContent = "";
 			content = "";
@@ -1170,6 +1220,8 @@ public:
 			forceActiveHashRefreshPending = false;
 		}
 
+		std::string registrationName;
+		std::uint64_t registrationEpoch = 0;
 		std::string sourceContent = "";
 		std::string content = "";
 		Bootil::AutoBuffer compressed;
@@ -1299,30 +1351,77 @@ public:
 		return entry->IsContentReady() && entry->hashPublished;
 	}
 
-	void AddFileContents(std::string fileName, std::string content,
-		bool forceActiveHashRefresh = false)
+	bool AddFileContents(std::string fileName, std::string content,
+		bool forceActiveHashRefresh = false, GarrysMod::Lua::LuaFile* nativeFile = nullptr,
+		bool captureForLuaPack = true)
 	{
 		if (!g_pDataPack)
-			return;
+			return false;
 
 		int fileID = g_pDataPack->m_pClientLuaFiles->FindStringIndex(fileName.c_str());
+		const bool bLuaPackEnabled = HolyLib::LuaPack::IsEnabled();
+		LuaPackEntry* previous = fileID != INVALID_STRING_INDEX ? GetPackEntry(fileID) : nullptr;
+		std::unique_lock<std::shared_mutex> lock;
+		if (previous)
+			lock = std::unique_lock<std::shared_mutex>(previous->mutex);
+		const bool hasCachedSource = previous && previous->hasSourceContent;
+		const bool sameRegistration = hasCachedSource && previous->registrationName == fileName;
+		const bool hasPreviousSource = sameRegistration &&
+			previous->registrationEpoch == g_clientLuaRegistrationEpoch;
+		const bool bSameSource = (sameRegistration || (!bLuaPackEnabled && hasCachedSource)) &&
+			previous->sourceContent == content;
+		const bool initFile = bLuaPackEnabled && HolyLib::LuaPack::IsInitFile(fileName);
+		const bool bCanonicalRegistration = HolyLib::LuaPack::SupportsCanonicalRegistration();
+		const bool bLuaPackCanonical = HolyLib::LuaPack::Policy::UsesCanonicalRegistration(
+			bLuaPackEnabled, bCanonicalRegistration);
+		std::string prepared = HolyLib::LuaPack::PrepareVanillaFile(fileName, content);
+		std::shared_ptr<Bootil::AutoBuffer> nativePayload;
+		ClientLuaHash nativeHash{};
+		const bool needsNativePreflight = bLuaPackEnabled && (initFile
+			? !bSameSource || previous->content != prepared
+			: (!(bSameSource && hasPreviousSource) && (hasPreviousSource || HolyLib::LuaPack::HasMapBaseSnapshot() ||
+				g_rejectedLateLuaFiles.count(fileName))) ||
+				(forceActiveHashRefresh && (!previous || !previous->activeRefreshCompressed)));
+		if (needsNativePreflight)
+		{
+			const std::string& nativeSource = initFile ? prepared : content;
+			nativeHash = HashClientLuaString(nativeSource);
+			nativePayload = std::make_shared<Bootil::AutoBuffer>();
+			if (!PrepareLuaPackNativePayload(fileName, nativeSource, initFile, nativeHash, *nativePayload))
+			{
+				// AddOrUpdateFile can receive a cache object the engine already filled.
+				// Restore it before a native request can observe the rejected source.
+				if (hasPreviousSource)
+					UpdateNativeLuaSource(nativeFile, previous->sourceContent);
+				else if (g_rejectedLateLuaFiles.size() < MAX_TRACKED_LUA_FILES)
+					g_rejectedLateLuaFiles.insert(fileName);
+				return false;
+			}
+		}
+
 		if (fileID == INVALID_STRING_INDEX)
 			fileID = g_pDataPack->m_pClientLuaFiles->AddString(true, fileName.c_str());
 
 		if (fileID == INVALID_STRING_INDEX)
 		{
 			Warning(PROJECT_NAME " - gmoddatapack: Failed to add string \"%s\" to client_lua_files table? Are we full?\n", fileName.c_str());
-			return;
+			return false;
 		}
 
 		LuaPackEntry& pEntry = m_pLuaFileCache[fileID];
-		std::lock_guard<std::shared_mutex> lock(pEntry.mutex);
+		g_rejectedLateLuaFiles.erase(fileName);
+		if (!lock.owns_lock())
+			lock = std::unique_lock<std::shared_mutex>(pEntry.mutex);
+		pEntry.registrationName = fileName;
+		pEntry.registrationEpoch = g_clientLuaRegistrationEpoch;
+		if (bLuaPackEnabled)
+		{
+			UpdateNativeLuaSource(nativeFile, content);
+			if (captureForLuaPack)
+				HolyLib::LuaPack::CaptureFileContents(fileName, content);
+		}
 		bool bRemoveServerCode = gmoddatapack_removeserverif.GetBool();
 		bool bRemoveComments = gmoddatapack_removecomments.GetBool();
-		const bool bLuaPackEnabled = HolyLib::LuaPack::IsEnabled();
-		const bool bCanonicalRegistration = HolyLib::LuaPack::SupportsCanonicalRegistration();
-		const bool bLuaPackCanonical = HolyLib::LuaPack::Policy::UsesCanonicalRegistration(
-			bLuaPackEnabled, bCanonicalRegistration);
 		if (bLuaPackEnabled && (bRemoveServerCode || bRemoveComments))
 		{
 			// Luapack requires one canonical byte stream: the stringtable hash comes from this
@@ -1338,7 +1437,6 @@ public:
 			bRemoveServerCode = false;
 			bRemoveComments = false;
 		}
-		bool bSameSource = pEntry.hasSourceContent && pEntry.sourceContent == content;
 		bool bSameProcessConfig = pEntry.removeServerCode == bRemoveServerCode && pEntry.removeComments == bRemoveComments &&
 			HolyLib::LuaPack::Policy::RegistrationModeMatches(pEntry.luapackCanonical,
 				pEntry.luapackPassthrough,
@@ -1350,6 +1448,8 @@ public:
 				// Explicit recovery is a one-file operation. Make its native identity
 				// drain-ready even if an older ready payload predates source-hash caching.
 				EnsureSourceHash(&pEntry);
+				if (nativePayload && !initFile)
+					pEntry.activeRefreshCompressed = std::move(nativePayload);
 				pEntry.activeHashRefreshPending = true;
 				pEntry.forceActiveHashRefreshPending = true;
 			}
@@ -1360,7 +1460,7 @@ public:
 			}
 			PublishEntryHash(fileID, pEntry);
 
-			return;
+			return true;
 		}
 
 		// The baseline plan is keyed by file ID and the exact immutable-base identity.
@@ -1374,15 +1474,24 @@ public:
 		pEntry.activeRefreshFailed = false;
 		pEntry.hasSourceContent = true;
 		pEntry.sourceContent = content;
-		pEntry.content = HolyLib::LuaPack::PrepareVanillaFile(fileName, content);
+		pEntry.content = std::move(prepared);
 		if (bLuaPackEnabled)
 		{
 			// Publish the small canonical body immediately, but leave full native-source
 			// hashing to the compression worker. Hashing an entire large registration set
 			// inside one transition frame can trip the server freeze watchdog.
 			pEntry.contentHash = HashClientLuaString(pEntry.content);
-			pEntry.sourceHashReady = false;
+			pEntry.sourceHashReady = nativePayload && !initFile;
 			pEntry.contentHashReady = true;
+			if (pEntry.sourceHashReady)
+			{
+				pEntry.sourceHash = nativeHash;
+				pEntry.activeRefreshCompressed = std::move(nativePayload);
+			}
+			else if (nativePayload)
+			{
+				pEntry.compressed.Write(nativePayload->GetBase(), nativePayload->GetWritten());
+			}
 		}
 		else
 		{
@@ -1405,6 +1514,7 @@ public:
 
 		std::lock_guard<std::mutex> queueLock(m_pCompressQueueMutex);
 		m_pCompressQueue.push_back(fileID);
+		return true;
 	}
 
 	// We only strip it, if it's valid lua (yes my token stuff is highly sensitive!)
@@ -1742,10 +1852,9 @@ void LuaDataPack::Initialize()
 			if (!luaFile)
 				continue;
 
-			HolyLib::LuaPack::CaptureFileContents(fileName, luaFile->contents);
 			// Re-feed ready entries too. AddFileContents reuses an exact source/mode match,
 			// but invalidates stale native/canonical bodies after a module reload or hook change.
-			AddFileContents(fileName, luaFile->contents);
+			AddFileContents(fileName, luaFile->contents, false, luaFile);
 		}
 	}
 
@@ -2430,6 +2539,7 @@ enum class LuaPackDiskRefreshResult
 	UnknownRegistration,
 	Resolved,
 	Unreadable,
+	Rejected,
 	ReadQueued,
 	Unchanged,
 	RefreshQueued,
@@ -2496,7 +2606,7 @@ static LuaPackDiskRefreshResult ResolveExistingLuaRegistration(
 				const int candidateID = g_pDataPack->m_pClientLuaFiles->FindStringIndex(
 					candidate.c_str());
 				if (candidateID <= 0 || candidateID == INVALID_STRING_INDEX)
-					return false;
+					return HolyLib::LuaPack::IsEnabled() && g_rejectedLateLuaFiles.count(candidate);
 				fileID = candidateID;
 				return true;
 			},
@@ -2547,25 +2657,12 @@ static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
 		(mode == LuaPackDiskRefreshMode::Deferred ? "deferred auto" : "auto");
 	const bool captureAndRefresh = HolyLib::LuaPack::Policy::ShouldCaptureAutoRefresh(
 		true, true, true, sourceReadable, sourceChanged);
-	auto refreshNativeSource = [&]() {
-		// SendOriginalLuaFile reads this separate engine cache, including its lazy
-		// compressed payload. Keep it on the captured revision before advertising
-		// that revision or a later native request would restore and send old bytes.
-		if (nativeFile->contents != source)
-		{
-			nativeFile->SetContents(source);
-			// Retain engine-owned storage; the native sender rebuilds an empty payload.
-#if defined(SYSTEM_LINUX)
-			g_nativeLuaBuffer.setWritten(&nativeFile->compressed, 0);
-			g_nativeLuaBuffer.setPosition(&nativeFile->compressed, 0);
-#endif
-		}
-	};
 	if (!captureAndRefresh)
 	{
 		if (!sourceReadable)
 		{
 			if (mode == LuaPackDiskRefreshMode::Automatic &&
+				fileID != INVALID_STRING_INDEX &&
 				QueueLuaAutoRefreshRead(fileID, fileRelPath, registeredName))
 			{
 				return LuaPackDiskRefreshResult::ReadQueued;
@@ -2580,8 +2677,8 @@ static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
 		if (HolyLib::LuaPack::Policy::ShouldQueueExplicitRefreshRecovery(
 			recoverUnchanged, true, true, true, sourceReadable, sourceChanged))
 		{
-			refreshNativeSource();
-			g_pLuaDataPack.AddFileContents(registeredName, source, true);
+			if (!g_pLuaDataPack.AddFileContents(registeredName, source, true, nativeFile))
+				return LuaPackDiskRefreshResult::Rejected;
 			Msg(PROJECT_NAME " - luapack: queued explicit refresh recovery for existing client Lua registration \"%s\"\n",
 				registeredName.c_str());
 			return LuaPackDiskRefreshResult::RefreshQueued;
@@ -2589,13 +2686,12 @@ static LuaPackDiskRefreshResult CaptureExistingLuaPackDiskRefresh(
 		return LuaPackDiskRefreshResult::Unchanged;
 	}
 
-	refreshNativeSource();
-	HolyLib::LuaPack::CaptureFileContents(registeredName, source);
 	// A current server-side shared cache does not prove that a connected client
 	// received or executed the changed bytes. If the trampoline already reached
 	// AddOrUpdateFile, sourceChanged above is false because that hook updated the
 	// LuaPack entry; otherwise this bypass path must stage a complete active refresh.
-	g_pLuaDataPack.AddFileContents(registeredName, source);
+	if (!g_pLuaDataPack.AddFileContents(registeredName, source, false, nativeFile))
+		return LuaPackDiskRefreshResult::Rejected;
 	Msg(PROJECT_NAME " - luapack: captured %s refresh for existing client Lua registration \"%s\"\n",
 		telemetryKind, registeredName.c_str());
 	return LuaPackDiskRefreshResult::Captured;
@@ -2685,8 +2781,17 @@ static bool hook_GarrysMod_AutoRefresh_HandleChange_Lua_LuaPack(
 		struct ScopedWatcherName
 		{
 			const std::string* previous = g_engineLuaRefreshName;
-			explicit ScopedWatcherName(const std::string& name) { g_engineLuaRefreshName = &name; }
-			~ScopedWatcherName() { g_engineLuaRefreshName = previous; }
+			bool previouslyRejected = g_engineLuaRefreshRejected;
+			explicit ScopedWatcherName(const std::string& name)
+			{
+				g_engineLuaRefreshName = &name;
+				g_engineLuaRefreshRejected = false;
+			}
+			~ScopedWatcherName()
+			{
+				g_engineLuaRefreshName = previous;
+				g_engineLuaRefreshRejected = previouslyRejected;
+			}
 		} scope(registeredName);
 		originalHandled = trampoline(fileRelPath, fileName, fileExt);
 	}
@@ -2768,29 +2873,26 @@ static void hook_CVEngineServer_GMOD_SendToClientFilter(void* engine,
 		!filter->IsReliable() || filter->IsInitMessage() ||
 		filter->GetRecipientCount() < 0 || filter->GetRecipientCount() > ABSOLUTE_PLAYER_LIMIT ||
 		!HolyLib::LuaPack::IsEnabled() || !HolyLib::LuaPack::SupportsCanonicalRegistration() ||
-		!ReadActiveLuaRefreshPayload(data, dataBits, payload) ||
-		payload.filename != *g_engineLuaRefreshName)
+		!MatchesActiveLuaRefreshPath(data, dataBits, *g_engineLuaRefreshName))
 	{
 		original(engine, filter, data, dataBits);
 		return;
 	}
+	// An engine watcher can hold the rejected bytes in a temporary buffer. Also
+	// leave an unadmitted refresh to the post-watcher disk capture below.
+	if (g_engineLuaRefreshRejected || !ReadActiveLuaRefreshPayload(data, dataBits, payload) ||
+		HolyLib::LuaPack::IsInitFile(payload.filename))
+		return;
 	const int fileID = g_pDataPack->m_pClientLuaFiles->FindStringIndex(payload.filename.c_str());
 	LuaDataPack::LuaPackEntry* entry = g_pLuaDataPack.GetPackEntry(fileID);
-	if (!entry || HolyLib::LuaPack::IsInitFile(payload.filename) ||
-		!g_pLuaDataPack.PublishRegistrationHash(fileID))
-	{
-		original(engine, filter, data, dataBits);
+	if (!entry)
 		return;
-	}
 	{
 		std::lock_guard<std::shared_mutex> lock(entry->mutex);
 		if (!entry->hasSourceContent || !g_pLuaDataPack.EnsureSourceHash(entry) ||
 			!ActiveLuaRefreshBodyMatches(payload.filename, entry->sourceHash.data(),
 				entry->sourceHash.size(), payload.body, payload.bodyBytes))
-		{
-			original(engine, filter, data, dataBits);
 			return;
-		}
 		// Copy the engine's finished body into HolyLib-owned storage. The engine
 		// destroys its temporary after this call; its allocation is never borrowed.
 		auto owned = std::make_shared<Bootil::AutoBuffer>();
@@ -2799,6 +2901,8 @@ static void hook_CVEngineServer_GMOD_SendToClientFilter(void* engine,
 		entry->activeRefreshRequested = false;
 		entry->activeRefreshFailed = false;
 	}
+	if (!g_pLuaDataPack.PublishRegistrationHash(fileID))
+		return;
 	class JoiningRecipients final : public IRecipientFilter
 	{
 	public:
@@ -2830,8 +2934,13 @@ static void hook_CVEngineServer_GMOD_SendToClientFilter(void* engine,
 static void hook_GModDataPack_AddOrUpdateFile(GModDataPack* pDataPack, GarrysMod::Lua::LuaFile* file, bool bReCompress)
 {
 	g_pDataPack = pDataPack;
-	HolyLib::LuaPack::CaptureFile(file);
-	g_pLuaDataPack.AddFileContents(file->GetName(), file->GetContents());
+	const bool accepted = g_pLuaDataPack.AddFileContents(file->GetName(), file->GetContents(), false, file);
+#if defined(SYSTEM_LINUX)
+	if (!accepted && g_engineLuaRefreshName && *g_engineLuaRefreshName == file->GetName())
+		g_engineLuaRefreshRejected = true;
+#else
+	(void)accepted;
+#endif
 	/*
 	if (g_Lua && Lua::PushHook("HolyLib:AddOrUpdateFileToDataPack")) // Allows one to override the clientside content
 	{
@@ -3538,9 +3647,7 @@ static bool RefreshRegistrationModeForRequest(int fileID, const std::string& fil
 	{
 		if (!hasSource)
 			return false;
-		if (enabled)
-			HolyLib::LuaPack::CaptureFileContents(fileName, source);
-		g_pLuaDataPack.AddFileContents(fileName, source);
+		g_pLuaDataPack.AddFileContents(fileName, source, false, luaFile);
 	}
 	// A matching mode can be pending publication without needing the source again.
 	// Mode changes, however, must never reuse the old transformed body as source.
@@ -3586,7 +3693,19 @@ static bool SendNativeLuaFile(GModDataPack* pDataPack, int clientIdx, int fileID
 		g_clientHashUpdatesPending[clientIdx].erase(fileID);
 	}
 
-	SendOriginalLuaFile(pDataPack, clientIdx, fileID);
+	// Reuse the measured body for accepted deltas. Native and opt-out joins
+	// send the very bytes admitted by the guard, without another compression pass.
+	std::shared_ptr<const Bootil::AutoBuffer> payload;
+	if (auto* entry = g_pLuaDataPack.GetPackEntry(fileID))
+	{
+		std::shared_lock<std::shared_mutex> lock(entry->mutex);
+		if (entry->sourceHashReady && (!luaFile || luaFile->contents == entry->sourceContent))
+			payload = entry->activeRefreshCompressed;
+	}
+	if (payload)
+		SendCompressedLuaFile(clientIdx, fileID, *payload);
+	else
+		SendOriginalLuaFile(pDataPack, clientIdx, fileID);
 	return true;
 }
 
@@ -4038,6 +4157,9 @@ LUA_FUNCTION_STATIC(gmoddatapack_RefreshExistingLuaFile)
 		case LuaPackDiskRefreshResult::Unreadable:
 			status = "unreadable";
 			break;
+		case LuaPackDiskRefreshResult::Rejected:
+			status = "rejected";
+			break;
 		case LuaPackDiskRefreshResult::Unchanged:
 			status = "unchanged";
 			break;
@@ -4185,9 +4307,8 @@ void CGModDataPackModule::Think(bool bSimulating)
 
 			if (!hasSource)
 				return false;
-			if (refresh.captureForMapBase)
-				HolyLib::LuaPack::CaptureFileContents(fileName, source);
-			g_pLuaDataPack.AddFileContents(fileName, source);
+			if (!g_pLuaDataPack.AddFileContents(fileName, source, false, file, refresh.captureForMapBase))
+				return false;
 			if (!g_pLuaDataPack.PublishRegistrationHash(fileID))
 				return false;
 			if (refresh.captureForMapBase)
@@ -4248,11 +4369,10 @@ void CGModDataPackModule::Think(bool bSimulating)
 			{
 				const std::string initPath = refresh.registeredInitName.empty()
 					? initFile->GetName() : refresh.registeredInitName;
-				if (refresh.captureForMapBase)
-					HolyLib::LuaPack::CaptureFileContents(initPath, initFile->contents);
-				g_pLuaDataPack.AddFileContents(initPath, initFile->contents);
+				const bool accepted = g_pLuaDataPack.AddFileContents(initPath, initFile->contents,
+					false, initFile, refresh.captureForMapBase);
 				const int initID = g_pDataPack->m_pClientLuaFiles->FindStringIndex(initPath.c_str());
-				refresh.initRefreshed = initID != INVALID_STRING_INDEX &&
+				refresh.initRefreshed = accepted && initID != INVALID_STRING_INDEX &&
 					g_pLuaDataPack.PublishRegistrationHash(initID);
 			}
 		}
@@ -4616,6 +4736,9 @@ void CGModDataPackModule::LuaShutdown(GarrysMod::Lua::ILuaInterface* pLua)
 
 void CGModDataPackModule::LevelShutdown()
 {
+	// Completed compression can be reused, but file IDs are assigned again.
+	++g_clientLuaRegistrationEpoch;
+	g_rejectedLateLuaFiles.clear();
 	g_pendingLuaAutoRefreshReads.clear();
 	for (int slot = 0; slot < ABSOLUTE_PLAYER_LIMIT; ++slot)
 		ClearClientLuaDeliveryState(slot);

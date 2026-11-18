@@ -9,7 +9,7 @@ local function equal(actual, expected, message)
 	end
 end
 
-local sourceFile = assert(io.open("source/modules/gmoddatapack_luapack.cpp", "rb"))
+local sourceFile = assert(io.open(arg[1] or "source/modules/gmoddatapack_luapack.cpp", "rb"))
 local source = sourceFile:read("*a")
 sourceFile:close()
 local fragments = {}
@@ -29,8 +29,9 @@ local function normalize(path)
 	return path
 end
 
-local function newRuntime(nativeFiles)
+local function newRuntime(nativeFiles, fixture)
 	nativeFiles = nativeFiles or {}
+	fixture = fixture or {}
 	local runtime = {
 		commands = {},
 		compileCalls = {},
@@ -51,11 +52,11 @@ local function newRuntime(nativeFiles)
 			SetString = function(_, nextValue) value = nextValue end,
 		}
 	end
-	convars.holylib_gmoddatapack_luapack_manifest = convar(snapshot)
+	convars.holylib_gmoddatapack_luapack_manifest = convar(fixture.snapshot or snapshot)
 	convars.holylib_gmoddatapack_luapack_required = convar("1")
 	convars.holylib_gmoddatapack_luapack_allow_optout = convar("1")
 	convars.tv_nochat = convar("")
-	convars.cl_downloadfilter = convar("none")
+	convars.cl_downloadfilter = convar(fixture.disk and "all" or "none")
 	runtime.convars = convars
 
 	environment.FCVAR_REPLICATED = 0
@@ -75,9 +76,16 @@ local function newRuntime(nativeFiles)
 		runtime.commands[#runtime.commands + 1] = command
 		allCommands[#allCommands + 1] = command
 	end
-	environment.file = {Open = function() return nil end}
+	environment.file = {Open = function(path, mode, pathID)
+		equal(mode, "rb", "pack file mode")
+		equal(pathID, "GAME", "pack search path")
+		local bytes = fixture.disk and fixture.disk[path]
+		if bytes then
+			return {Size = function() return #bytes end, Read = function() return bytes end, Close = function() end}
+		end
+	end}
 
-	local hashes = {}
+	local hashes = fixture.hashes or {}
 	local hashIndex = 0
 	local function fakeMD5(value)
 		local hash = hashes[value]
@@ -89,7 +97,9 @@ local function newRuntime(nativeFiles)
 	end
 	environment.util = {
 		MD5 = fakeMD5,
-		Decompress = function(value) return value end,
+		Decompress = function(value)
+			if value ~= fixture.brokenLZMA then return value end
+		end,
 	}
 	environment.CompileString = function(code, identifier, handleError)
 		runtime.compileCalls[#runtime.compileCalls + 1] = {
@@ -423,6 +433,49 @@ for _, command in ipairs(allCommands) do
 	if command[1] == "holylib_luapack_failed" or command[1] == "retry" then
 		fail("bootstrap include tests unexpectedly requested recovery")
 	end
+end
+
+-- First join reports a corrupt cache once. The next engine download uses a
+-- different path while the READY identity remains the pinned base.
+do
+	local repair = string.rep("b", 32)
+	local path = "lua/repair_fixture.lua"
+	local primaryPath = "download/data/test/" .. generation .. ".bsp"
+	local repairPath = "download/data/test/" .. repair .. ".bsp"
+	local verifiedSource = [[return "verified repair"]]
+	local key = string.rep("\1", 16)
+	local pack = "\1" .. key .. key .. key .. "\0\0\0" .. string.char(#verifiedSource) .. verifiedSource
+	local wrongMD5 = pack:sub(1, -2) .. "x"
+	local brokenLZMA = string.rep("\255", #pack)
+	local repairSnapshot = "2|" .. generation .. "|74657374|73|" .. repair
+	local function fixture(disk, manifest)
+		return newRuntime(nil, {
+			disk = disk, snapshot = manifest, brokenLZMA = brokenLZMA,
+			hashes = {[pack] = repair, [salt .. ":repair" .. path] = string.rep("01", 16)},
+		})
+	end
+	local function expectCorrupt(runtime)
+		equal(runtime:runStub(path), nil, "unverified source never executes")
+		equal(runtime:runStub(path), nil, "later placeholders also fail closed")
+		equal(#runtime.commands, 1, "one corruption report and no client retry")
+		equal(runtime.commands[1][1], "holylib_luapack_corrupt", "dedicated cache recovery command")
+		equal(runtime.commands[1][2], generation, "report the pinned generation")
+	end
+	for _, bad in ipairs({brokenLZMA, wrongMD5}) do
+		local disk = {[primaryPath] = bad}
+		expectCorrupt(fixture(disk, snapshot))
+		disk[repairPath] = pack
+		local rejoined = fixture(disk, repairSnapshot)
+		equal(rejoined:runStub(path), "verified repair", "rejoin mounts verified FastDL repair")
+		equal(#rejoined.commands, 1, "repaired join only sends READY")
+		equal(rejoined.commands[1][1], "holylib_luapack_ready", "repair acknowledges the base")
+		equal(rejoined.commands[1][2], generation, "READY keeps pinned generation")
+		equal(rejoined.commands[1][3], generation, "READY keeps pinned MD5")
+		equal(disk[primaryPath], bad, "the engine cache was left intact")
+		disk[repairPath] = wrongMD5
+		expectCorrupt(fixture(disk, repairSnapshot))
+	end
+	expectCorrupt(fixture({}, repairSnapshot))
 end
 
 print("luapack bootstrap include tests passed")

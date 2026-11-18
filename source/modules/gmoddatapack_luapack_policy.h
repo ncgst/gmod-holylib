@@ -1150,19 +1150,26 @@ namespace HolyLib::LuaPack::Policy
 	// a u32 BYTE count, then SHA-256(source + NUL) followed by Bootil LZMA bytes.
 	// The GMod outer envelope contains the payload's BIT count. Keep the native
 	// sender's 64 KiB payload ceiling, including the filename and every field.
+	constexpr std::size_t NativeLuaMaximumBodyBytes = 64u * 1024u;
 	constexpr std::size_t ActiveLuaRefreshMaximumPayloadBytes = 64u * 1024u;
 	constexpr std::size_t ActiveLuaRefreshFrameBits = 256u * 1024u * 8u;
 	constexpr int ActiveLuaRefreshLengthBits = 20;
 	constexpr std::uint32_t ActiveLuaRefreshMessageType = 1;
 
+	constexpr std::size_t ActiveLuaRefreshHeaderBytes = 1u + 1u + sizeof(std::uint32_t);
+
+	constexpr std::size_t ActiveLuaRefreshMaximumBodyBytes(std::size_t filenameBytes)
+	{
+		return filenameBytes == 0 ||
+			filenameBytes > ActiveLuaRefreshMaximumPayloadBytes - ActiveLuaRefreshHeaderBytes
+			? 0u : ActiveLuaRefreshMaximumPayloadBytes - ActiveLuaRefreshHeaderBytes - filenameBytes;
+	}
+
 	constexpr std::size_t ActiveLuaRefreshPayloadBits(std::size_t filenameBytes,
 		std::size_t bodyBytes)
 	{
-		constexpr std::size_t fields = 1u + 1u + sizeof(std::uint32_t);
-		return filenameBytes == 0 || filenameBytes > ActiveLuaRefreshMaximumPayloadBytes - fields ||
-			bodyBytes <= ClientLuaHashBytes ||
-			bodyBytes > ActiveLuaRefreshMaximumPayloadBytes - fields - filenameBytes
-			? 0u : (fields + filenameBytes + bodyBytes) * 8u;
+		return bodyBytes <= ClientLuaHashBytes || bodyBytes > ActiveLuaRefreshMaximumBodyBytes(filenameBytes)
+			? 0u : (ActiveLuaRefreshHeaderBytes + filenameBytes + bodyBytes) * 8u;
 	}
 
 	constexpr std::size_t ActiveLuaRefreshWireBits(int serviceTypeBits,
@@ -1189,6 +1196,16 @@ namespace HolyLib::LuaPack::Policy
 		const unsigned char* body = nullptr;
 		std::size_t bodyBytes = 0;
 	};
+
+	inline bool MatchesActiveLuaRefreshPath(const void* data, int dataBits, const std::string& filename)
+	{
+		if (!data || dataBits <= 0 || filename.empty() ||
+			static_cast<std::size_t>(dataBits / 8) <= filename.size() + 1u)
+			return false;
+		const auto* bytes = static_cast<const unsigned char*>(data);
+		return bytes[0] == ActiveLuaRefreshMessageType && bytes[filename.size() + 1u] == 0 &&
+			std::memcmp(bytes + 1, filename.data(), filename.size()) == 0;
+	}
 
 	// Inspect the byte-aligned native watcher payload without trusting its NUL or
 	// body length. The returned view borrows storage only for this sender call.
