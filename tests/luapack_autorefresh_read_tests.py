@@ -8,12 +8,18 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--compiler", default="c++")
 parser.add_argument("--msvc", action="store_true")
 parser.add_argument("--sanitize", action="store_true")
+parser.add_argument("--source", type=Path)
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[1]
-source = (root / "source/modules/gmoddatapack.cpp").read_text(encoding="utf-8")
+source = (args.source or root / "source/modules/gmoddatapack.cpp").read_text(encoding="utf-8")
 start = source.index("static bool ReadLuaAutoRefreshSource(")
 end = source.index("void HolyLib::GModDataPack::InstallLuaAutoRefreshDetour()", start)
 methods = source[start:end]
+preflight = source[source.index("static std::unordered_set<std::string> g_rejectedLateLuaFiles;"):
+                   source.index("class LuaDataPack")]
+registration = source[source.index("\tbool AddFileContents("):source.index("\t// We only strip it")]
+registration = registration.replace("bool AddFileContents(", "bool LuaDataPack::CommitFileContents(", 1)
+registration = registration.replace(" = false", "", 1).replace(" = nullptr", "", 1).replace(" = true", "", 1)
 
 # The adapters exercise the production queue. Also require its real lifecycle
 # entry points to call the drain/reset, rather than only wiring the test driver.
@@ -28,7 +34,8 @@ assert template.count("// INSERT_PRODUCTION_METHODS") == 1
 with tempfile.TemporaryDirectory(prefix="luapack-refresh-") as directory:
     directory = Path(directory)
     cpp = directory / "refresh.cpp"
-    cpp.write_text(template.replace("// INSERT_PRODUCTION_METHODS", methods), encoding="utf-8")
+    cpp.write_text(template.replace("// INSERT_PRODUCTION_METHODS",
+                                   preflight + registration + methods), encoding="utf-8")
     binary = directory / ("refresh.exe" if args.msvc else "refresh")
     if args.msvc:
         command = [args.compiler, "/nologo", "/EHsc", "/std:c++17", "/W4",

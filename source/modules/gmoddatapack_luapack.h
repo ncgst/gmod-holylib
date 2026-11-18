@@ -14,7 +14,6 @@ struct edict_t;
 namespace GarrysMod::Lua
 {
 	class ILuaInterface;
-	struct LuaFile;
 }
 
 namespace Bootil
@@ -93,7 +92,7 @@ namespace HolyLib::LuaPack
 	void Think();
 	void LuaInit(GarrysMod::Lua::ILuaInterface* pLua, bool bServerInit);
 
-	void CaptureFile(const GarrysMod::Lua::LuaFile* file);
+	bool HasMapBaseSnapshot();
 	void CaptureFileContents(const std::string& virtualPath, const std::string& contents);
 	std::string PrepareVanillaFile(const std::string& virtualPath, const std::string& contents);
 	bool ConsumeBootstrapRefresh();

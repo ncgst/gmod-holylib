@@ -40,7 +40,6 @@ namespace Lua
 	struct Shared { GarrysMod::Lua::LuaFile* GetCache(const std::string&) { return nullptr; } };
 	static Shared* GetShared() { static Shared shared; return &shared; }
 }
-namespace HolyLib::LuaPack { static void CaptureFileContents(const std::string&, const std::string&) {} }
 struct Table { int GetNumStrings() { return 0; } const char* GetString(int) { return ""; } };
 struct DataPack { Table* m_pClientLuaFiles = nullptr; };
 static DataPack* g_pDataPack = nullptr;
@@ -81,7 +80,7 @@ public:
 	void ProcessContent(LuaPackEntry*, int) { assert(false && "ready source must be reused"); }
 	void EnsureSourceHash(LuaPackEntry*) {}
 	void CompressFile(LuaPackEntry*, int) { assert(false && "ready ordinary payload must be reused"); }
-	void AddFileContents(const std::string&, const std::string&) { assert(false); }
+	void AddFileContents(const std::string&, const std::string&, bool, GarrysMod::Lua::LuaFile*) { assert(false); }
 	void CompressActiveRefreshPayload(LuaPackEntry* entry)
 	{
 		std::lock_guard<std::shared_mutex> lock(entry->mutex);

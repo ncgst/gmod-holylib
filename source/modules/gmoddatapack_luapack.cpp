@@ -2108,11 +2108,9 @@ end, nil, "Immediately disable bundled delivery and restore per-file vanilla Lua
 			pLua->RunString("HolyLib luapack server bridge", "", serverBridge, true, true);
 	}
 
-	void CaptureFile(const GarrysMod::Lua::LuaFile* file)
+	bool HasMapBaseSnapshot()
 	{
-		if (!file)
-			return;
-		CaptureFileContents(file->name, file->contents);
+		return state.activeBuild || !state.currentGeneration.empty();
 	}
 
 	void CaptureFileContents(const std::string& inputPath, const std::string& contents)
